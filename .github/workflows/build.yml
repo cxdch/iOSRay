@@ -53,6 +53,7 @@ jobs:
           path: |
             build/*.ipa
             build/*.tipa
+            build/*.dSYM
             shader-report.txt
             shaders-out/report.json
 

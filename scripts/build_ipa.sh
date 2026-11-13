@@ -41,6 +41,13 @@ build_variant() {
         -framework UIKit -framework Metal -framework QuartzCore -framework Foundation \
         $LDFLAGS -o "$app/$APP_NAME"
 
+    # На macOS clang с -g сам запускает dsymutil и кладёт XRProbe.dSYM рядом с бинарником,
+    # то есть внутрь .app. ldid в TrollStore падает на нём («Unsupported Mach-O type»),
+    # поэтому выносим символы из пакета — они нужны только для разбора крэшей.
+    if [[ -d "$app/$APP_NAME.dSYM" ]]; then
+        mv "$app/$APP_NAME.dSYM" "$OUT/$APP_NAME-$variant.dSYM"
+    fi
+
     sed -e "s/@BUNDLE_ID@/$BUNDLE_ID/" -e "s/@VERSION@/$VERSION/" -e "s/@BUILD@/$BUILD/" \
         "$ROOT/app/Info.plist" > "$app/Info.plist"
     printf 'APPL????' > "$app/PkgInfo"
@@ -67,6 +74,14 @@ build_variant() {
         elif command -v ldid >/dev/null; then
             ldid -S "$app/$APP_NAME"
         fi
+    fi
+
+    # В пакете не должно быть лишних Mach-O, кроме самого приложения.
+    local stray
+    stray="$(find "$app" -mindepth 1 -name '*.dSYM' -o -mindepth 1 -type f -name '*.dylib' | head -1)"
+    if [[ -n "$stray" ]]; then
+        echo "ОШИБКА: лишний файл в пакете: $stray" >&2
+        exit 1
     fi
 
     (cd "$stage" && zip -qry "$OUT/$APP_NAME-$variant.$ext" Payload)
