@@ -17,6 +17,1395 @@ index 4b438f03..9b3f34a6 100644
      add_subdirectory(LuaJIT-proj)
  else()
      find_package(Lua51 REQUIRED)
+diff --git a/src/Layers/xrRender/BufferUtils.h b/src/Layers/xrRender/BufferUtils.h
+index e683c4b1..a96ea1cc 100644
+--- a/src/Layers/xrRender/BufferUtils.h
++++ b/src/Layers/xrRender/BufferUtils.h
+@@ -23,7 +23,7 @@ void ConvertVertexDeclaration(const xr_vector<VertexElement>& declIn, xr_vector<
+ 
+ #ifdef USE_OGL
+ void SetGLVertexPointer(SDeclaration* decl, u32 baseOffset = 0);
+-#   ifdef XR_PLATFORM_WEB
++#   ifdef XR_GL_ES
+ GLuint GetVertexArray(SDeclaration* decl, u32 baseVertex);
+ bool IsStreamVertexBuffer(GLuint buffer);
+ void ForgetVertexArrays(GLuint buffer);
+@@ -177,7 +177,7 @@ public:
+ 
+     void* Map(size_t offset, size_t size, bool flush = false);
+     void Unmap();
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     void Unmap(size_t writtenSize);
+ #endif
+     bool IsValid() const;
+@@ -208,7 +208,7 @@ private:
+ 
+     VertexBufferHandle m_DeviceBuffer{};
+     u32 m_RefCounter{};
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     xr_vector<u8> m_HostBuffer;
+     size_t m_MappedOffset{};
+     size_t m_MappedSize{};
+@@ -224,7 +224,7 @@ public:
+ 
+     void* Map(size_t offset, size_t size, bool flush = false);
+     void Unmap();
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     void Unmap(size_t writtenSize);
+ #endif
+     bool IsValid() const;
+@@ -255,7 +255,7 @@ private:
+ 
+     IndexBufferHandle m_DeviceBuffer{};
+     u32 m_RefCounter{};
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     xr_vector<u8> m_HostBuffer;
+     size_t m_MappedOffset{};
+     size_t m_MappedSize{};
+diff --git a/src/Layers/xrRender/QueryHelper.h b/src/Layers/xrRender/QueryHelper.h
+index 9582062e..a701b713 100644
+--- a/src/Layers/xrRender/QueryHelper.h
++++ b/src/Layers/xrRender/QueryHelper.h
+@@ -64,7 +64,7 @@ IC HRESULT CreateQuery(GLuint* pQuery, D3D_QUERY type)
+     return S_OK;
+ }
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ constexpr GLenum OCCLUSION_QUERY_TARGET = GL_ANY_SAMPLES_PASSED_CONSERVATIVE;
+ 
+ IC HRESULT GetData(GLuint query, void* pData, u32 DataSize)
+diff --git a/src/Layers/xrRender/R_Backend.h b/src/Layers/xrRender/R_Backend.h
+index 5164948e..477d2f2b 100644
+--- a/src/Layers/xrRender/R_Backend.h
++++ b/src/Layers/xrRender/R_Backend.h
+@@ -146,7 +146,7 @@ private:
+ #   endif
+ #endif // DEBUG
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     static inline u32 stencil_enable = u32(-1);
+     static inline u32 stencil_func = u32(-1);
+     static inline u32 stencil_ref = u32(-1);
+@@ -195,7 +195,7 @@ private:
+     //CTexture* textures_vs[5]; // dmap + 4 vs
+     CTexture* textures_vs[CTexture::mtMaxVertexShaderTextures]; // 4 vs
+     CTexture* textures_gs[CTexture::mtMaxGeometryShaderTextures]; // 4 vs
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     static inline u32 occupied_texture_units = u32(-1);
+ #endif
+ #if defined(USE_DX11)
+@@ -450,7 +450,7 @@ public:
+                         u32 _zfail = D3DSTENCILOP_KEEP);
+     IC void set_Z(u32 _enable);
+     IC void set_ZFunc(u32 _func);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     IC void set_DepthWrite(u32 _enable);
+     IC void set_Blend(u32 _enable, u32 _src, u32 _dst, u32 _srcAlpha, u32 _dstAlpha, u32 _op, u32 _opAlpha);
+ #endif
+diff --git a/src/Layers/xrRender/R_Backend_Runtime.cpp b/src/Layers/xrRender/R_Backend_Runtime.cpp
+index 6d4133db..54fc3e77 100644
+--- a/src/Layers/xrRender/R_Backend_Runtime.cpp
++++ b/src/Layers/xrRender/R_Backend_Runtime.cpp
+@@ -78,7 +78,7 @@ void CBackend::Invalidate()
+     C = nullptr;
+ 
+     alpha_ref = u32(-1);
+-#ifndef XR_PLATFORM_WEB
++#ifndef XR_GL_ES
+     stencil_enable = u32(-1);
+     stencil_func = u32(-1);
+     stencil_ref = u32(-1);
+@@ -182,7 +182,7 @@ void CBackend::set_Textures(STextureList* textures_list)
+     //    return;
+     T = textures_list;
+     // If resources weren't set at all we should clear from resource #0.
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     u32 usedPS = 0;
+     u32 usedVS = 0;
+ #endif
+@@ -210,7 +210,7 @@ void CBackend::set_Textures(STextureList* textures_list)
+             // ordinary pixel surface
+             if ((int)load_id > _last_ps)
+                 _last_ps = load_id;
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+             usedPS |= 1u << load_id;
+ #endif
+             if (textures_ps[load_id] != load_surf || (load_surf && (load_surf->last_slice != load_surf->curr_slice)))
+@@ -224,7 +224,7 @@ void CBackend::set_Textures(STextureList* textures_list)
+                     load_surf->bind(*this, load_id);
+                     //load_surf->Apply(load_id);
+                     load_surf->last_slice = load_surf->curr_slice;
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+                     occupied_texture_units |= 1u << load_id;
+ #endif
+                 }
+@@ -242,7 +242,7 @@ void CBackend::set_Textures(STextureList* textures_list)
+             u32 load_id_remapped = load_id - CTexture::rstVertex;
+             if ((int)load_id_remapped > _last_vs)
+                 _last_vs = load_id_remapped;
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+             usedVS |= 1u << load_id_remapped;
+ #endif
+             if (textures_vs[load_id_remapped] != load_surf)
+@@ -255,7 +255,7 @@ void CBackend::set_Textures(STextureList* textures_list)
+                     PGO(Msg("PGO:tex%d:%s", load_id, load_surf->cName.c_str()));
+                     load_surf->bind(*this, load_id);
+                     //load_surf->Apply(load_id);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+                     occupied_texture_units |= 1u << load_id;
+ #endif
+                 }
+@@ -358,7 +358,7 @@ void CBackend::set_Textures(STextureList* textures_list)
+     }
+ 
+     // clear remaining stages (PS)
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     for (u32 _last_ps = 0; _last_ps < CTexture::mtMaxPixelShaderTextures; _last_ps++)
+     {
+         if (usedPS & (1u << _last_ps))
+@@ -392,7 +392,7 @@ void CBackend::set_Textures(STextureList* textures_list)
+ #endif
+     }
+     // clear remaining stages (VS)
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     for (u32 _last_vs = 0; _last_vs < CTexture::mtMaxVertexShaderTextures; _last_vs++)
+     {
+         if (usedVS & (1u << _last_vs))
+diff --git a/src/Layers/xrRender/R_DStreams.cpp b/src/Layers/xrRender/R_DStreams.cpp
+index 072820ef..23a4c741 100644
+--- a/src/Layers/xrRender/R_DStreams.cpp
++++ b/src/Layers/xrRender/R_DStreams.cpp
+@@ -12,7 +12,7 @@ namespace xray::render::RENDER_NAMESPACE
+ int rsDVB_Size = 4096; //Fixed: (bytes_need<=mSize) && vl_Count
+ int rsDIB_Size = 512;
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ constexpr bool DiscardOnEveryLock = true;
+ #else
+ constexpr bool DiscardOnEveryLock = false;
+@@ -86,7 +86,7 @@ void _VertexStream::Unlock(u32 Count, u32 Stride)
+ #endif
+     mPosition += Count * Stride;
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     pVB.Unmap(Count * Stride);
+ #else
+     pVB.Unmap();
+@@ -155,7 +155,7 @@ void _IndexStream::Unlock(u32 RealCount)
+ {
+     PGO(Msg("PGO:IB_UNLOCK:%d", RealCount));
+     mPosition += RealCount;
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     pIB.Unmap(RealCount * sizeof(u16));
+ #else
+     pIB.Unmap();
+diff --git a/src/Layers/xrRender/SH_Atomic.cpp b/src/Layers/xrRender/SH_Atomic.cpp
+index 3aec55ca..91728743 100644
+--- a/src/Layers/xrRender/SH_Atomic.cpp
++++ b/src/Layers/xrRender/SH_Atomic.cpp
+@@ -193,7 +193,7 @@ SDeclaration::~SDeclaration()
+         _RELEASE(iLayout->second);
+     }
+ #elif defined(USE_OGL)
+-#   ifdef XR_PLATFORM_WEB
++#   ifdef XR_GL_ES
+     ForgetVertexArrays(this);
+ #   endif
+     glDeleteVertexArrays(1, &dcl);
+diff --git a/src/Layers/xrRender/SH_Atomic.h b/src/Layers/xrRender/SH_Atomic.h
+index 301e8050..72630b1d 100644
+--- a/src/Layers/xrRender/SH_Atomic.h
++++ b/src/Layers/xrRender/SH_Atomic.h
+@@ -149,7 +149,7 @@ struct ECORE_API SDeclaration : public xr_resource_flagged
+     xr_vector<D3D_INPUT_ELEMENT_DESC> dx11_dcl_code;
+ #elif defined(USE_OGL)
+     GLuint dcl;
+-#   ifdef XR_PLATFORM_WEB
++#   ifdef XR_GL_ES
+     GLuint bound_vb{};
+     u32 bound_stride{};
+     GLuint bound_ib{};
+diff --git a/src/Layers/xrRender/SH_RT.h b/src/Layers/xrRender/SH_RT.h
+index 4cf5534d..8a87b142 100644
+--- a/src/Layers/xrRender/SH_RT.h
++++ b/src/Layers/xrRender/SH_RT.h
+@@ -26,7 +26,7 @@ public:
+     void set_slice_write(u32 context_id, int slice);
+ 
+     void resolve_into(CRT& destination) const; // only RTs with same format supported
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     void copy_into(CRT& destination) const; // same format and size
+ #endif
+ 
+diff --git a/src/Layers/xrRender/ShaderResourceTraits.h b/src/Layers/xrRender/ShaderResourceTraits.h
+index 6f426275..c770c816 100644
+--- a/src/Layers/xrRender/ShaderResourceTraits.h
++++ b/src/Layers/xrRender/ShaderResourceTraits.h
+@@ -70,7 +70,7 @@ inline std::pair<char, GLuint> GLCompileShader(pcstr* buffer, size_t size, pcstr
+         CHK_GL(glProgramParameteri(program, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, (GLint)GL_TRUE));
+ 
+     CHK_GL(glAttachShader(program, shader));
+-#ifndef XR_PLATFORM_WEB // GLSL ES declares output locations in the shader itself
++#ifndef XR_GL_ES // GLSL ES declares output locations in the shader itself
+     CHK_GL(glBindFragDataLocation(program, 0, "SV_Target"));
+     CHK_GL(glBindFragDataLocation(program, 0, "SV_Target0"));
+     CHK_GL(glBindFragDataLocation(program, 1, "SV_Target1"));
+@@ -101,7 +101,7 @@ inline std::pair<char, GLuint> GLUseBinary(pcstr* buffer, size_t size, const GLe
+         CHK_GL(glObjectLabel(GL_PROGRAM, program, -1, name));
+     CHK_GL(glProgramParameteri(program, GL_PROGRAM_SEPARABLE, (GLint)GL_TRUE));
+ 
+-#ifndef XR_PLATFORM_WEB // GLSL ES declares output locations in the shader itself
++#ifndef XR_GL_ES // GLSL ES declares output locations in the shader itself
+     CHK_GL(glBindFragDataLocation(program, 0, "SV_Target"));
+     CHK_GL(glBindFragDataLocation(program, 0, "SV_Target0"));
+     CHK_GL(glBindFragDataLocation(program, 1, "SV_Target1"));
+@@ -120,7 +120,7 @@ inline std::pair<char, GLuint> GLUseBinary(pcstr* buffer, size_t size, const GLe
+     return { 'p', program };
+ }
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ static GLuint GLDepthOnlyFragmentShader()
+ {
+     static GLuint shader = 0;
+@@ -137,7 +137,7 @@ static GLuint GLDepthOnlyFragmentShader()
+ 
+ static GLuint GLLinkMonolithicProgram(pcstr name, GLuint ps, GLuint vs, GLuint gs)
+ {
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     if (!vs)
+     {
+         Log("! shader program not linked, the vertex stage failed to compile:", name);
+@@ -159,7 +159,7 @@ static GLuint GLLinkMonolithicProgram(pcstr name, GLuint ps, GLuint vs, GLuint g
+     CHK_GL(glAttachShader(program, vs));
+     if (gs)
+         CHK_GL(glAttachShader(program, gs));
+-#ifndef XR_PLATFORM_WEB // GLSL ES declares output locations in the shader itself
++#ifndef XR_GL_ES // GLSL ES declares output locations in the shader itself
+     CHK_GL(glBindFragDataLocation(program, 0, "SV_Target"));
+     CHK_GL(glBindFragDataLocation(program, 0, "SV_Target0"));
+     CHK_GL(glBindFragDataLocation(program, 1, "SV_Target1"));
+diff --git a/src/Layers/xrRender/SkeletonX.cpp b/src/Layers/xrRender/SkeletonX.cpp
+index 0f6315b6..01085c78 100644
+--- a/src/Layers/xrRender/SkeletonX.cpp
++++ b/src/Layers/xrRender/SkeletonX.cpp
+@@ -73,7 +73,7 @@ void CSkeletonX::_Render(CBackend& cmd_list, ref_geom& hGeom, u32 vCount, u32 iO
+         // transfer matrices
+         ref_constant array = cmd_list.get_c(s_bones_array_const);
+         u32 count = RMS_bonecount;
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         static thread_local xr_vector<Fvector4> rows;
+         rows.resize(count * 3);
+         for (u32 mid = 0; mid < count; mid++)
+diff --git a/src/Layers/xrRender/dxImGuiRender.cpp b/src/Layers/xrRender/dxImGuiRender.cpp
+index 66af8444..acdb812c 100644
+--- a/src/Layers/xrRender/dxImGuiRender.cpp
++++ b/src/Layers/xrRender/dxImGuiRender.cpp
+@@ -53,7 +53,7 @@ void dxImGuiRender::Frame()
+ 
+ void dxImGuiRender::Render(ImDrawData* data)
+ {
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     if (data->CmdListsCount == 0)
+         return;
+ #endif
+diff --git a/src/Layers/xrRender/r__occlusion.cpp b/src/Layers/xrRender/r__occlusion.cpp
+index 30681103..7d83cec9 100644
+--- a/src/Layers/xrRender/r__occlusion.cpp
++++ b/src/Layers/xrRender/r__occlusion.cpp
+@@ -99,7 +99,7 @@ R_occlusion::occq_result R_occlusion::occq_get(u32& ID)
+     CTimer T;
+     T.Start();
+     RImplementation.BasicStats.Wait.Begin();
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     if ((hr = GetData(used[ID].Q, &fragments, sizeof(fragments))) == S_FALSE)
+         fragments = (occq_result)-1;
+ #else
+diff --git a/src/Layers/xrRender/r__sync_point.cpp b/src/Layers/xrRender/r__sync_point.cpp
+index 50d2fb2e..b89c5307 100644
+--- a/src/Layers/xrRender/r__sync_point.cpp
++++ b/src/Layers/xrRender/r__sync_point.cpp
+@@ -17,7 +17,7 @@ bool R_sync_point::Wait(u32 /*wait_sleep*/, u64 timeout)
+     ZoneScoped;
+     CHK_GL(q_sync_point[q_sync_count] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0));
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     return true; // WebGL cannot block on a fence; End() still deletes it
+ #endif
+ 
+diff --git a/src/Layers/xrRenderGL/glBCDecode.h b/src/Layers/xrRenderGL/glBCDecode.h
+new file mode 100644
+index 00000000..33fe2a04
+--- /dev/null
++++ b/src/Layers/xrRenderGL/glBCDecode.h
+@@ -0,0 +1,109 @@
++#pragma once
++// Распаковка BC1/BC2/BC3 (DXT1/DXT3/DXT5) в RGBA8 на CPU.
++// Нужна для OpenGL ES на iOS: у GPU Apple A10 и старше нет S3TC, а текстуры игры — в DDS/DXT.
++// Временное решение до перекодировки в ASTC.
++
++#include <cstdint>
++#include <cstring>
++
++namespace xray::render::bc
++{
++inline void rgb565(uint16_t c, uint8_t out[3])
++{
++    const uint32_t r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
++    out[0] = uint8_t((r * 527 + 23) >> 6);
++    out[1] = uint8_t((g * 259 + 33) >> 6);
++    out[2] = uint8_t((b * 527 + 23) >> 6);
++}
++
++// Цветовой блок (8 байт) → 16 пикселей RGBA.
++// isBC1: при c0 <= c1 блок трёхцветный; punchAlpha: четвёртый цвет прозрачный (DXT1a), иначе чёрный.
++inline void decode_color(const uint8_t* block, uint8_t rgba[16][4], bool isBC1, bool punchAlpha)
++{
++    const uint16_t c0 = uint16_t(block[0] | (block[1] << 8));
++    const uint16_t c1 = uint16_t(block[2] | (block[3] << 8));
++    uint8_t pal[4][4];
++    rgb565(c0, pal[0]);
++    rgb565(c1, pal[1]);
++    pal[0][3] = pal[1][3] = 255;
++    if (c0 > c1 || !isBC1)
++    {
++        for (int k = 0; k < 3; ++k)
++        {
++            pal[2][k] = uint8_t((2 * pal[0][k] + pal[1][k] + 1) / 3);
++            pal[3][k] = uint8_t((pal[0][k] + 2 * pal[1][k] + 1) / 3);
++        }
++        pal[2][3] = pal[3][3] = 255;
++    }
++    else
++    {
++        for (int k = 0; k < 3; ++k)
++        {
++            pal[2][k] = uint8_t((pal[0][k] + pal[1][k] + 1) / 2);
++            pal[3][k] = 0;
++        }
++        pal[2][3] = 255;
++        pal[3][3] = punchAlpha ? 0 : 255;
++    }
++    const uint32_t idx = uint32_t(block[4] | (block[5] << 8) | (block[6] << 16) | (uint32_t(block[7]) << 24));
++    for (int i = 0; i < 16; ++i)
++        std::memcpy(rgba[i], pal[(idx >> (2 * i)) & 3], 4);
++}
++
++inline void decode_alpha_bc2(const uint8_t* block, uint8_t rgba[16][4])
++{
++    for (int i = 0; i < 16; ++i)
++    {
++        const uint8_t a = uint8_t((block[i / 2] >> ((i & 1) * 4)) & 15);
++        rgba[i][3] = uint8_t(a * 17);
++    }
++}
++
++inline void decode_alpha_bc3(const uint8_t* block, uint8_t rgba[16][4])
++{
++    uint8_t a[8];
++    a[0] = block[0];
++    a[1] = block[1];
++    if (a[0] > a[1])
++        for (int i = 1; i < 7; ++i)
++            a[i + 1] = uint8_t(((7 - i) * a[0] + i * a[1] + 3) / 7);
++    else
++    {
++        for (int i = 1; i < 5; ++i)
++            a[i + 1] = uint8_t(((5 - i) * a[0] + i * a[1] + 2) / 5);
++        a[6] = 0;
++        a[7] = 255;
++    }
++    uint64_t bits = 0;
++    for (int i = 0; i < 6; ++i)
++        bits |= uint64_t(block[2 + i]) << (8 * i);
++    for (int i = 0; i < 16; ++i)
++        rgba[i][3] = a[(bits >> (3 * i)) & 7];
++}
++
++enum class kind { bc1, bc1a, bc2, bc3 };
++
++// Распаковывает уровень (width×height) из блоков src в плотный RGBA8 dst (width*height*4 байт).
++inline void decode_level(kind k, const uint8_t* src, uint32_t width, uint32_t height, uint8_t* dst)
++{
++    const uint32_t bw = (width + 3) / 4, bh = (height + 3) / 4;
++    const uint32_t blockSize = (k == kind::bc1 || k == kind::bc1a) ? 8 : 16;
++    uint8_t px[16][4];
++    for (uint32_t by = 0; by < bh; ++by)
++    {
++        for (uint32_t bx = 0; bx < bw; ++bx, src += blockSize)
++        {
++            switch (k)
++            {
++            case kind::bc1: decode_color(src, px, true, false); break;
++            case kind::bc1a: decode_color(src, px, true, true); break;
++            case kind::bc2: decode_color(src + 8, px, false, false); decode_alpha_bc2(src, px); break;
++            case kind::bc3: decode_color(src + 8, px, false, false); decode_alpha_bc3(src, px); break;
++            }
++            for (uint32_t y = 0; y < 4 && by * 4 + y < height; ++y)
++                for (uint32_t x = 0; x < 4 && bx * 4 + x < width; ++x)
++                    std::memcpy(dst + ((by * 4 + y) * width + bx * 4 + x) * 4, px[y * 4 + x], 4);
++        }
++    }
++}
++} // namespace xray::render::bc
+diff --git a/src/Layers/xrRenderGL/glBufferUtils.cpp b/src/Layers/xrRenderGL/glBufferUtils.cpp
+index 1e340112..49a7591b 100644
+--- a/src/Layers/xrRenderGL/glBufferUtils.cpp
++++ b/src/Layers/xrRenderGL/glBufferUtils.cpp
+@@ -5,7 +5,7 @@
+ 
+ namespace xray::render::RENDER_NAMESPACE
+ {
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ enum
+ {
+     LOCKFLAGS_FLUSH  = GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT,
+@@ -40,7 +40,7 @@ static HRESULT CreateBuffer(GLuint* pBuffer, const void* pData, u32 dataSize, bo
+     const GLenum target = bIndexBuffer ? GL_ELEMENT_ARRAY_BUFFER : GL_ARRAY_BUFFER;
+ 
+     glGenBuffers(1, pBuffer);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     if (bIndexBuffer)
+         BindVertexArray(0);
+ #endif
+@@ -196,7 +196,7 @@ void SetGLVertexPointer(SDeclaration* decl, u32 baseOffset)
+     SetVertexDeclaration(decl->dcl_code.data(), baseOffset);
+ }
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ namespace
+ {
+ struct VertexArrayKey
+@@ -344,7 +344,7 @@ void VertexStagingBuffer::Destroy()
+ 
+     if (m_DeviceBuffer)
+     {
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         ForgetVertexArrays(m_DeviceBuffer);
+ #endif
+         glDeleteBuffers(1, &m_DeviceBuffer);
+@@ -439,7 +439,7 @@ void IndexStagingBuffer::Destroy()
+ 
+     if (m_DeviceBuffer)
+     {
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         ForgetVertexArrays(m_DeviceBuffer);
+ #endif
+         glDeleteBuffers(1, &m_DeviceBuffer);
+@@ -464,7 +464,7 @@ size_t IndexStagingBuffer::GetVideoMemoryUsage() const
+         return 0;
+ 
+     GLint bufferSize;
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     glBindBuffer(GL_COPY_READ_BUFFER, m_DeviceBuffer);
+     CHK_GL(glGetBufferParameteriv(GL_COPY_READ_BUFFER, GL_BUFFER_SIZE, &bufferSize));
+ #else
+@@ -483,7 +483,7 @@ VertexStreamBuffer::~VertexStreamBuffer()
+ void VertexStreamBuffer::Create(size_t size)
+ {
+     CreateVertexBuffer(&m_DeviceBuffer, nullptr, size, true);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     streamVertexBuffers.push_back(m_DeviceBuffer);
+     m_HostBuffer.resize(size);
+ #endif
+@@ -495,7 +495,7 @@ void VertexStreamBuffer::Destroy()
+     if (m_DeviceBuffer == 0)
+         return;
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     ForgetVertexArrays(m_DeviceBuffer);
+     streamVertexBuffers.erase(std::find(streamVertexBuffers.begin(), streamVertexBuffers.end(), m_DeviceBuffer));
+ #endif
+@@ -503,7 +503,7 @@ void VertexStreamBuffer::Destroy()
+     m_DeviceBuffer = 0;
+ }
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ void* VertexStreamBuffer::Map(size_t offset, size_t size, bool flush /*= false*/)
+ {
+     VERIFY(m_DeviceBuffer);
+@@ -566,7 +566,7 @@ IndexStreamBuffer::~IndexStreamBuffer()
+ void IndexStreamBuffer::Create(size_t size)
+ {
+     CreateIndexBuffer(&m_DeviceBuffer, nullptr, size, true);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     m_HostBuffer.resize(size);
+ #endif
+     AddRef();
+@@ -577,20 +577,20 @@ void IndexStreamBuffer::Destroy()
+     if (m_DeviceBuffer == 0)
+         return;
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     ForgetVertexArrays(m_DeviceBuffer);
+ #endif
+     glDeleteBuffers(1, &m_DeviceBuffer);
+     m_DeviceBuffer = 0;
+ }
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ constexpr GLenum INDEX_UPLOAD_TARGET = GL_COPY_WRITE_BUFFER;
+ #else
+ constexpr GLenum INDEX_UPLOAD_TARGET = GL_ELEMENT_ARRAY_BUFFER;
+ #endif
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ void* IndexStreamBuffer::Map(size_t offset, size_t size, bool flush /*= false*/)
+ {
+     VERIFY(m_DeviceBuffer);
+diff --git a/src/Layers/xrRenderGL/glHW.cpp b/src/Layers/xrRenderGL/glHW.cpp
+index 4b52ce87..60847dac 100644
+--- a/src/Layers/xrRenderGL/glHW.cpp
++++ b/src/Layers/xrRenderGL/glHW.cpp
+@@ -5,6 +5,9 @@
+ #pragma hdrstop
+ 
+ #include "glHW.h"
++#if defined(XR_PLATFORM_APPLE) && defined(XR_GL_ES)
++#include <SDL_syswm.h>
++#endif
+ #include "xrEngine/XR_IOConsole.h"
+ 
+ namespace xray::render::RENDER_NAMESPACE
+@@ -141,10 +144,27 @@ void CHW::CreateDevice(SDL_Window* hWnd)
+     }
+ 
+     int version;
++#ifdef XR_GL_ES
++    {
++        ZoneScopedN("gladLoadGLES2");
++        version = gladLoadGLES2(reinterpret_cast<GLADloadfunc>(SDL_GL_GetProcAddress));
++    }
++    BaseVertexDrawSupported = false; // в OpenGL ES 3.0 нет glDrawElementsBaseVertex
++#   ifdef XR_PLATFORM_APPLE
++    {
++        SDL_SysWMinfo info;
++        SDL_VERSION(&info.version);
++        if (SDL_GetWindowWMInfo(m_window, &info) && info.subsystem == SDL_SYSWM_UIKIT)
++            WindowFB = info.info.uikit.framebuffer;
++        Msg("* iOS: framebuffer окна = %u", WindowFB);
++    }
++#   endif
++#else
+     {
+         ZoneScopedN("gladLoadGL");
+         version = gladLoadGL(reinterpret_cast<GLADloadfunc>(SDL_GL_GetProcAddress));
+     }
++#endif
+ #endif
+     if (version == 0)
+     {
+@@ -180,7 +200,7 @@ void CHW::CreateDevice(SDL_Window* hWnd)
+     Msg("* GPU OpenGL shading language version: %s", ShadingVersion);
+     Msg("* GPU OpenGL VTF units: [%d] CTI units: [%d]", iMaxVTFUnits, iMaxCTIUnits);
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     TextureUploadUnit = u32(iMaxCTIUnits) - 1;
+     R_ASSERT2(TextureUploadUnit >= CTexture::rstVertex + CTexture::mtMaxVertexShaderTextures,
+         "too few texture units for a dedicated upload unit");
+@@ -232,6 +252,21 @@ void CHW::SetPrimaryAttributes(u32& windowFlags)
+ #endif
+     windowFlags |= SDL_WINDOW_OPENGL;
+ 
++#ifdef XR_GL_ES
++    // iOS: OpenGL ES 3.0. Глубина и трафарет окна не нужны — движок рисует в свои цели.
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
++    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
++    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
++    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
++    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
++    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
++    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
++    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
++    return;
++#endif
++
+     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+ 
+     SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+@@ -306,7 +341,11 @@ void CHW::Present()
+     RImplementation.Target->phase_flip();
+ #else
+     glBindFramebuffer(GL_READ_FRAMEBUFFER, pFB);
++#if defined(XR_PLATFORM_APPLE) && defined(XR_GL_ES)
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, WindowFB);
++#else
+     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++#endif
+     glBlitFramebuffer(
+         0, 0, Device.dwWidth, Device.dwHeight,
+         0, 0, Device.dwWidth, Device.dwHeight,
+@@ -352,7 +391,7 @@ void CHW::EndPixEvent() const
+ }
+ } // namespace xray::render::RENDER_NAMESPACE
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ namespace xray::render::RENDER_NAMESPACE
+ {
+ texture_upload_unit::texture_upload_unit(GLenum target) : target(target)
+diff --git a/src/Layers/xrRenderGL/glHW.h b/src/Layers/xrRenderGL/glHW.h
+index f645ad6d..eceb037b 100644
+--- a/src/Layers/xrRenderGL/glHW.h
++++ b/src/Layers/xrRenderGL/glHW.h
+@@ -63,21 +63,27 @@ public:
+ 
+ #ifdef XR_PLATFORM_WEB
+     EMSCRIPTEN_WEBGL_CONTEXT_HANDLE m_webgl{};
++#endif
++#ifdef XR_GL_ES
+     bool BaseVertexDrawSupported{};
+ #endif
++#if defined(XR_PLATFORM_APPLE) && defined(XR_GL_ES)
++    // iOS: у окна нет framebuffer 0 — SDL создаёт свой FBO (SDL_SysWMinfo::uikit.framebuffer).
++    GLuint WindowFB{};
++#endif
+ 
+     pcstr AdapterName;
+     pcstr OpenGLVersionString;
+     pcstr ShadingVersion;
+     bool ComputeShadersSupported;
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     u32 TextureUploadUnit{};
+ #endif
+ };
+ 
+ struct texture_upload_unit
+ {
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     const GLenum target;
+     explicit texture_upload_unit(GLenum target);
+     ~texture_upload_unit();
+diff --git a/src/Layers/xrRenderGL/glR_Backend_Runtime.h b/src/Layers/xrRenderGL/glR_Backend_Runtime.h
+index bb4c2748..27ca4788 100644
+--- a/src/Layers/xrRenderGL/glR_Backend_Runtime.h
++++ b/src/Layers/xrRenderGL/glR_Backend_Runtime.h
+@@ -56,7 +56,7 @@ IC void CBackend::ClearRT(GLuint rt, const Fcolor& color)
+     CHK_GL(glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rt, 0));
+ 
+     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     colorwrite_mask = u32(-1);
+ #endif
+     glClearColor(color.r, color.g, color.b, color.a);
+@@ -71,7 +71,7 @@ IC void CBackend::ClearZB(GLuint zb, float depth)
+     CHK_GL(glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, zb, 0));
+ 
+     glDepthMask(GL_TRUE);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     depth_write_mask = TRUE;
+ #endif
+     glClearDepthf(depth);
+@@ -89,7 +89,7 @@ IC void CBackend::ClearZB(GLuint zb, float depth, u8 stencil)
+     glClearDepthf(depth);
+ 
+     glStencilMask(~0);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     depth_write_mask = TRUE;
+     stencil_writemask = u32(~0);
+ #endif
+@@ -116,7 +116,7 @@ IC bool CBackend::ClearRTRect(GLuint rt, const Fcolor& color, size_t numRects, c
+ 
+         // Clear the color buffer without affecting the global state
+         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         colorwrite_mask = u32(-1);
+ #endif
+         glClearColor(color.r, color.g, color.b, color.a);
+@@ -146,7 +146,7 @@ IC bool CBackend::ClearZBRect(GLuint zb, float depth, size_t numRects, const Ire
+         CHK_GL(glScissor(rects->left, bottom, rects->width(), rects->height()));
+ 
+         glDepthMask(GL_TRUE);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         depth_write_mask = TRUE;
+ #endif
+         glClearDepthf(depth);
+@@ -159,7 +159,7 @@ IC bool CBackend::ClearZBRect(GLuint zb, float depth, size_t numRects, const Ire
+     return true;
+ }
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ inline SDeclaration* g_boundDeclaration = nullptr;
+ inline GLuint g_boundVertexArray = 0;
+ 
+@@ -181,7 +181,7 @@ ICF void CBackend::set_Format(SDeclaration* _decl)
+ 		stat.decl++;
+ #endif
+         decl = _decl;
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         BindVertexArray(_decl->dcl);
+         g_boundDeclaration = _decl;
+         vb = 0;
+@@ -289,7 +289,7 @@ ICF void CBackend::set_Vertices(GLuint _vb, u32 _vb_stride)
+         }
+         else
+         {
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+             if (g_boundDeclaration)
+             {
+                 g_boundDeclaration->bound_vb = vb;
+@@ -312,7 +312,7 @@ ICF void CBackend::set_Indices(GLuint _ib)
+ 		stat.ib++;
+ #endif
+         ib = _ib;
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         if (g_boundDeclaration)
+             g_boundDeclaration->bound_ib = ib;
+ #else
+@@ -365,9 +365,11 @@ IC u32 GetIndexCount(D3DPRIMITIVETYPE T, u32 iPrimitiveCount)
+     }
+ }
+ 
++#ifdef XR_GL_ES
+ #ifdef XR_PLATFORM_WEB
+ extern "C" void glDrawElementsInstancedBaseVertexBaseInstanceWEBGL(
+     GLenum, GLsizei, GLenum, const void*, GLsizei, GLint, GLuint);
++#endif
+ 
+ ICF void CBackend::SetBaseVertex(u32 baseV)
+ {
+@@ -398,6 +400,7 @@ ICF void CBackend::SetBaseVertex(u32 baseV)
+ ICF void CBackend::DrawIndexedBaseVertex(GLenum topology, u32 indexCount, u32 startI, u32 baseV)
+ {
+     const void* indices = (void*)(startI * sizeof(GLushort));
++#ifdef XR_PLATFORM_WEB
+     if (HW.BaseVertexDrawSupported)
+     {
+         SetBaseVertex(0);
+@@ -405,6 +408,7 @@ ICF void CBackend::DrawIndexedBaseVertex(GLenum topology, u32 indexCount, u32 st
+             topology, indexCount, GL_UNSIGNED_SHORT, indices, 1, baseV, 0);
+         return;
+     }
++#endif
+     SetBaseVertex(baseV);
+     CHK_GL(glDrawElements(topology, indexCount, GL_UNSIGNED_SHORT, indices));
+ }
+@@ -419,7 +423,7 @@ ICF void CBackend::Render(D3DPRIMITIVETYPE T, u32 baseV, u32 startV, u32 countV,
+     stat.render.verts += countV;
+     stat.render.polys += PC;
+     constants.flush();
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     DrawIndexedBaseVertex(Topology, iIndexCount, startI, baseV);
+ #else
+     CHK_GL(glDrawElementsBaseVertex(Topology, iIndexCount, GL_UNSIGNED_SHORT, (void*)(startI * sizeof(GLushort)), baseV));
+@@ -436,7 +440,7 @@ ICF void CBackend::Render(D3DPRIMITIVETYPE T, u32 startV, u32 PC)
+     stat.render.verts += iIndexCount;
+     stat.render.polys += PC;
+     constants.flush();
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     SetBaseVertex(0);
+ #endif
+     CHK_GL(glDrawArrays(Topology, startV, iIndexCount));
+@@ -479,7 +483,7 @@ IC void CBackend::SetViewport(const D3D_VIEWPORT& viewport) const
+ IC void CBackend::set_Stencil(u32 _enable, u32 _func, u32 _ref, u32 _mask, u32 _writemask, u32 _fail, u32 _pass,
+                               u32 _zfail)
+ {
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     if (stencil_enable != _enable)
+     {
+         stencil_enable = _enable;
+@@ -553,7 +557,7 @@ IC void CBackend::set_ZFunc(u32 _func)
+     }
+ }
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ IC void CBackend::set_DepthWrite(u32 _enable)
+ {
+     if (depth_write_mask == _enable)
+@@ -632,7 +636,7 @@ ICF void CBackend::set_FillMode(u32 _mode)
+     if (fill_mode != _mode)
+     {
+         fill_mode = _mode;
+-#ifndef XR_PLATFORM_WEB // wireframe is a debug feature; GLES has no glPolygonMode
++#ifndef XR_GL_ES // wireframe is a debug feature; GLES has no glPolygonMode
+         glPolygonMode(GL_FRONT_AND_BACK, glStateUtils::ConvertFillMode(_mode));
+ #endif
+     }
+@@ -695,7 +699,7 @@ void CBackend::set_pass_targets(const ref_rt& _1, const ref_rt& _2, const ref_rt
+     set_RT(_3 ? _3->pRT : 0, 2);
+     set_ZB(zb ? zb->pZRT : 0);
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     VERIFY(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+ #else
+     [[maybe_unused]] GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+diff --git a/src/Layers/xrRenderGL/glResourceManager_Resources.cpp b/src/Layers/xrRenderGL/glResourceManager_Resources.cpp
+index 7625fcb3..d751ea19 100644
+--- a/src/Layers/xrRenderGL/glResourceManager_Resources.cpp
++++ b/src/Layers/xrRenderGL/glResourceManager_Resources.cpp
+@@ -112,7 +112,7 @@ bool CResourceManager::_LinkPP(SPass& pass)
+     else
+     {
+         pp.pp = GLLinkMonolithicProgram(pp.cName.c_str(), pass.ps->sh, pass.vs->sh, pass.gs->sh);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         if (pp.pp)
+             pp.constants.parse(&pp.pp, RC_dest_all);
+ #else
+diff --git a/src/Layers/xrRenderGL/glSH_RT.cpp b/src/Layers/xrRenderGL/glSH_RT.cpp
+index f34a2fdb..d32231f8 100644
+--- a/src/Layers/xrRenderGL/glSH_RT.cpp
++++ b/src/Layers/xrRenderGL/glSH_RT.cpp
+@@ -33,7 +33,7 @@ void CRT::create(LPCSTR Name, u32 w, u32 h, D3DFORMAT f, u32 SampleCount /*= 1*/
+ 
+     // Get caps
+     GLint max_width, max_height;
+-#if defined(XR_PLATFORM_APPLE) || defined(XR_PLATFORM_WEB) // GLES 3.0 has no GL_MAX_FRAMEBUFFER_WIDTH either
++#if defined(XR_PLATFORM_APPLE) || defined(XR_GL_ES) // GLES 3.0 has no GL_MAX_FRAMEBUFFER_WIDTH either
+     // https://developer.apple.com/library/archive/documentation/GraphicsImaging/Conceptual/OpenGL-MacProgGuide/opengl_offscreen/opengl_offscreen.html
+     CHK_GL(glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_width));
+     max_height = max_width;
+@@ -90,7 +90,7 @@ void CRT::reset_end()
+ void CRT::resolve_into(CRT& destination) const
+ {
+     glReadBuffer(GL_COLOR_ATTACHMENT0);
+-#ifndef XR_PLATFORM_WEB // glDrawBuffers below covers it; glDrawBuffer does not exist in GLES
++#ifndef XR_GL_ES // glDrawBuffers below covers it; glDrawBuffer does not exist in GLES
+     glDrawBuffer(GL_COLOR_ATTACHMENT1);
+ #endif
+ 
+@@ -98,7 +98,7 @@ void CRT::resolve_into(CRT& destination) const
+     RCache.set_RT(pRT, 0);
+     RCache.set_RT(destination.pRT, 1);
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     VERIFY(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+ #else
+     [[maybe_unused]] GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+@@ -110,7 +110,7 @@ void CRT::resolve_into(CRT& destination) const
+         GL_COLOR_BUFFER_BIT, GL_NEAREST));
+ }
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ void CRT::copy_into(CRT& destination) const
+ {
+     RCache.set_RT(pRT, 0);
+diff --git a/src/Layers/xrRenderGL/glSH_Texture.cpp b/src/Layers/xrRenderGL/glSH_Texture.cpp
+index 664c2078..4815b15b 100644
+--- a/src/Layers/xrRenderGL/glSH_Texture.cpp
++++ b/src/Layers/xrRenderGL/glSH_Texture.cpp
+@@ -94,7 +94,7 @@ void CTexture::apply_theora(CBackend& cmd_list, u32 dwStage)
+         u32 _w = pTheora->Width(true);
+         u32 _h = pTheora->Height(true);
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         xr_vector<u32> frame(_w * _h);
+         int framePos = 0;
+         pTheora->DecompressFrame(frame.data(), 0, framePos);
+@@ -369,7 +369,7 @@ void CTexture::desc_update()
+     desc_cache = pSurface;
+     if (pSurface && (GL_TEXTURE_2D == desc || GL_TEXTURE_2D_MULTISAMPLE == desc))
+     {
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         m_width = m_loaded_width;
+         m_height = m_loaded_height;
+ #else
+diff --git a/src/Layers/xrRenderGL/glState.cpp b/src/Layers/xrRenderGL/glState.cpp
+index 3f12049f..1c0a8edc 100644
+--- a/src/Layers/xrRenderGL/glState.cpp
++++ b/src/Layers/xrRenderGL/glState.cpp
+@@ -39,7 +39,7 @@ glState* glState::Create()
+     return xr_new<glState>();
+ }
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ namespace
+ {
+ GLuint boundSamplers[CTexture::mtMaxCombinedShaderTextures]{};
+@@ -54,7 +54,7 @@ void glState::Apply()
+     {
+         if (m_samplerArray[stage])
+         {
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+             if (boundSamplers[stage] != m_samplerArray[stage])
+             {
+                 boundSamplers[stage] = m_samplerArray[stage];
+@@ -68,7 +68,7 @@ void glState::Apply()
+             {
+                 CHK_GL(glSamplerParameterf(m_samplerArray[stage], GL_TEXTURE_MIN_LOD, 0.f));
+                 CHK_GL(glSamplerParameterf(m_samplerArray[stage], GL_TEXTURE_MAX_LOD, FLT_MAX));
+-#ifndef XR_PLATFORM_WEB
++#ifndef XR_GL_ES
+                 CHK_GL(glSamplerParameterf(m_samplerArray[stage], GL_TEXTURE_LOD_BIAS, ps_r__tf_Mipbias));
+ #endif
+             }
+@@ -91,7 +91,7 @@ void glState::Apply()
+         m_pDepthStencilState.StencilDepthFailOp
+     );
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     RCache.set_DepthWrite(m_pDepthStencilState.DepthWriteMask ? TRUE : FALSE);
+     RCache.set_Blend(m_pBlendState.BlendEnable, m_pBlendState.SrcBlend, m_pBlendState.DestBlend,
+         m_pBlendState.SrcBlendAlpha, m_pBlendState.DestBlendAlpha, m_pBlendState.BlendOp,
+@@ -259,7 +259,7 @@ void glState::UpdateSamplerState(u32 stage, u32 name, u32 value)
+         break;
+     case D3DSAMP_BORDERCOLOR: /* D3DCOLOR */
+     {
+-#ifndef XR_PLATFORM_WEB
++#ifndef XR_GL_ES
+         GLuint color[] = {color_get_R(value), color_get_G(value), color_get_B(value), color_get_A(value)};
+         CHK_GL(glSamplerParameterIuiv(m_samplerArray[stage], GL_TEXTURE_BORDER_COLOR, color));
+ #endif
+@@ -278,7 +278,7 @@ void glState::UpdateSamplerState(u32 stage, u32 name, u32 value)
+             value, currentFilter, true)));
+         break;
+     case D3DSAMP_MIPMAPLODBIAS: /* float Mipmap LOD bias */
+-#ifndef XR_PLATFORM_WEB
++#ifndef XR_GL_ES
+         CHK_GL(glSamplerParameterf(m_samplerArray[stage], GL_TEXTURE_LOD_BIAS, value));
+ #endif
+         break;
+diff --git a/src/Layers/xrRenderGL/glStateUtils.cpp b/src/Layers/xrRenderGL/glStateUtils.cpp
+index 30519005..ecb595f1 100644
+--- a/src/Layers/xrRenderGL/glStateUtils.cpp
++++ b/src/Layers/xrRenderGL/glStateUtils.cpp
+@@ -164,7 +164,7 @@ GLint ConvertTextureAddressMode(u32 Mode)
+     case D3DTADDRESS_CLAMP:
+         return (GLint)GL_CLAMP_TO_EDGE;
+     case D3DTADDRESS_BORDER:
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         return (GLint)GL_CLAMP_TO_EDGE; // no border mode in GLES 3.0
+ #else
+         return (GLint)GL_CLAMP_TO_BORDER;
+diff --git a/src/Layers/xrRenderGL/glTexture.cpp b/src/Layers/xrRenderGL/glTexture.cpp
+index 1cee8526..2435a010 100644
+--- a/src/Layers/xrRenderGL/glTexture.cpp
++++ b/src/Layers/xrRenderGL/glTexture.cpp
+@@ -5,6 +5,9 @@
+ #include "stdafx.h"
+ 
+ #include <gli/gli.hpp>
++#ifdef XR_GL_ES
++#include "glBCDecode.h"
++#endif
+ 
+ namespace xray::render::RENDER_NAMESPACE
+ {
+@@ -42,6 +45,54 @@ int get_texture_load_lod(LPCSTR fn)
+     return 2;
+ }
+ 
++#ifdef XR_GL_ES
++// OpenGL ES на iOS: у GPU Apple нет S3TC, поэтому DXT1/3/5 распаковываются в RGBA8 при загрузке.
++// Это временно (память ×4–8) — до перекодировки текстур в ASTC.
++static gli::texture DecompressBCIfUnsupported(const gli::texture& t, pcstr name)
++{
++    if (!gli::is_compressed(t.format()) || GLAD_GL_EXT_texture_compression_s3tc)
++        return t;
++    namespace bc = xray::render::bc;
++    bc::kind k;
++    bool srgb = false;
++    switch (t.format())
++    {
++    case gli::FORMAT_RGB_DXT1_SRGB_BLOCK8: srgb = true; [[fallthrough]];
++    case gli::FORMAT_RGB_DXT1_UNORM_BLOCK8: k = bc::kind::bc1; break;
++    case gli::FORMAT_RGBA_DXT1_SRGB_BLOCK8: srgb = true; [[fallthrough]];
++    case gli::FORMAT_RGBA_DXT1_UNORM_BLOCK8: k = bc::kind::bc1a; break;
++    case gli::FORMAT_RGBA_DXT3_SRGB_BLOCK16: srgb = true; [[fallthrough]];
++    case gli::FORMAT_RGBA_DXT3_UNORM_BLOCK16: k = bc::kind::bc2; break;
++    case gli::FORMAT_RGBA_DXT5_SRGB_BLOCK16: srgb = true; [[fallthrough]];
++    case gli::FORMAT_RGBA_DXT5_UNORM_BLOCK16: k = bc::kind::bc3; break;
++    default:
++        Msg("! OpenGL ES: сжатый формат %d не поддерживается: %s", int(t.format()), name);
++        return t;
++    }
++    gli::texture out(t.target(), srgb ? gli::FORMAT_RGBA8_SRGB_PACK8 : gli::FORMAT_RGBA8_UNORM_PACK8,
++        t.extent(), t.layers(), t.faces(), t.levels());
++    const size_t blockSize = (k == bc::kind::bc1 || k == bc::kind::bc1a) ? 8 : 16;
++    for (size_t layer = 0; layer < t.layers(); ++layer)
++        for (size_t face = 0; face < t.faces(); ++face)
++            for (size_t level = 0; level < t.levels(); ++level)
++            {
++                const auto e = t.extent(level);
++                const auto* src = static_cast<const uint8_t*>(t.data(layer, face, level));
++                auto* dst = static_cast<uint8_t*>(out.data(layer, face, level));
++                const size_t srcSlice = size_t((e.x + 3) / 4) * size_t((e.y + 3) / 4) * blockSize;
++                const size_t dstSlice = size_t(e.x) * size_t(e.y) * 4;
++                for (int z = 0; z < e.z; ++z)
++                    bc::decode_level(k, src + z * srcSlice, u32(e.x), u32(e.y), dst + z * dstSlice);
++            }
++    static size_t decodedBytes = 0;
++    static u32 decodedCount = 0;
++    decodedBytes += out.size();
++    if ((++decodedCount % 200) == 1)
++        Msg("* OpenGL ES: распаковано DXT-текстур: %u, %u МБ RGBA8", decodedCount, u32(decodedBytes >> 20));
++    return out;
++}
++#endif
++
+ u32 calc_texture_size(int lod, u32 mip_cnt, size_t orig_size)
+ {
+     if (1 == mip_cnt)
+@@ -110,10 +161,13 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
+ #endif // DEBUG
+     gli::texture texture = gli::load((char*)S->pointer(), img_size);
+     R_ASSERT2(!texture.empty(), fn);
++#ifdef XR_GL_ES
++    texture = DecompressBCIfUnsupported(texture, fn);
++#endif
+ 
+     u32 mip_cnt = u32(-1); // XXX: write to it when reading with GLI!
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     gli::gl GL(gli::gl::PROFILE_ES30);
+ #else
+     gli::gl GL(gli::gl::PROFILE_GL33);
+@@ -130,7 +184,7 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
+     glTexParameteri(target, GL_TEXTURE_BASE_LEVEL, 0);
+     glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, static_cast<GLint>(texture.levels() - 1));
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     const bool swapRedBlue = !gli::is_compressed(texture.format()) && gli::block_size(texture.format()) == 4
+         && format.Swizzles[gli::SWIZZLE_RED] == GL_BLUE;
+     xr_vector<u8> reordered;
+diff --git a/src/Layers/xrRenderGL/glr_constants.cpp b/src/Layers/xrRenderGL/glr_constants.cpp
+index fdfb61ae..2fdbd7af 100644
+--- a/src/Layers/xrRenderGL/glr_constants.cpp
++++ b/src/Layers/xrRenderGL/glr_constants.cpp
+@@ -33,7 +33,7 @@ BOOL R_constant_table::parse(void* _desc, u32 destination)
+     GLint uniformCount;
+     CHK_GL(glGetProgramiv(program, GL_ACTIVE_UNIFORMS, &uniformCount));
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     u16 samplerStage = 0;
+ #endif
+ 
+@@ -124,7 +124,7 @@ BOOL R_constant_table::parse(void* _desc, u32 destination)
+                 C->handler = &binder_sampler;
+                 R_constant_load& L = C->samp;
+                 if (destination & RC_dest_all)
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+                     L.index = samplerStage;
+ #else
+                     L.index = r_index;
+@@ -141,7 +141,7 @@ BOOL R_constant_table::parse(void* _desc, u32 destination)
+                 R_ASSERT(C->type == RC_sampler);
+                 R_ASSERT(C->handler == &binder_sampler);
+                 R_constant_load& L = C->samp;
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+                 R_ASSERT((destination & RC_dest_all) || L.index == r_index);
+ #else
+                 R_ASSERT(L.index == r_index);
+@@ -150,7 +150,7 @@ BOOL R_constant_table::parse(void* _desc, u32 destination)
+                 R_ASSERT(L.location == r_location);
+                 R_ASSERT(L.program == program);
+             }
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+             ++samplerStage;
+ #endif
+         }
+diff --git a/src/Layers/xrRenderGL/glr_constants_cache.h b/src/Layers/xrRenderGL/glr_constants_cache.h
+index e1484bfc..a3cb1687 100644
+--- a/src/Layers/xrRenderGL/glr_constants_cache.h
++++ b/src/Layers/xrRenderGL/glr_constants_cache.h
+@@ -2,7 +2,7 @@
+ 
+ namespace xray::render::RENDER_NAMESPACE
+ {
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ class UniformShadow
+ {
+ public:
+@@ -40,7 +40,7 @@ private:
+     ICF void set(R_constant* C, R_constant_load& L, const Fmatrix& A)
+     {
+         VERIFY(RC_float == C->type);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         if (!g_uniformShadow.Update(L.program, L.location, &A, sizeof(A)))
+             return;
+ #endif
+@@ -89,7 +89,7 @@ private:
+     ICF void set(R_constant* C, R_constant_load& L, const Fvector4& A)
+     {
+         VERIFY(RC_float == C->type);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         if (!g_uniformShadow.Update(L.program, L.location, &A, sizeof(A)))
+             return;
+ #endif
+@@ -128,7 +128,7 @@ private:
+     ICF void set(R_constant* C, R_constant_load& L, float x, float y, float z, float w)
+     {
+         VERIFY(RC_float == C->type);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         const Fvector4 value{ x, y, z, w };
+         if (!g_uniformShadow.Update(L.program, L.location, &value, sizeof(value)))
+             return;
+@@ -170,7 +170,7 @@ private:
+     {
+         VERIFY(RC_float == C->type);
+         VERIFY(RC_1x1 == L.cls);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         if (!g_uniformShadow.Update(L.program, L.location, &A, sizeof(A)))
+             return;
+ #endif
+@@ -184,7 +184,7 @@ private:
+     {
+         VERIFY(RC_int == C->type);
+         VERIFY(RC_1x1 == L.cls);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         if (!g_uniformShadow.Update(L.program, L.location, &A, sizeof(A)))
+             return;
+ #endif
+@@ -271,7 +271,7 @@ public:
+         set(C, L, x, y, z, w);
+     }
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     ICF void seta(R_constant* C, u32 e, const Fvector4* values, u32 count)
+     {
+         VERIFY(RC_float == C->type);
+diff --git a/src/Layers/xrRenderGL/glr_screenshot.cpp b/src/Layers/xrRenderGL/glr_screenshot.cpp
+index 60fe082f..1d330873 100644
+--- a/src/Layers/xrRenderGL/glr_screenshot.cpp
++++ b/src/Layers/xrRenderGL/glr_screenshot.cpp
+@@ -33,7 +33,7 @@ void CRender::Screenshot(ScreenshotMode mode /*= SM_NORMAL*/, pcstr name /*= nul
+         xr_vector<u8> pixels;
+         pixels.resize(Device.dwWidth * Device.dwHeight * 3);
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         xr_vector<u8> rgba;
+         rgba.resize(Device.dwWidth * Device.dwHeight * 4);
+         glReadPixels(0, 0, Device.dwWidth, Device.dwHeight, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+diff --git a/src/Layers/xrRenderPC_GL/CMakeLists.txt b/src/Layers/xrRenderPC_GL/CMakeLists.txt
+index 9018d8bb..380be9f2 100644
+--- a/src/Layers/xrRenderPC_GL/CMakeLists.txt
++++ b/src/Layers/xrRenderPC_GL/CMakeLists.txt
+@@ -423,6 +423,11 @@ target_compile_definitions(xrRender_GL
+     PURE_DYNAMIC_CAST
+ )
+ 
++if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
++    # На iOS есть только OpenGL ES 3.0 — используем путь WebGL 2 / ES 3.0.
++    target_compile_definitions(xrRender_GL PRIVATE XR_GL_ES)
++endif()
++
+ set_target_properties(xrRender_GL PROPERTIES
+     PREFIX ""
+ )
+diff --git a/src/Layers/xrRenderPC_GL/gl_rendertarget.h b/src/Layers/xrRenderPC_GL/gl_rendertarget.h
+index 2173ccd6..639fb268 100644
+--- a/src/Layers/xrRenderPC_GL/gl_rendertarget.h
++++ b/src/Layers/xrRenderPC_GL/gl_rendertarget.h
+@@ -62,7 +62,7 @@ public:
+     ref_rt rt_Accumulator_temp; // only for HW which doesn't feature fp16 blend
+     ref_rt rt_Generic_0; // 32bit		(r,g,b,a)				// post-process, intermidiate results, etc.
+     ref_rt rt_Generic_1; // 32bit		(r,g,b,a)				// post-process, intermidiate results, etc.
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     ref_rt rt_Forward; // 32bit		(r,g,b,a)				// scene copy the forward pass draws into
+ #endif
+     //	Igor: for volumetric lights
+diff --git a/src/Layers/xrRenderPC_GL/gl_rendertarget_phase_combine.cpp b/src/Layers/xrRenderPC_GL/gl_rendertarget_phase_combine.cpp
+index 853b8fec..27ca0815 100644
+--- a/src/Layers/xrRenderPC_GL/gl_rendertarget_phase_combine.cpp
++++ b/src/Layers/xrRenderPC_GL/gl_rendertarget_phase_combine.cpp
+@@ -219,7 +219,7 @@ void CRenderTarget::phase_combine()
+     // Forward rendering
+     {
+         PIX_EVENT(Forward_rendering);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         rt_Generic_0_r->copy_into(*rt_Forward);
+         u_setrt(RCache, rt_Forward, nullptr, nullptr, rt_MSAADepth);
+ #else
+@@ -233,7 +233,7 @@ void CRenderTarget::phase_combine()
+         RImplementation.render_forward();
+         if (g_pGamePersistent)
+             g_pGamePersistent->OnRenderPPUI_main(); // PP-UI
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         rt_Forward->copy_into(*rt_Generic_0_r);
+ #endif
+     }
+diff --git a/src/Layers/xrRenderPC_GL/gl_rendertarget_u_set_rt.cpp b/src/Layers/xrRenderPC_GL/gl_rendertarget_u_set_rt.cpp
+index c35ac5e8..b4d370d2 100644
+--- a/src/Layers/xrRenderPC_GL/gl_rendertarget_u_set_rt.cpp
++++ b/src/Layers/xrRenderPC_GL/gl_rendertarget_u_set_rt.cpp
+@@ -89,7 +89,7 @@ void CRenderTarget::u_setrt(CBackend& cmd_list, const ref_rt& _1, const ref_rt&
+     VERIFY(dwWidth  != 0);
+     VERIFY(dwHeight != 0);
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     VERIFY(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+ #else
+     [[maybe_unused]] GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+@@ -164,7 +164,7 @@ void CRenderTarget::u_setrt(CBackend& cmd_list, const ref_rt& _1, const ref_rt&
+     VERIFY(dwWidth[cmd_list.context_id]  != 0);
+     VERIFY(dwHeight[cmd_list.context_id] != 0);
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     VERIFY(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+ #else
+     [[maybe_unused]] GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+@@ -194,7 +194,7 @@ void CRenderTarget::u_setrt(CBackend& cmd_list, u32 W, u32 H, GLuint _1, GLuint
+     cmd_list.set_RT(_3, 2);
+     cmd_list.set_ZB(zb);
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     VERIFY(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+ #else
+     [[maybe_unused]] GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+diff --git a/src/Layers/xrRenderPC_GL/r2_test_hw.cpp b/src/Layers/xrRenderPC_GL/r2_test_hw.cpp
+index 6734e1d6..c3ce2fc6 100644
+--- a/src/Layers/xrRenderPC_GL/r2_test_hw.cpp
++++ b/src/Layers/xrRenderPC_GL/r2_test_hw.cpp
+@@ -38,7 +38,7 @@ BOOL xrRender_test_hw()
+ {
+     ZoneScoped;
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     return TRUE;
+ #endif
+ 
+diff --git a/src/Layers/xrRenderPC_GL/rgl_shaders.cpp b/src/Layers/xrRenderPC_GL/rgl_shaders.cpp
+index ceb4d5ab..ff925b70 100644
+--- a/src/Layers/xrRenderPC_GL/rgl_shaders.cpp
++++ b/src/Layers/xrRenderPC_GL/rgl_shaders.cpp
+@@ -1,5 +1,5 @@
+ #include "stdafx.h"
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+ #include "rgl_essl_web.h"
+ #endif
+ #include "r2.h"
+@@ -227,7 +227,7 @@ HRESULT CRender::shader_compile(pcstr name, IReader* fs, pcstr pFunctionName,
+         sh_name.append(option);
+     };
+ 
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+     options.add("#version 300 es");
+ #else
+     options.add("#version 410");
+@@ -419,7 +419,7 @@ HRESULT CRender::shader_compile(pcstr name, IReader* fs, pcstr pFunctionName,
+     appendShaderOption(o.gbuffer_opt, "GBUFFER_OPTIMIZATION", "1");
+ 
+     // Shader Model 4.1
+-#if !defined(XR_PLATFORM_APPLE) && !defined(XR_PLATFORM_WEB) // WebGL2 has no textureGatherOffset either
++#if !defined(XR_PLATFORM_APPLE) && !defined(XR_GL_ES) // WebGL2 has no textureGatherOffset either
+     appendShaderOption(o.dx11_sm4_1, "SM_4_1", "1");
+     // Despite the fact that glsl 4.1 is claimed to be supported on macOS,
+     // the issue is that gatherTextureOffset requires compile-time constant offset argument.
+@@ -559,7 +559,7 @@ HRESULT CRender::shader_compile(pcstr name, IReader* fs, pcstr pFunctionName,
+         sources.compile(fs, options);
+ 
+         // Compile the shader from sources
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         std::string joined;
+         for (size_t i = 0; i < sources.length(); ++i)
+             joined += sources.get()[i];
+diff --git a/src/Layers/xrRenderPC_GL/stdafx.h b/src/Layers/xrRenderPC_GL/stdafx.h
+index 1602ed36..434e81a2 100644
+--- a/src/Layers/xrRenderPC_GL/stdafx.h
++++ b/src/Layers/xrRenderPC_GL/stdafx.h
+@@ -1,5 +1,11 @@
+ #pragma once
+ 
++// XR_GL_ES: ограничения OpenGL ES 3.0 / WebGL 2 (ESSL, без separate shader objects и т. п.).
++// Включается для WebGL-сборки и для iOS (CMake, xrRender_GL).
++#if defined(XR_PLATFORM_WEB) && !defined(XR_GL_ES)
++#define XR_GL_ES 1
++#endif
++
+ #pragma warning(disable:4995)
+ #include "xrEngine/stdafx.h"
+ #pragma warning(default:4995)
+diff --git a/src/Layers/xrRender_R2/r2_rendertarget.cpp b/src/Layers/xrRender_R2/r2_rendertarget.cpp
+index 55ae8027..a6713bba 100644
+--- a/src/Layers/xrRender_R2/r2_rendertarget.cpp
++++ b/src/Layers/xrRender_R2/r2_rendertarget.cpp
+@@ -312,7 +312,7 @@ CRenderTarget::CRenderTarget()
+         rt_Generic_0.create(r2_RT_generic0, w, h, D3DFMT_A8R8G8B8, 1);
+         rt_Generic_1.create(r2_RT_generic1, w, h, D3DFMT_A8R8G8B8, 1);
+         rt_Generic.create(r2_RT_generic, w, h, D3DFMT_A8R8G8B8, 1);
+-#ifdef XR_PLATFORM_WEB
++#ifdef XR_GL_ES
+         rt_Forward.create("$user$forward", w, h, D3DFMT_A8R8G8B8, 1);
+ #endif
+ 
 diff --git a/src/xrGame/MainMenu.cpp b/src/xrGame/MainMenu.cpp
 index 22028756..5dbab994 100644
 --- a/src/xrGame/MainMenu.cpp
