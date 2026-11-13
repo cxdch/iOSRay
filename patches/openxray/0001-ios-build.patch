@@ -54,10 +54,10 @@ index 3eb004d9..5f34ac1e 100644
  }
  
 diff --git a/src/xr_3da/CMakeLists.txt b/src/xr_3da/CMakeLists.txt
-index 2ea56a22..1a248c8e 100644
+index 2ea56a22..e38f6b61 100644
 --- a/src/xr_3da/CMakeLists.txt
 +++ b/src/xr_3da/CMakeLists.txt
-@@ -37,6 +37,11 @@ set_target_properties(xr_3da PROPERTIES
+@@ -37,6 +37,18 @@ set_target_properties(xr_3da PROPERTIES
      PREFIX ""
  )
  
@@ -65,6 +65,13 @@ index 2ea56a22..1a248c8e 100644
 -    DESTINATION "${CMAKE_INSTALL_BINDIR}"
 -)
 +if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
++    enable_language(OBJCXX)
++    target_sources(xr_3da PRIVATE ios_bootstrap.mm)
++    set_source_files_properties(ios_bootstrap.mm PROPERTIES
++        COMPILE_OPTIONS "-fobjc-arc"
++        SKIP_PRECOMPILE_HEADERS ON
++        SKIP_UNITY_BUILD_INCLUSION ON)
++    target_link_libraries(xr_3da PRIVATE SDL2::SDL2main "-framework Foundation")
 +    # На iOS исполняемый файл — это .app-бандл; пакет собирает проект iOSRay.
 +    install(TARGETS xr_3da BUNDLE DESTINATION "${CMAKE_INSTALL_BINDIR}")
 +else()
@@ -72,3 +79,174 @@ index 2ea56a22..1a248c8e 100644
 +        DESTINATION "${CMAKE_INSTALL_BINDIR}"
 +    )
 +endif()
+diff --git a/src/xr_3da/entry_point.cpp b/src/xr_3da/entry_point.cpp
+index 82d7da5d..1f1a7834 100644
+--- a/src/xr_3da/entry_point.cpp
++++ b/src/xr_3da/entry_point.cpp
+@@ -4,6 +4,16 @@
+ #include "xrGame/xrGame.h"
+ #include "Include/xrRender/xrRender.h"
+ 
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#endif
++#if defined(__APPLE__) && TARGET_OS_IOS
++#define XR_PLATFORM_IOS_APP 1
++// main() становится SDL_main(): SDL2main запускает UIKit и вызывает его из UIApplicationMain.
++#include <SDL_main.h>
++// ios_bootstrap.mm: папка игры в Documents, лог консоли, fsgame.ltx; возвращает доп. аргументы.
++extern "C" const char* xr_ios_prepare();
++#endif
+ #if !defined(XR_PLATFORM_WINDOWS)
+ #include <unistd.h>
+ #include <stdlib.h>
+@@ -86,14 +96,20 @@ int main(int argc, char *argv[])
+     {
+         char* commandLine = nullptr;
+         int i;
+-        if(argc > 1)
++#ifdef XR_PLATFORM_IOS_APP
++        const char* platformArgs = xr_ios_prepare();
++#else
++        const char* platformArgs = "";
++#endif
++        if(argc > 1 || *platformArgs)
+         {
+-            size_t sum = 1;
++            size_t sum = 1 + strlen(platformArgs);
+             for(i = 1; i < argc; ++i)
+                 sum += strlen(argv[i]) + 1;
+ 
+             commandLine = (char*)xr_malloc(sum);
+             ZeroMemory(commandLine, sum);
++            strcat(commandLine, platformArgs);
+ 
+             for(i = 1; i < argc; ++i)
+             {
+diff --git a/src/xr_3da/ios_bootstrap.mm b/src/xr_3da/ios_bootstrap.mm
+new file mode 100644
+index 00000000..ce7fcb98
+--- /dev/null
++++ b/src/xr_3da/ios_bootstrap.mm
+@@ -0,0 +1,121 @@
++// iOSRay: подготовка окружения движка на iOS перед entry_point().
++//
++// Что делает:
++//  1. Перенаправляет stdout/stderr в Documents/iosray-console.log — это первый лог,
++//     который пишется ещё до инициализации файловой системы движка.
++//  2. Выбирает папку игры в Documents (видна в приложении «Файлы»):
++//       Documents/soc — Тень Чернобыля (-shoc), Documents/cs — Чистое Небо (-cs),
++//       Documents/cop — Зов Припяти. Если папок нет, создаёт soc с инструкцией.
++//  3. Кладёт в папку игры fsgame.ltx из бандла (если там нет своего) и ссылку
++//     gamedata/shaders/gl на шейдеры OpenXRay из бандла.
++//  4. Делает папку игры текущей: LocatorAPI ищет fsgame.ltx в текущем каталоге.
++
++#import <Foundation/Foundation.h>
++#include <unistd.h>
++#include <stdio.h>
++#include <string>
++#include <sys/stat.h>
++
++namespace
++{
++NSString* Documents()
++{
++    return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
++}
++
++void RedirectConsole(NSString* docs)
++{
++    NSString* path = [docs stringByAppendingPathComponent:@"iosray-console.log"];
++    freopen(path.fileSystemRepresentation, "w", stdout);
++    setvbuf(stdout, nullptr, _IOLBF, 0);
++    dup2(fileno(stdout), fileno(stderr));
++    setvbuf(stderr, nullptr, _IONBF, 0);
++    NSDictionary* info = NSBundle.mainBundle.infoDictionary;
++    printf("[iOSRay] %s %s, %s\n", [info[@"CFBundleName"] UTF8String],
++           [info[@"CFBundleShortVersionString"] UTF8String], [NSProcessInfo.processInfo.operatingSystemVersionString UTF8String]);
++}
++
++void EnsureLink(NSString* link, NSString* target)
++{
++    NSFileManager* fm = NSFileManager.defaultManager;
++    NSString* current = [fm destinationOfSymbolicLinkAtPath:link error:nil];
++    if ([current isEqualToString:target])
++        return;
++    // Путь к бандлу меняется после каждой переустановки — пересоздаём ссылку.
++    if (current || [fm fileExistsAtPath:link])
++    {
++        BOOL isDir = NO;
++        [fm fileExistsAtPath:link isDirectory:&isDir];
++        if (current || !isDir)
++            [fm removeItemAtPath:link error:nil];
++        else
++        {
++            printf("[iOSRay] %s — настоящая папка, ссылку не создаю\n", link.fileSystemRepresentation);
++            return;
++        }
++    }
++    [fm createDirectoryAtPath:link.stringByDeletingLastPathComponent withIntermediateDirectories:YES attributes:nil error:nil];
++    NSError* err = nil;
++    if (![fm createSymbolicLinkAtPath:link withDestinationPath:target error:&err])
++        printf("[iOSRay] не удалось создать ссылку %s: %s\n", link.fileSystemRepresentation, err.localizedDescription.UTF8String);
++}
++} // namespace
++
++// Возвращает добавку к командной строке движка (например, "-shoc ").
++extern "C" const char* xr_ios_prepare()
++{
++    static std::string extraArgs;
++    @autoreleasepool
++    {
++        NSString* docs = Documents();
++        RedirectConsole(docs);
++        NSFileManager* fm = NSFileManager.defaultManager;
++
++        struct Game { NSString* folder; const char* args; const char* title; };
++        const Game games[] = {
++            { @"soc", "-shoc ", "Тень Чернобыля" },
++            { @"cs", "-cs ", "Чистое Небо" },
++            { @"cop", "", "Зов Припяти" },
++        };
++        const Game* chosen = nullptr;
++        for (const Game& g : games)
++        {
++            BOOL isDir = NO;
++            if ([fm fileExistsAtPath:[docs stringByAppendingPathComponent:g.folder] isDirectory:&isDir] && isDir)
++            {
++                chosen = &g;
++                break;
++            }
++        }
++        if (!chosen)
++        {
++            chosen = &games[0];
++            NSString* dir = [docs stringByAppendingPathComponent:chosen->folder];
++            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
++            NSString* readme =
++                @"Скопируйте сюда файлы S.T.A.L.K.E.R.: Тень Чернобыля 1.0006 из своей лицензионной копии\n"
++                 "(архивы gamedata.db*, папки levels/localization/resources, если есть).\n"
++                 "Папки cs и cop рядом — для Чистого Неба и Зова Припяти.\n";
++            [readme writeToFile:[dir stringByAppendingPathComponent:@"ПОЛОЖИТЕ_ИГРУ_СЮДА.txt"]
++                     atomically:YES encoding:NSUTF8StringEncoding error:nil];
++        }
++
++        NSString* gameDir = [docs stringByAppendingPathComponent:chosen->folder];
++        NSString* res = [NSBundle.mainBundle.resourcePath stringByAppendingPathComponent:@"res"];
++        printf("[iOSRay] игра: %s, папка: %s\n", chosen->title, gameDir.fileSystemRepresentation);
++
++        NSString* fsltx = [gameDir stringByAppendingPathComponent:@"fsgame.ltx"];
++        if (![fm fileExistsAtPath:fsltx])
++        {
++            [fm copyItemAtPath:[res stringByAppendingPathComponent:@"fsgame.ltx"] toPath:fsltx error:nil];
++            printf("[iOSRay] fsgame.ltx скопирован из бандла\n");
++        }
++        EnsureLink([gameDir stringByAppendingPathComponent:@"gamedata/shaders/gl"],
++                   [res stringByAppendingPathComponent:@"gamedata/shaders/gl"]);
++
++        chdir(gameDir.fileSystemRepresentation);
++        extraArgs = chosen->args;
++        fflush(stdout);
++    }
++    return extraArgs.c_str();
++}

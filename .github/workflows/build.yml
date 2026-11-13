@@ -68,14 +68,15 @@ jobs:
             --notes "Сборка ${GITHUB_SHA::7}. IPA — для SideStore, TIPA — для TrollStore."
 
   engine:
-    # Движок OpenXRay под iOS arm64: зависимости → исходники с патчами → сборка.
+    # Движок OpenXRay под iOS arm64: зависимости → исходники с патчами → сборка → IPA.
+    needs: ios          # релиз nightly создаёт job ios; движок добавляет в него свои файлы
     runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
       - name: Инструменты
-        run: brew install ninja
+        run: brew install ninja ldid
 
       - name: Кэш зависимостей
         id: deps-cache
@@ -93,6 +94,16 @@ jobs:
 
       - name: Сборка движка
         run: bash scripts/build_engine_ios.sh
+
+      - name: IPA движка
+        run: |
+          VERSION="0.1.${GITHUB_RUN_NUMBER}" BUILD="${GITHUB_RUN_NUMBER}" bash scripts/package_engine_ipa.sh
+
+      - name: Добавить в релиз nightly
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload nightly build/iOSRay-sidestore.ipa build/iOSRay-trollstore.tipa --clobber
 
       - name: Отчёт
         if: always()
