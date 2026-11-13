@@ -57,6 +57,8 @@ SDK_PATH="${SDKROOT:-$(xcrun --sdk iphoneos --show-sdk-path)}"
 if command -v llvm-ar-18 >/dev/null; then LJ_AR="llvm-ar-18 rcus"; else LJ_AR="ar rcus"; fi
 HOST_CC_BIN="$(command -v gcc || command -v clang)"
 make -C "$SRC/luajit/src" clean > /dev/null
+# Makefile LuaJIT на macOS-хосте требует MACOSX_DEPLOYMENT_TARGET (для host-утилит buildvm/minilua).
+MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}" \
 make -C "$SRC/luajit/src" -j "$JOBS" libluajit.a HOST_CC="$HOST_CC_BIN" CC=clang CROSS="" \
     TARGET_SYS=iOS TARGET_FLAGS="-target arm64-apple-ios15.0 -isysroot $SDK_PATH" \
     TARGET_AR="$LJ_AR" XCFLAGS="-DLUAJIT_DISABLE_JIT" BUILDMODE=static > "$SRC/luajit.build.log"
