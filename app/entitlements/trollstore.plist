@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Права для сборки под TrollStore (iPhone 7 Plus, iOS 15.8.8).
+     TrollStore сохраняет entitlements, заданные при фейковой подписи через ldid.
+     Песочница остаётся включённой: игра должна вести себя так же, как в SideStore-сборке. -->
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key>
+	<string>@BUNDLE_ID@</string>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+	<key>get-task-allow</key>
+	<true/>
+</dict>
+</plist>

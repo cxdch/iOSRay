@@ -1,0 +1,67 @@
+# Сборка XRProbe на облачном Mac (GitHub Actions, бесплатно для публичных репозиториев).
+# Результат: IPA для SideStore и TIPA для TrollStore — в артефактах и в релизе "nightly",
+# откуда их можно скачать прямо на iPhone.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Зафиксированный коммит OpenXRay, из которого берутся GL-шейдеры для теста.
+  OPENXRAY_REV: ddb78a5cfbe6719f4b5abe371e3fdeed0f3481fc
+
+jobs:
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Инструменты
+        run: |
+          brew install glslang spirv-cross ldid
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: GL-шейдеры OpenXRay
+        run: |
+          git init -q xray-16
+          cd xray-16
+          git remote add origin https://github.com/OpenXRay/xray-16.git
+          git sparse-checkout set res/gamedata/shaders/gl
+          git fetch -q --depth 1 --filter=blob:none origin "$OPENXRAY_REV"
+          git checkout -q FETCH_HEAD
+
+      - name: GLSL → SPIR-V → MSL
+        run: |
+          python3 -I scripts/convert_shaders.py xray-16/res/gamedata/shaders/gl shaders-out \
+            "$(command -v glslangValidator)" "$(command -v spirv-cross)" | tee shader-report.txt
+
+      - name: Сборка IPA
+        run: |
+          VERSION="0.1.${GITHUB_RUN_NUMBER}" BUILD="${GITHUB_RUN_NUMBER}" \
+            bash scripts/build_ipa.sh shaders-out/high
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XRProbe-${{ github.run_number }}
+          path: |
+            build/*.ipa
+            build/*.tipa
+            shader-report.txt
+            shaders-out/report.json
+
+      - name: Релиз nightly
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete nightly --yes --cleanup-tag || true
+          gh release create nightly build/*.ipa build/*.tipa shader-report.txt \
+            --prerelease --target "$GITHUB_SHA" --title "XRProbe nightly #${GITHUB_RUN_NUMBER}" \
+            --notes "Сборка ${GITHUB_SHA::7}. IPA — для SideStore, TIPA — для TrollStore."

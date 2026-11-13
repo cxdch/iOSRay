@@ -1,0 +1,6 @@
+build/
+shaders-out/
+xray-16/
+*.ipa
+*.tipa
+.DS_Store
