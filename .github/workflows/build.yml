@@ -66,3 +66,43 @@ jobs:
           gh release create nightly build/*.ipa build/*.tipa shader-report.txt \
             --prerelease --target "$GITHUB_SHA" --title "XRProbe nightly #${GITHUB_RUN_NUMBER}" \
             --notes "Сборка ${GITHUB_SHA::7}. IPA — для SideStore, TIPA — для TrollStore."
+
+  engine:
+    # Движок OpenXRay под iOS arm64: зависимости → исходники с патчами → сборка.
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Инструменты
+        run: brew install ninja
+
+      - name: Кэш зависимостей
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: build/ios-prefix
+          key: ios-deps-${{ hashFiles('scripts/build_deps_ios.sh', 'deps/**', 'cmake/ios.toolchain.cmake') }}
+
+      - name: Зависимости (SDL2, OpenAL Soft, Ogg/Vorbis/Theora, LZO, LuaJIT)
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: bash scripts/build_deps_ios.sh
+
+      - name: Исходники OpenXRay + патчи
+        run: bash scripts/fetch_openxray.sh
+
+      - name: Сборка движка
+        run: bash scripts/build_engine_ios.sh
+
+      - name: Отчёт
+        if: always()
+        run: |
+          mkdir -p report
+          cp build/engine/build.log report/ 2>/dev/null || true
+          grep -E "error:" build/engine/build.log | sort | uniq -c | sort -rn > report/errors.txt 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: engine-ios-${{ github.run_number }}
+          path: report/

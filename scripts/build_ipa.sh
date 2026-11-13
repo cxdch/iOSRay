@@ -49,7 +49,7 @@ build_variant() {
         mv "$app/$APP_NAME.dSYM" "$OUT/$APP_NAME-$variant.dSYM"
     fi
 
-    sed -e "s/@BUNDLE_ID@/$BUNDLE_ID/" -e "s/@VERSION@/$VERSION/" -e "s/@BUILD@/$BUILD/" \
+    sed -e "s/@BUNDLE_ID@/$BUNDLE_ID/" -e "s/@VERSION@/$VERSION/" -e "s/@BUILD@/$BUILD/" -e "s/@VARIANT@/$variant/" \
         "$ROOT/app/Info.plist" > "$app/Info.plist"
     printf 'APPL????' > "$app/PkgInfo"
 

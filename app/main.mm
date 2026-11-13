@@ -435,7 +435,7 @@ fragment float4 tri_fs(VOut in [[stage_in]]) { return float4(in.color, 1.0); }
                     : gMemTestResultMB > 0 ? [NSString stringWithFormat:@"занято до %.0f МБ", gMemTestResultMB.load()]
                                            : @"не запускался";
     _overlay.text = [NSString stringWithFormat:
-        @" XRProbe · S.T.A.L.K.E.R. iOS \n"
+        @" XRProbe %@ · S.T.A.L.K.E.R. iOS \n"
          " %@ · iOS %@ \n"
          " GPU: %@ \n"
          " Семейства: %@ · BC: %@ \n"
@@ -443,7 +443,7 @@ fragment float4 tri_fs(VOut in [[stage_in]]) { return float4(in.color, 1.0); }
          " Доступно памяти: %.0f МБ · нагрев: %@ \n"
          " Тест памяти: %@ \n"
          " Шейдеры OpenXRay: %@ ",
-        MachineModel(), UIDevice.currentDevice.systemVersion, _device.name, GPUFamilies(_device),
+        [NSBundle mainBundle].infoDictionary[@"XRVariant"] ?: @"", MachineModel(), UIDevice.currentDevice.systemVersion, _device.name, GPUFamilies(_device),
         SupportsBC(_device) ? @"да" : @"нет", _frameMsAvg, _frameMsAvg > 0 ? 1000.0 / _frameMsAvg : 0.0,
         (long)_touches, AvailableMemoryMB(), ThermalName(NSProcessInfo.processInfo.thermalState), mem, shaders];
 }
@@ -483,7 +483,8 @@ fragment float4 tri_fs(VOut in [[stage_in]]) { return float4(in.color, 1.0); }
 @implementation XRAppDelegate
 - (BOOL)application:(UIApplication*)app didFinishLaunchingWithOptions:(NSDictionary*)opts
 {
-    XRLog(@"Запуск XRProbe %@", [NSBundle mainBundle].infoDictionary[@"CFBundleShortVersionString"]);
+    NSDictionary* info = [NSBundle mainBundle].infoDictionary;
+    XRLog(@"Запуск XRProbe %@, сборка %@", info[@"CFBundleShortVersionString"], info[@"XRVariant"] ?: @"?");
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidReceiveMemoryWarningNotification
                                                       object:nil
                                                        queue:nil

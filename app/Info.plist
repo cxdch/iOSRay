@@ -20,6 +20,8 @@
 	<string>@VERSION@</string>
 	<key>CFBundleVersion</key>
 	<string>@BUILD@</string>
+	<key>XRVariant</key>
+	<string>@VARIANT@</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>iPhoneOS</string>

@@ -51,6 +51,12 @@ app/main.mm                    приложение (Objective-C++)
 app/Info.plist                 шаблон Info.plist
 app/entitlements/trollstore.plist  права для TrollStore-сборки
 scripts/convert_shaders.py     GLSL OpenXRay → SPIR-V → MSL, отчёт report.json
-scripts/build_ipa.sh           сборка и подпись двух вариантов IPA
+scripts/build_ipa.sh           сборка и подпись вариантов IPA XRProbe
+scripts/build_deps_ios.sh      зависимости движка для iOS (SDL2, OpenAL Soft, Ogg/Vorbis/Theora, LZO, LuaJIT)
+scripts/fetch_openxray.sh      OpenXRay на зафиксированном коммите + патчи из patches/openxray
+scripts/build_engine_ios.sh    сборка движка OpenXRay под iOS arm64
+cmake/ios.toolchain.cmake      тулчейн CMake (macOS/Xcode и Linux/clang+lld)
+deps/theora/CMakeLists.txt     сборка libtheora без autotools
+patches/openxray/              правки OpenXRay для iOS
 .github/workflows/build.yml    CI на macos-15
 ```

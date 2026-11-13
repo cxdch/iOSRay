@@ -1,0 +1,74 @@
+diff --git a/Externals/CMakeLists.txt b/Externals/CMakeLists.txt
+index 4b438f03..9b3f34a6 100644
+--- a/Externals/CMakeLists.txt
++++ b/Externals/CMakeLists.txt
+@@ -1,4 +1,13 @@
+-if (XRAY_USE_LUAJIT)
++if (XRAY_USE_LUAJIT AND CMAKE_SYSTEM_NAME STREQUAL "iOS")
++    # iOS: LuaJIT собирается заранее штатным Makefile (кросс-компиляция, без JIT),
++    # см. iOSRay/scripts/build_deps_ios.sh. Здесь — только импорт готовой библиотеки.
++    find_library(XRAY_IOS_LUAJIT_LIBRARY NAMES luajit luajit-5.1 REQUIRED)
++    add_library(xrLuaJIT STATIC IMPORTED GLOBAL)
++    set_target_properties(xrLuaJIT PROPERTIES
++        IMPORTED_LOCATION "${XRAY_IOS_LUAJIT_LIBRARY}"
++        INTERFACE_INCLUDE_DIRECTORIES "${XRAY_SOURCE_DIR}/Externals/LuaJIT/src"
++    )
++elseif (XRAY_USE_LUAJIT)
+     add_subdirectory(LuaJIT-proj)
+ else()
+     find_package(Lua51 REQUIRED)
+diff --git a/src/xrGame/MainMenu.cpp b/src/xrGame/MainMenu.cpp
+index 22028756..5dbab994 100644
+--- a/src/xrGame/MainMenu.cpp
++++ b/src/xrGame/MainMenu.cpp
+@@ -880,8 +880,8 @@ void CMainMenu::OnDownloadMPMap(CUIWindow* w, void* d)
+     STRCONCAT(params, "/C start ", url);
+     ShellExecute(0, "open", "cmd.exe", params, NULL, SW_SHOW);
+ #else
+-    std::string command = "xdg-open " + std::string{url};
+-    std::ignore = system(command.c_str());
++    // system() недоступен на iOS; SDL_OpenURL работает на Linux, macOS и iOS.
++    SDL_OpenURL(url);
+ #endif
+ }
+ 
+diff --git a/src/xrGame/login_manager.cpp b/src/xrGame/login_manager.cpp
+index 3eb004d9..5f34ac1e 100644
+--- a/src/xrGame/login_manager.cpp
++++ b/src/xrGame/login_manager.cpp
+@@ -1,4 +1,5 @@
+ #include "StdAfx.h"
++#include <SDL.h>
+ #include "login_manager.h"
+ #include "account_manager.h"
+ #include "MainMenu.h"
+@@ -407,8 +408,8 @@ void login_manager::forgot_password(char const* url)
+     STRCONCAT(params, "/C start ", url);
+     ShellExecute(0, "open", "cmd.exe", params, NULL, SW_SHOW);
+ #else
+-    std::string command = "xdg-open " + std::string{url};
+-    std::ignore = system(command.c_str());
++    // system() недоступен на iOS; SDL_OpenURL работает на Linux, macOS и iOS.
++    SDL_OpenURL(url);
+ #endif
+ }
+ 
+diff --git a/src/xr_3da/CMakeLists.txt b/src/xr_3da/CMakeLists.txt
+index 2ea56a22..1a248c8e 100644
+--- a/src/xr_3da/CMakeLists.txt
++++ b/src/xr_3da/CMakeLists.txt
+@@ -37,6 +37,11 @@ set_target_properties(xr_3da PROPERTIES
+     PREFIX ""
+ )
+ 
+-install(TARGETS xr_3da RUNTIME
+-    DESTINATION "${CMAKE_INSTALL_BINDIR}"
+-)
++if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
++    # На iOS исполняемый файл — это .app-бандл; пакет собирает проект iOSRay.
++    install(TARGETS xr_3da BUNDLE DESTINATION "${CMAKE_INSTALL_BINDIR}")
++else()
++    install(TARGETS xr_3da RUNTIME
++        DESTINATION "${CMAKE_INSTALL_BINDIR}"
++    )
++endif()
