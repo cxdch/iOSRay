@@ -1406,6 +1406,49 @@ index 55ae8027..a6713bba 100644
          rt_Forward.create("$user$forward", w, h, D3DFMT_A8R8G8B8, 1);
  #endif
  
+diff --git a/src/xrEngine/GameFont.cpp b/src/xrEngine/GameFont.cpp
+index add453d0..c5d5c4b2 100644
+--- a/src/xrEngine/GameFont.cpp
++++ b/src/xrEngine/GameFont.cpp
+@@ -68,7 +68,37 @@ void CGameFont::Initialize(pcstr cShader, pcstr cTextureName)
+     xr_strcpy(buf, cTexture);
+     if (strext(buf))
+         *strext(buf) = 0;
+-    R_ASSERT2(FS.exist(fn, "$game_textures$", buf, ".ini"), fn);
++    if (!FS.exist(fn, "$game_textures$", buf, ".ini"))
++    {
++        // Временная заглушка (iOSRay): нет файла метрик шрифта — режем текстуру
++        // равной сеткой 16x16. Размер клетки берём из заголовка DDS.
++        u32 texW = 256, texH = 256;
++        string_path dds;
++        if (FS.exist(dds, "$game_textures$", buf, ".dds"))
++        {
++            if (IReader* r = FS.r_open(dds))
++            {
++                if (r->length() >= 20 && r->r_u32() == 0x20534444) // "DDS "
++                {
++                    r->seek(12);
++                    texH = r->r_u32();
++                    texW = r->r_u32();
++                }
++                FS.r_close(r);
++            }
++        }
++        const int cpl = 16;
++        const float cellW = float(texW) / cpl, cellH = float(texH) / cpl;
++        Msg("! [iOSRay] нет метрик шрифта '%s.ini' — сетка 16x16 по текстуре %ux%u", buf, texW, texH);
++        nNumChars = 0x100;
++        TCMap = (Fvector*)xr_realloc((void*)TCMap, nNumChars * sizeof(Fvector));
++        fHeight = cellH;
++        for (u32 i = 0; i < nNumChars; i++)
++            TCMap[i].set((i % cpl) * cellW, (i / cpl) * cellH, cellW);
++        fCurrentHeight = fHeight;
++        pFontRender->Initialize(cShader, cTexture);
++        return;
++    }
+     CInifile* ini = CInifile::Create(fn);
+ 
+     nNumChars = 0x100;
 diff --git a/src/xrGame/MainMenu.cpp b/src/xrGame/MainMenu.cpp
 index 22028756..5dbab994 100644
 --- a/src/xrGame/MainMenu.cpp
