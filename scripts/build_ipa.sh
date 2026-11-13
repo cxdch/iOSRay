@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Сборка XRProbe в два IPA:
 #   build/XRProbe-sidestore.ipa  — без особых прав, ставится через SideStore/AltStore/Sideloadly;
-#   build/XRProbe-trollstore.tipa — фейковая подпись ldid с расширенными правами для TrollStore.
+#   build/XRProbe-trollstore.tipa — фейковая подпись ldid с расширенными правами для TrollStore;
+#   build/XRProbe-trollstore-base.tipa — то же без прав на память (для сравнения).
 #
 # На macOS (в том числе в GitHub Actions) всё берётся из Xcode через xcrun.
 # На Linux можно собрать тем же скриптом, если задать:
@@ -59,9 +60,9 @@ build_variant() {
     fi
 
     echo "== Подпись ($variant)"
-    if [[ "$variant" == trollstore ]]; then
+    if [[ "$variant" == trollstore* ]]; then
         local ent="$stage/entitlements.plist"
-        sed "s/@BUNDLE_ID@/$BUNDLE_ID/" "$ROOT/app/entitlements/trollstore.plist" > "$ent"
+        sed "s/@BUNDLE_ID@/$BUNDLE_ID/" "$ROOT/app/entitlements/$variant.plist" > "$ent"
         if command -v ldid >/dev/null; then
             ldid -S"$ent" "$app/$APP_NAME"
         else
@@ -90,3 +91,4 @@ build_variant() {
 
 build_variant sidestore ipa
 build_variant trollstore tipa
+build_variant trollstore-base tipa

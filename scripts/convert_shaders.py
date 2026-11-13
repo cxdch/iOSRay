@@ -39,6 +39,12 @@ FALLBACKS = [
     {"GBUFFER_OPTIMIZATION": "1", "USE_MSAA": "1", "MSAA_SAMPLES": "4", "ISAMPLE": "uint(0)"},
 ]
 
+# -V -R: Vulkan-SPIR-V с «расслабленными» правилами — все свободные uniform собираются
+# в один блок gl_DefaultUniformBlock. Без этого SPIRV-Cross делает из каждого uniform
+# отдельный constant-буфер, и драйвер Metal отвергает передачу таких буферов во
+# вспомогательные функции (address space mismatch), а массивы uniform съедают >31 слота.
+GLSLANG_MODE = ["-V", "-R"]
+
 CASE_MISSES = Counter()
 
 
@@ -94,7 +100,7 @@ def convert_one(src, pdir, name, header, glslang, spvc):
     glsl, spv, msl = base + "." + stage, base + ".spv", base + ".metal"
     with open(glsl, "w") as f:
         f.write(header + body)
-    code, log = run([glslang, "-G", "--aml", "--amb", "-S", stage, "-o", spv, glsl])
+    code, log = run([glslang, *GLSLANG_MODE, "--aml", "--amb", "-S", stage, "-o", spv, glsl])
     if code != 0:
         return "glsl_fail", "glslang: " + first_error(log)
     code, log = run([spvc, spv, "--msl", "--msl-ios", "--msl-version", "20100",

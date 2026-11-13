@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Контрольная TrollStore-сборка без прав на память: чтобы сравнить бюджет памяти
+     с сборкой trollstore (increased-memory-limit) на одном и том же телефоне. -->
+<plist version="1.0">
+<dict>
+	<key>application-identifier</key>
+	<string>@BUNDLE_ID@</string>
+	<key>get-task-allow</key>
+	<true/>
+</dict>
+</plist>

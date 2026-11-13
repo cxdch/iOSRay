@@ -23,7 +23,8 @@ XRProbe — пробное приложение, которое проверяе
 - **iPhone 7 Plus (iOS 15.8.8)** — `XRProbe-trollstore.tipa` через TrollStore. Сборка с правами
   `increased-memory-limit` и `extended-virtual-addressing`.
 
-Для сравнения памяти поставьте на 7 Plus обе сборки по очереди (у них один bundle id).
+Для сравнения памяти поставьте на 7 Plus по очереди `XRProbe-trollstore.tipa` и `XRProbe-trollstore-base.tipa`
+(та же сборка без прав на память; bundle id один, вторая заменит первую).
 
 ## Сборка
 
