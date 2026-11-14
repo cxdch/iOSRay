@@ -246,9 +246,16 @@ static void RunMetallibTest(id<MTLDevice> device)
                         offset += 16;
                     }
                     vd.layouts[30].stride = MAX(offset, (NSUInteger)16);
+                    // Пустой пиксельный шейдер: Metal не даёт выключить растеризацию,
+                    // если вершинный шейдер что-то возвращает.
+                    static id<MTLFunction> dummyFs = [[device newLibraryWithSource:
+                        @"#include <metal_stdlib>\nusing namespace metal;\n"
+                         "fragment float4 xr_dummy_fs() { return float4(0); }\n" options:nil error:nil]
+                        newFunctionWithName:@"xr_dummy_fs"];
                     pd.vertexFunction = fn;
                     pd.vertexDescriptor = vd;
-                    pd.rasterizationEnabled = NO;
+                    pd.fragmentFunction = dummyFs;
+                    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
                 }
                 else
                 {
