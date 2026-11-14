@@ -5,7 +5,7 @@ name: build
 
 on:
   push:
-    branches: [main]
+    branches: [main, metal]
   pull_request:
   workflow_dispatch:
 
@@ -42,6 +42,9 @@ jobs:
           python3 -I scripts/convert_shaders.py xray-16/res/gamedata/shaders/gl shaders-out \
             "$(command -v glslangValidator)" "$(command -v spirv-cross)" | tee shader-report.txt
 
+      - name: Офлайн-сборка xrshaders.metallib
+        run: bash scripts/build_metallib.sh shaders-out/high build/xrshaders.metallib | tee -a shader-report.txt
+
       - name: Сборка IPA
         run: |
           VERSION="0.1.${GITHUB_RUN_NUMBER}" BUILD="${GITHUB_RUN_NUMBER}" \
@@ -54,6 +57,7 @@ jobs:
             build/*.ipa
             build/*.tipa
             build/*.dSYM
+            build/xrshaders.metallib
             shader-report.txt
             shaders-out/report.json
 

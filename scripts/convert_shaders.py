@@ -107,6 +107,11 @@ def convert_one(src, pdir, name, header, glslang, spvc):
                      "--msl-decoration-binding", "--output", msl])
     if code != 0:
         return "msl_fail", "spirv-cross: " + first_error(log)
+    # Отражение (reflection) для Metal-рендера: где лежат uniform-константы,
+    # текстуры и сэмплеры, какие у них индексы [[buffer]]/[[texture]]/[[sampler]].
+    code, log = run([spvc, spv, "--reflect", "--output", base + ".json"])
+    if code != 0:
+        return "msl_fail", "spirv-cross --reflect: " + first_error(log)
     return None
 
 
