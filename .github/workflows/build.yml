@@ -103,6 +103,16 @@ jobs:
         run: |
           VERSION="0.1.${GITHUB_RUN_NUMBER}" BUILD="${GITHUB_RUN_NUMBER}" bash scripts/package_engine_ipa.sh
 
+      - name: Релиз metal-nightly (ветка metal)
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/metal'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete metal-nightly --yes --cleanup-tag || true
+          gh release create metal-nightly build/iOSRay-sidestore.ipa build/iOSRay-trollstore.tipa \
+            --prerelease --target "$GITHUB_SHA" --title "iOSRay Metal (эксперимент) #${GITHUB_RUN_NUMBER}" \
+            --notes "Ветка metal, ${GITHUB_SHA::7}. Рендер выбирается в «Настройках» iOS → iOSRay."
+
       - name: Добавить в релиз nightly
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         env:
