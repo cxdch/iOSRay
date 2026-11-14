@@ -591,20 +591,70 @@ index 1e340112..49a7591b 100644
  {
      VERIFY(m_DeviceBuffer);
 diff --git a/src/Layers/xrRenderGL/glHW.cpp b/src/Layers/xrRenderGL/glHW.cpp
-index 4b52ce87..60847dac 100644
+index 4b52ce87..482a7b16 100644
 --- a/src/Layers/xrRenderGL/glHW.cpp
 +++ b/src/Layers/xrRenderGL/glHW.cpp
-@@ -5,6 +5,9 @@
+@@ -5,12 +5,26 @@
  #pragma hdrstop
  
  #include "glHW.h"
 +#if defined(XR_PLATFORM_APPLE) && defined(XR_GL_ES)
 +#include <SDL_syswm.h>
++#include <SDL_metal.h>
++// iOSRay: Metal-режим (src/Layers/xrRenderGL/mtl/glmtl.mm)
++extern "C" bool xr_mtl_init(void* metalLayer);
++extern "C" void* xr_mtl_get_proc(const char* name);
++extern "C" void xr_mtl_present();
++#define XR_HAS_METAL_MODE 1
 +#endif
  #include "xrEngine/XR_IOConsole.h"
  
  namespace xray::render::RENDER_NAMESPACE
-@@ -141,10 +144,27 @@ void CHW::CreateDevice(SDL_Window* hWnd)
+ {
+ CHW HW;
+ 
++#ifdef XR_HAS_METAL_MODE
++static bool UseMetal() { return strstr(Core.Params, "-xr_metal") != nullptr; }
++static SDL_MetalView s_metalView = nullptr;
++#endif
++
+ void CALLBACK OnDebugCallback(GLenum /*source*/, GLenum /*type*/, GLuint id, GLenum severity, GLsizei /*length*/,
+     const GLchar* message, const void* /*userParam*/)
+ {
+@@ -127,6 +141,32 @@ void CHW::CreateDevice(SDL_Window* hWnd)
+         emscripten_webgl_enable_extension(m_webgl, "WEBGL_draw_instanced_base_vertex_base_instance");
+     Msg("* WebGL base vertex draws: %s", BaseVertexDrawSupported ? "extension" : "attribute re-pointing");
+ #else
++#ifdef XR_HAS_METAL_MODE
++    if (UseMetal())
++    {
++        // Metal-режим: без контекста OpenGL; glad смотрит на наши функции
++        s_metalView = SDL_Metal_CreateView(m_window);
++        if (!s_metalView || !xr_mtl_init(SDL_Metal_GetLayer(s_metalView)))
++        {
++            Log("! Metal: не удалось создать слой:", SDL_GetError());
++            return;
++        }
++        const int mtlVersion = gladLoadGLES2(reinterpret_cast<GLADloadfunc>(xr_mtl_get_proc));
++        Msg("* iOSRay: Metal-режим (экспериментальный), glad %d", mtlVersion);
++        BaseVertexDrawSupported = false;
++        WindowFB = 0;
++        int iMaxVTFUnits, iMaxCTIUnits;
++        glGetIntegerv(GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS, &iMaxVTFUnits);
++        glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &iMaxCTIUnits);
++        AdapterName = reinterpret_cast<pcstr>(glGetString(GL_RENDERER));
++        OpenGLVersionString = reinterpret_cast<pcstr>(glGetString(GL_VERSION));
++        ShadingVersion = reinterpret_cast<pcstr>(glGetString(GL_SHADING_LANGUAGE_VERSION));
++        TextureUploadUnit = u32(iMaxCTIUnits) - 1;
++        ComputeShadersSupported = false;
++        UpdateViews();
++        return;
++    }
++#endif
+     m_context = SDL_GL_CreateContext(m_window);
+     if (m_context == nullptr)
+     {
+@@ -141,10 +181,27 @@ void CHW::CreateDevice(SDL_Window* hWnd)
      }
  
      int version;
@@ -632,7 +682,7 @@ index 4b52ce87..60847dac 100644
  #endif
      if (version == 0)
      {
-@@ -180,7 +200,7 @@ void CHW::CreateDevice(SDL_Window* hWnd)
+@@ -180,7 +237,7 @@ void CHW::CreateDevice(SDL_Window* hWnd)
      Msg("* GPU OpenGL shading language version: %s", ShadingVersion);
      Msg("* GPU OpenGL VTF units: [%d] CTI units: [%d]", iMaxVTFUnits, iMaxCTIUnits);
  
@@ -641,7 +691,33 @@ index 4b52ce87..60847dac 100644
      TextureUploadUnit = u32(iMaxCTIUnits) - 1;
      R_ASSERT2(TextureUploadUnit >= CTexture::rstVertex + CTexture::mtMaxVertexShaderTextures,
          "too few texture units for a dedicated upload unit");
-@@ -232,6 +252,21 @@ void CHW::SetPrimaryAttributes(u32& windowFlags)
+@@ -203,6 +260,15 @@ void CHW::DestroyDevice()
+     return;
+ #endif
+ 
++#ifdef XR_HAS_METAL_MODE
++    if (UseMetal())
++    {
++        if (s_metalView)
++            SDL_Metal_DestroyView(s_metalView);
++        s_metalView = nullptr;
++        return;
++    }
++#endif
+     const auto context = SDL_GL_GetCurrentContext();
+     if (context == m_context)
+         SDL_GL_MakeCurrent(nullptr, nullptr);
+@@ -229,9 +295,31 @@ void CHW::SetPrimaryAttributes(u32& windowFlags)
+ {
+ #ifdef XR_PLATFORM_WEB
+     return; // the WebGL2 context is created on the canvas directly, not through SDL
++#endif
++#ifdef XR_HAS_METAL_MODE
++    if (UseMetal())
++    {
++        windowFlags |= SDL_WINDOW_METAL;
++        return;
++    }
  #endif
      windowFlags |= SDL_WINDOW_OPENGL;
  
@@ -663,7 +739,29 @@ index 4b52ce87..60847dac 100644
      SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
  
      SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
-@@ -306,7 +341,11 @@ void CHW::Present()
+@@ -257,6 +345,10 @@ IRender::RenderContext CHW::GetCurrentContext() const
+         return IRender::PrimaryContext;
+     return IRender::NoContext;
+ #else
++#ifdef XR_HAS_METAL_MODE
++    if (UseMetal())
++        return IRender::PrimaryContext;
++#endif
+     const auto context = SDL_GL_GetCurrentContext();
+     if (context == m_context)
+         return IRender::PrimaryContext;
+@@ -266,6 +358,10 @@ IRender::RenderContext CHW::GetCurrentContext() const
+ 
+ int CHW::MakeContextCurrent(IRender::RenderContext context) const
+ {
++#ifdef XR_HAS_METAL_MODE
++    if (UseMetal())
++        return 0;
++#endif
+     switch (context)
+     {
+ #ifdef XR_PLATFORM_WEB
+@@ -306,13 +402,22 @@ void CHW::Present()
      RImplementation.Target->phase_flip();
  #else
      glBindFramebuffer(GL_READ_FRAMEBUFFER, pFB);
@@ -675,7 +773,18 @@ index 4b52ce87..60847dac 100644
      glBlitFramebuffer(
          0, 0, Device.dwWidth, Device.dwHeight,
          0, 0, Device.dwWidth, Device.dwHeight,
-@@ -352,7 +391,7 @@ void CHW::EndPixEvent() const
+         GL_COLOR_BUFFER_BIT, GL_NEAREST);
+ #endif
+ 
++#ifdef XR_HAS_METAL_MODE
++    if (UseMetal())
++        xr_mtl_present();
++    else
++#endif
+ #ifndef XR_PLATFORM_WEB
+     SDL_GL_SwapWindow(m_window); // on the web the frame is presented when the loop callback returns
+ #endif
+@@ -352,7 +457,7 @@ void CHW::EndPixEvent() const
  }
  } // namespace xray::render::RENDER_NAMESPACE
  
@@ -1517,11 +1626,336 @@ index 60fe082f..1d330873 100644
          xr_vector<u8> rgba;
          rgba.resize(Device.dwWidth * Device.dwHeight * 4);
          glReadPixels(0, 0, Device.dwWidth, Device.dwHeight, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+diff --git a/src/Layers/xrRenderGL/mtl/glmtl.mm b/src/Layers/xrRenderGL/mtl/glmtl.mm
+new file mode 100644
+index 00000000..39d782d8
+--- /dev/null
++++ b/src/Layers/xrRenderGL/mtl/glmtl.mm
+@@ -0,0 +1,319 @@
++// iOSRay: Metal-режим рендера (этап 3).
++//
++// Рендер OpenXRay продолжает вызывать функции OpenGL ES (через указатели glad),
++// но в Metal-режиме glad загружается не из драйвера Apple, а отсюда.
++// На этом этапе почти всё — заглушки, которые «делают вид», что работа выполнена:
++// объекты получают номера, проверки проходят, буферы — настоящие MTLBuffer
++// (чтобы glMapBuffer* возвращал память). Каждый кадр Metal очищает экран и
++// показывает его. Дальше функции будут по одной переводиться на Metal.
++
++#import <Metal/Metal.h>
++#import <QuartzCore/CAMetalLayer.h>
++#include <glad/gl.h>
++
++#include <cstdio>
++#include <cstring>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++
++namespace
++{
++struct MtlState
++{
++    id<MTLDevice> device;
++    id<MTLCommandQueue> queue;
++    CAMetalLayer* layer;
++    dispatch_semaphore_t inFlight;
++    GLuint nextName = 1;
++    std::unordered_map<GLenum, GLuint> boundBuffer; // цель → имя буфера
++    std::unordered_map<GLuint, id<MTLBuffer>> buffers;
++    std::unordered_map<std::string, unsigned> unknownCalls;
++    unsigned frame = 0;
++} g;
++
++const char* const kExtensions[] = {
++    "GL_KHR_texture_compression_astc_ldr",
++    "GL_EXT_color_buffer_half_float",
++    "GL_APPLE_texture_format_BGRA8888",
++};
++
++// --- общие заглушки ---------------------------------------------------------
++GLuint64 gl_noop() { return 0; }
++
++GLenum gl_GetError() { return GL_NO_ERROR; }
++
++const GLubyte* gl_GetString(GLenum name)
++{
++    switch (name)
++    {
++    case GL_VENDOR: return (const GLubyte*)"Apple Inc. (iOSRay Metal)";
++    case GL_RENDERER: return (const GLubyte*)(g.device ? g.device.name.UTF8String : "Metal");
++    case GL_VERSION: return (const GLubyte*)"OpenGL ES 3.0 iOSRay-Metal";
++    case GL_SHADING_LANGUAGE_VERSION: return (const GLubyte*)"OpenGL ES GLSL ES 3.00";
++    default: return (const GLubyte*)"";
++    }
++}
++
++const GLubyte* gl_GetStringi(GLenum name, GLuint index)
++{
++    if (name == GL_EXTENSIONS && index < std::size(kExtensions))
++        return (const GLubyte*)kExtensions[index];
++    return (const GLubyte*)"";
++}
++
++void gl_GetIntegerv(GLenum pname, GLint* v)
++{
++    switch (pname)
++    {
++    case GL_NUM_EXTENSIONS: *v = GLint(std::size(kExtensions)); return;
++    case GL_MAJOR_VERSION: *v = 3; return;
++    case GL_MINOR_VERSION: *v = 0; return;
++    case GL_MAX_TEXTURE_SIZE: *v = 8192; return;
++    case GL_MAX_CUBE_MAP_TEXTURE_SIZE: *v = 8192; return;
++    case GL_MAX_3D_TEXTURE_SIZE: *v = 2048; return;
++    case GL_MAX_ARRAY_TEXTURE_LAYERS: *v = 2048; return;
++    case GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS: *v = 16; return;
++    case GL_MAX_TEXTURE_IMAGE_UNITS: *v = 16; return;
++    case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS: *v = 32; return;
++    case GL_MAX_VERTEX_ATTRIBS: *v = 16; return;
++    case GL_MAX_DRAW_BUFFERS: *v = 4; return;
++    case GL_MAX_COLOR_ATTACHMENTS: *v = 4; return;
++    case GL_MAX_SAMPLES: *v = 4; return;
++    case GL_MAX_RENDERBUFFER_SIZE: *v = 8192; return;
++    case GL_MAX_UNIFORM_BLOCK_SIZE: *v = 65536; return;
++    case GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT: *v = 16; return;
++    case GL_MAX_VERTEX_UNIFORM_VECTORS: *v = 1024; return;
++    case GL_MAX_FRAGMENT_UNIFORM_VECTORS: *v = 1024; return;
++    case GL_VIEWPORT:
++        v[0] = v[1] = 0;
++        v[2] = g.layer ? GLint(g.layer.drawableSize.width) : 1;
++        v[3] = g.layer ? GLint(g.layer.drawableSize.height) : 1;
++        return;
++    default: *v = 0; return;
++    }
++}
++
++void gl_GetFloatv(GLenum pname, GLfloat* v)
++{
++    GLint i[4]{};
++    gl_GetIntegerv(pname, i);
++    v[0] = GLfloat(i[0]);
++}
++
++void gl_GetBooleanv(GLenum, GLboolean* v) { *v = GL_FALSE; }
++
++GLenum gl_CheckFramebufferStatus(GLenum) { return GL_FRAMEBUFFER_COMPLETE; }
++
++void gl_GenNames(GLsizei n, GLuint* ids)
++{
++    for (GLsizei i = 0; i < n; ++i)
++        ids[i] = g.nextName++;
++}
++
++GLuint gl_CreateName() { return g.nextName++; }
++
++GLuint gl_CreateShaderProgramv(GLenum, GLsizei, const GLchar* const*) { return g.nextName++; }
++
++void gl_GetShaderiv(GLuint, GLenum pname, GLint* v)
++{
++    *v = (pname == GL_COMPILE_STATUS || pname == GL_DELETE_STATUS) ? GL_TRUE : 0;
++}
++
++void gl_GetProgramiv(GLuint, GLenum pname, GLint* v)
++{
++    *v = (pname == GL_LINK_STATUS || pname == GL_VALIDATE_STATUS) ? GL_TRUE : 0;
++}
++
++void gl_GetProgramPipelineiv(GLuint, GLenum pname, GLint* v)
++{
++    *v = (pname == GL_VALIDATE_STATUS) ? GL_TRUE : 0;
++}
++
++void gl_GetInfoLog(GLuint, GLsizei bufSize, GLsizei* length, GLchar* log)
++{
++    if (length)
++        *length = 0;
++    if (log && bufSize > 0)
++        log[0] = 0;
++}
++
++GLint gl_GetUniformLocation(GLuint, const GLchar*) { return -1; } // констант пока нет
++GLint gl_GetAttribLocation(GLuint, const GLchar*) { return -1; }
++GLuint gl_GetUniformBlockIndex(GLuint, const GLchar*) { return GL_INVALID_INDEX; }
++
++GLsync gl_FenceSync(GLenum, GLbitfield) { return reinterpret_cast<GLsync>(uintptr_t(1)); }
++GLenum gl_ClientWaitSync(GLsync, GLbitfield, GLuint64) { return GL_ALREADY_SIGNALED; }
++
++void gl_GetQueryObjectuiv(GLuint, GLenum pname, GLuint* v) { *v = pname == GL_QUERY_RESULT_AVAILABLE ? GL_TRUE : 1; }
++
++GLboolean gl_IsTrue(GLuint) { return GL_TRUE; }
++
++// --- буферы: настоящие MTLBuffer, чтобы отображение в память работало -------
++void gl_BindBuffer(GLenum target, GLuint buffer) { g.boundBuffer[target] = buffer; }
++
++void gl_DeleteBuffers(GLsizei n, const GLuint* ids)
++{
++    for (GLsizei i = 0; i < n; ++i)
++        g.buffers.erase(ids[i]);
++}
++
++id<MTLBuffer> BoundBuffer(GLenum target)
++{
++    const auto it = g.buffers.find(g.boundBuffer[target]);
++    return it == g.buffers.end() ? nil : it->second;
++}
++
++void gl_BufferData(GLenum target, GLsizeiptr size, const void* data, GLenum)
++{
++    const GLuint name = g.boundBuffer[target];
++    if (!name || size <= 0)
++        return;
++    id<MTLBuffer> buf = data ? [g.device newBufferWithBytes:data length:NSUInteger(size) options:MTLResourceStorageModeShared]
++                             : [g.device newBufferWithLength:NSUInteger(size) options:MTLResourceStorageModeShared];
++    g.buffers[name] = buf;
++}
++
++void gl_BufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data)
++{
++    id<MTLBuffer> buf = BoundBuffer(target);
++    if (buf && data && NSUInteger(offset + size) <= buf.length)
++        memcpy(static_cast<uint8_t*>(buf.contents) + offset, data, size_t(size));
++}
++
++void* gl_MapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield)
++{
++    id<MTLBuffer> buf = BoundBuffer(target);
++    if (!buf || NSUInteger(offset + length) > buf.length)
++        return nullptr;
++    return static_cast<uint8_t*>(buf.contents) + offset;
++}
++
++void* gl_MapBuffer(GLenum target, GLenum)
++{
++    id<MTLBuffer> buf = BoundBuffer(target);
++    return buf ? buf.contents : nullptr;
++}
++
++GLboolean gl_UnmapBuffer(GLenum) { return GL_TRUE; }
++
++void gl_GetBufferParameteriv(GLenum target, GLenum pname, GLint* v)
++{
++    id<MTLBuffer> buf = BoundBuffer(target);
++    *v = (pname == GL_BUFFER_SIZE && buf) ? GLint(buf.length) : 0;
++}
++
++struct Entry
++{
++    const char* name;
++    void* fn;
++};
++
++#define E(n, f) { n, reinterpret_cast<void*>(&f) }
++const Entry kTable[] = {
++    E("glGetError", gl_GetError),
++    E("glGetString", gl_GetString),
++    E("glGetStringi", gl_GetStringi),
++    E("glGetIntegerv", gl_GetIntegerv),
++    E("glGetFloatv", gl_GetFloatv),
++    E("glGetBooleanv", gl_GetBooleanv),
++    E("glCheckFramebufferStatus", gl_CheckFramebufferStatus),
++    E("glGenTextures", gl_GenNames),
++    E("glGenBuffers", gl_GenNames),
++    E("glGenFramebuffers", gl_GenNames),
++    E("glGenRenderbuffers", gl_GenNames),
++    E("glGenVertexArrays", gl_GenNames),
++    E("glGenSamplers", gl_GenNames),
++    E("glGenQueries", gl_GenNames),
++    E("glGenProgramPipelines", gl_GenNames),
++    E("glGenTransformFeedbacks", gl_GenNames),
++    E("glCreateShader", gl_CreateName),
++    E("glCreateProgram", gl_CreateName),
++    E("glCreateShaderProgramv", gl_CreateShaderProgramv),
++    E("glGetShaderiv", gl_GetShaderiv),
++    E("glGetProgramiv", gl_GetProgramiv),
++    E("glGetProgramPipelineiv", gl_GetProgramPipelineiv),
++    E("glGetShaderInfoLog", gl_GetInfoLog),
++    E("glGetProgramInfoLog", gl_GetInfoLog),
++    E("glGetProgramPipelineInfoLog", gl_GetInfoLog),
++    E("glGetUniformLocation", gl_GetUniformLocation),
++    E("glGetAttribLocation", gl_GetAttribLocation),
++    E("glGetUniformBlockIndex", gl_GetUniformBlockIndex),
++    E("glFenceSync", gl_FenceSync),
++    E("glClientWaitSync", gl_ClientWaitSync),
++    E("glGetQueryObjectuiv", gl_GetQueryObjectuiv),
++    E("glIsProgram", gl_IsTrue),
++    E("glIsShader", gl_IsTrue),
++    E("glBindBuffer", gl_BindBuffer),
++    E("glDeleteBuffers", gl_DeleteBuffers),
++    E("glBufferData", gl_BufferData),
++    E("glBufferSubData", gl_BufferSubData),
++    E("glMapBufferRange", gl_MapBufferRange),
++    E("glMapBuffer", gl_MapBuffer),
++    E("glMapBufferOES", gl_MapBuffer),
++    E("glUnmapBuffer", gl_UnmapBuffer),
++    E("glUnmapBufferOES", gl_UnmapBuffer),
++    E("glGetBufferParameteriv", gl_GetBufferParameteriv),
++};
++#undef E
++} // namespace
++
++extern "C" bool xr_mtl_init(void* metalLayer)
++{
++    g.device = MTLCreateSystemDefaultDevice();
++    if (!g.device || !metalLayer)
++        return false;
++    g.queue = [g.device newCommandQueue];
++    g.layer = (__bridge CAMetalLayer*)metalLayer;
++    g.layer.device = g.device;
++    g.layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
++    g.layer.framebufferOnly = YES;
++    g.layer.maximumDrawableCount = 3;
++    g.inFlight = dispatch_semaphore_create(3);
++    printf("[iOSRay] Metal: %s, слой %.0fx%.0f\n", g.device.name.UTF8String, g.layer.drawableSize.width,
++        g.layer.drawableSize.height);
++    fflush(stdout);
++    return true;
++}
++
++// Загрузчик для gladLoadGLES2: свои реализации или общая заглушка
++extern "C" void* xr_mtl_get_proc(const char* name)
++{
++    for (const Entry& e : kTable)
++        if (!strcmp(e.name, name))
++            return e.fn;
++    return reinterpret_cast<void*>(&gl_noop);
++}
++
++// Конец кадра: пока — очистка экрана тёмно-серым и показ
++extern "C" void xr_mtl_present()
++{
++    if (!g.layer)
++        return;
++    dispatch_semaphore_wait(g.inFlight, DISPATCH_TIME_FOREVER);
++    @autoreleasepool
++    {
++        id<CAMetalDrawable> drawable = [g.layer nextDrawable];
++        if (!drawable)
++        {
++            dispatch_semaphore_signal(g.inFlight);
++            return;
++        }
++        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
++        rp.colorAttachments[0].texture = drawable.texture;
++        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
++        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
++        rp.colorAttachments[0].clearColor = MTLClearColorMake(0.12, 0.12, 0.13, 1.0);
++        id<MTLCommandBuffer> cb = [g.queue commandBuffer];
++        [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
++        [cb presentDrawable:drawable];
++        dispatch_semaphore_t sem = g.inFlight;
++        [cb addCompletedHandler:^(id<MTLCommandBuffer>) { dispatch_semaphore_signal(sem); }];
++        [cb commit];
++    }
++    if ((++g.frame % 600) == 1)
++    {
++        printf("[iOSRay] Metal: кадр %u\n", g.frame);
++        fflush(stdout);
++    }
++}
 diff --git a/src/Layers/xrRenderPC_GL/CMakeLists.txt b/src/Layers/xrRenderPC_GL/CMakeLists.txt
-index 9018d8bb..6667522d 100644
+index 9018d8bb..08a78f0e 100644
 --- a/src/Layers/xrRenderPC_GL/CMakeLists.txt
 +++ b/src/Layers/xrRenderPC_GL/CMakeLists.txt
-@@ -423,6 +423,17 @@ target_compile_definitions(xrRender_GL
+@@ -423,6 +423,25 @@ target_compile_definitions(xrRender_GL
      PURE_DYNAMIC_CAST
  )
  
@@ -1534,6 +1968,14 @@ index 9018d8bb..6667522d 100644
 +    target_include_directories(xrRender_GL PRIVATE "${XR_ASTCENC_INCLUDE_DIR}")
 +    target_link_libraries(xrRender_GL PRIVATE "${XR_ASTCENC_LIBRARY}")
 +    target_compile_definitions(xrRender_GL PRIVATE XR_USE_ASTC)
++    # Экспериментальный Metal-режим (iOSRay): GL-вызовы рендера → Metal
++    enable_language(OBJCXX)
++    target_sources(xrRender_GL PRIVATE ../xrRenderGL/mtl/glmtl.mm)
++    set_source_files_properties(../xrRenderGL/mtl/glmtl.mm PROPERTIES
++        COMPILE_OPTIONS "-fobjc-arc"
++        SKIP_PRECOMPILE_HEADERS ON
++        SKIP_UNITY_BUILD_INCLUSION ON)
++    target_link_libraries(xrRender_GL PRIVATE "-framework Metal" "-framework QuartzCore")
 +endif()
 +
  set_target_properties(xrRender_GL PROPERTIES
@@ -2165,10 +2607,10 @@ index 82d7da5d..0fd1fa17 100644
  #endif
 diff --git a/src/xr_3da/ios_bootstrap.mm b/src/xr_3da/ios_bootstrap.mm
 new file mode 100644
-index 00000000..1b2f3b33
+index 00000000..ca3b093e
 --- /dev/null
 +++ b/src/xr_3da/ios_bootstrap.mm
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,165 @@
 +// iOSRay: подготовка окружения движка на iOS перед entry_point().
 +//
 +// Что делает:
@@ -2321,6 +2763,15 @@ index 00000000..1b2f3b33
 +        // Запросы видимости (occlusion queries) роняют GL-драйвер iOS (gldModifyQuery,
 +        // SIGBUS в R_occlusion::occq_begin). Отключаем — свет и тени считаются видимыми.
 +        extraArgs += " -no_occq ";
++        // «Настройки» iOS → iOSRay → Рендер (Settings.bundle)
++        NSString* renderer = [NSUserDefaults.standardUserDefaults stringForKey:@"iosray_renderer"];
++        if ([renderer isEqualToString:@"metal"])
++        {
++            extraArgs += " -xr_metal ";
++            printf("[iOSRay] рендер: Metal (экспериментальный)\n");
++        }
++        else
++            printf("[iOSRay] рендер: OpenGL ES\n");
 +        fflush(stdout);
 +    }
 +    return extraArgs.c_str();
