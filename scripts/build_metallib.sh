@@ -9,7 +9,8 @@ ok=0; fail=0
 for f in "$SRC"/*.metal; do
   n="$(basename "$f" .metal)"
   # У каждого шейдера точка входа main0 — переименовываем, чтобы они ужились в одной библиотеке.
-  sed "s/\bmain0\b/${n}/" "$f" > "$TMP/$n.metal"
+  # (BSD sed на macOS не знает \b — берём perl)
+  perl -pe "s/\bmain0\b/${n}/g" "$f" > "$TMP/$n.metal"
   if xcrun -sdk iphoneos metal -std=ios-metal2.1 -mios-version-min=15.0 -c "$TMP/$n.metal" -o "$TMP/$n.air" 2> "$TMP/$n.log"; then
     ok=$((ok+1))
   else

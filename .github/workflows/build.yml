@@ -43,7 +43,7 @@ jobs:
             "$(command -v glslangValidator)" "$(command -v spirv-cross)" | tee shader-report.txt
 
       - name: Офлайн-сборка xrshaders.metallib
-        run: bash scripts/build_metallib.sh shaders-out/high build/xrshaders.metallib | tee -a shader-report.txt
+        run: set -o pipefail; bash scripts/build_metallib.sh shaders-out/high build/xrshaders.metallib | tee -a shader-report.txt
 
       - name: Сборка IPA
         run: |
