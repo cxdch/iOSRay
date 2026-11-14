@@ -1537,7 +1537,7 @@ index add453d0..c5d5c4b2 100644
  
      nNumChars = 0x100;
 diff --git a/src/xrEngine/defines.cpp b/src/xrEngine/defines.cpp
-index 6bb1d98e..a5227031 100644
+index 6bb1d98e..d15c94de 100644
 --- a/src/xrEngine/defines.cpp
 +++ b/src/xrEngine/defines.cpp
 @@ -1,4 +1,7 @@
@@ -1548,13 +1548,7 @@ index 6bb1d98e..a5227031 100644
  
  #ifdef DEBUG
  ECORE_API bool bDebug = false;
-@@ -20,7 +23,14 @@ DeviceMode psDeviceMode =
- Flags32 psDeviceFlags =
- {
-    rsDrawStatic | rsDrawDynamic | rsDrawDetails | rsDrawParticles | mtSound | mtNetwork
-+#if defined(__APPLE__) && TARGET_OS_IPHONE
-+   | rsShowFPS // iOS: счётчик кадров на время отладки
-+#endif
+@@ -23,4 +26,8 @@ Flags32 psDeviceFlags =
  };
  
  // textures
@@ -1591,10 +1585,35 @@ index 01a427c0..1c00302c 100644
  bool g_bLoaded = false;
  ref_light precache_light = 0;
 diff --git a/src/xrEngine/xr_input.cpp b/src/xrEngine/xr_input.cpp
-index b8caddd9..ffeb2605 100644
+index b8caddd9..d0dfc953 100644
 --- a/src/xrEngine/xr_input.cpp
 +++ b/src/xrEngine/xr_input.cpp
-@@ -832,3 +832,85 @@ void CInput::Feedback(FeedbackType type, float s1, float s2, float duration)
+@@ -1,4 +1,7 @@
+ #include "stdafx.h"
++#ifdef __APPLE__
++#include <TargetConditionals.h>
++#endif
+ #pragma hdrstop
+ 
+ #include "xr_input.h"
+@@ -758,9 +761,16 @@ void CInput::OnAppDeactivate(void)
+     controllerState = {};
+ }
+ 
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++extern "C" void xr_ios_touch_tick(); // src/xr_3da/ios_touch.mm
++#endif
++
+ void CInput::OnFrame(void)
+ {
+     ZoneScoped;
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++    xr_ios_touch_tick();
++#endif
+ 
+     if (AltF4Pressed)
+         return;
+@@ -832,3 +842,90 @@ void CInput::Feedback(FeedbackType type, float s1, float s2, float duration)
      default: NODEFAULT;
      }
  }
@@ -1608,6 +1627,11 @@ index b8caddd9..ffeb2605 100644
 +// Кнопки не знают клавиш: они просят действие, а мы находим, на что оно
 +// назначено в default_controls.ltx/user.ltx, и шлём в SDL нужное событие.
 +// ---------------------------------------------------------------------------
++extern "C" unsigned xr_ios_frame_counter()
++{
++    return Device.dwFrame;
++}
++
 +extern "C" int xr_ios_input_grabbed()
 +{
 +    return pInput && pInput->InputIsGrabbed() ? 1 : 0;
@@ -1997,10 +2021,10 @@ index 00000000..6e58cbec
 +}
 diff --git a/src/xr_3da/ios_touch.mm b/src/xr_3da/ios_touch.mm
 new file mode 100644
-index 00000000..ddb0a8ca
+index 00000000..dc341223
 --- /dev/null
 +++ b/src/xr_3da/ios_touch.mm
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,343 @@
 +// iOSRay: экранное управление поверх окна SDL (минимальный набор).
 +//
 +//  * В игре (движок захватил ввод) слой ловит все касания:
@@ -2015,6 +2039,7 @@ index 00000000..ddb0a8ca
 +// (xr_ios_action в xrEngine/xr_input.cpp).
 +
 +#import <UIKit/UIKit.h>
++#import <QuartzCore/QuartzCore.h>
 +
 +extern "C" int xr_ios_input_grabbed();
 +extern "C" void xr_ios_action(int iosAction, int down);
@@ -2266,26 +2291,80 @@ index 00000000..ddb0a8ca
 +@end
 +
 +static XRTouchOverlay* g_overlay;
++static UILabel* g_fps;
++
++extern "C" unsigned xr_ios_frame_counter();
++
++// Окно SDL: видимое окно, чей контроллер — SDL_uikitviewcontroller
++// (у SDL есть ещё временное окно заставки запуска — в него встраиваться нельзя).
++static UIView* FindSDLHostView()
++{
++    UIView* fallback = nil;
++    for (UIWindow* w in UIApplication.sharedApplication.windows)
++    {
++        UIViewController* vc = w.rootViewController;
++        if (w.hidden || !vc || !vc.view)
++            continue;
++        if ([NSStringFromClass(vc.class) hasPrefix:@"SDL_uikitviewcontroller"])
++            return vc.view;
++        if (w.isKeyWindow)
++            fallback = vc.view;
++    }
++    return fallback;
++}
++
++// Вызывается движком каждый кадр (CInput::OnFrame), работа — не чаще 4 раз в секунду.
++extern "C" void xr_ios_touch_tick()
++{
++    static CFTimeInterval lastTick = 0;
++    static unsigned lastFrame = 0;
++    static CFTimeInterval lastTime = CACurrentMediaTime();
++    const CFTimeInterval tickNow = CACurrentMediaTime();
++    if (tickNow - lastTick < 0.25)
++        return;
++    lastTick = tickNow;
++    @autoreleasepool {
++        UIView* host = FindSDLHostView();
++        if (!host)
++            return;
++        if (!g_overlay)
++        {
++            g_overlay = [[XRTouchOverlay alloc] initWithFrame:host.bounds];
++            g_fps = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 90, 18)];
++            g_fps.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightSemibold];
++            g_fps.textColor = [UIColor colorWithRed:0.6 green:1.0 blue:0.6 alpha:0.9];
++            g_fps.backgroundColor = [UIColor colorWithWhite:0 alpha:0.35];
++            g_fps.textAlignment = NSTextAlignmentCenter;
++            g_fps.userInteractionEnabled = NO;
++            [g_overlay addSubview:g_fps];
++        }
++        if (g_overlay.superview != host)
++        {
++            [g_overlay removeFromSuperview];
++            g_overlay.frame = host.bounds;
++            [host addSubview:g_overlay];
++            printf("[iOSRay] экранное управление: %s, %.0fx%.0f\n",
++                NSStringFromClass(host.class).UTF8String, host.bounds.size.width, host.bounds.size.height);
++            fflush(stdout);
++        }
++        [host bringSubviewToFront:g_overlay];
++        g_overlay.gameplay = xr_ios_input_grabbed() != 0;
++
++        // Счётчик кадров: кадры движка за реальное время
++        const unsigned frame = xr_ios_frame_counter();
++        const CFTimeInterval now = CACurrentMediaTime();
++        if (now - lastTime >= 0.5)
++        {
++            const double fps = (frame - lastFrame) / (now - lastTime);
++            g_fps.text = [NSString stringWithFormat:@"%.0f FPS", fps];
++            lastFrame = frame;
++            lastTime = now;
++        }
++        g_fps.center = CGPointMake(g_overlay.safeAreaInsets.left + 55, g_overlay.bounds.size.height - 12);
++    }
++}
 +
 +extern "C" void xr_ios_touch_start()
 +{
-+    [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer*) {
-+        if (!g_overlay)
-+        {
-+            UIView* host = nil;
-+            for (UIWindow* w in UIApplication.sharedApplication.windows)
-+                if (w.rootViewController.view)
-+                {
-+                    host = w.rootViewController.view;
-+                    break;
-+                }
-+            if (!host)
-+                return;
-+            g_overlay = [[XRTouchOverlay alloc] initWithFrame:host.bounds];
-+            [host addSubview:g_overlay];
-+        }
-+        else if (g_overlay.superview)
-+            [g_overlay.superview bringSubviewToFront:g_overlay];
-+        g_overlay.gameplay = xr_ios_input_grabbed() != 0;
-+    }];
++    printf("[iOSRay] экранное управление: ожидаю окно SDL\n");
 +}
