@@ -319,10 +319,10 @@ index 0f6315b6..01085c78 100644
          rows.resize(count * 3);
          for (u32 mid = 0; mid < count; mid++)
 diff --git a/src/Layers/xrRender/dxImGuiRender.cpp b/src/Layers/xrRender/dxImGuiRender.cpp
-index 66af8444..6b094530 100644
+index 66af8444..a10165e2 100644
 --- a/src/Layers/xrRender/dxImGuiRender.cpp
 +++ b/src/Layers/xrRender/dxImGuiRender.cpp
-@@ -10,6 +10,16 @@
+@@ -10,6 +10,35 @@
  
  namespace xray::render::RENDER_NAMESPACE
  {
@@ -331,7 +331,26 @@ index 66af8444..6b094530 100644
 +// OpenGL ES напрямую (мимо glad) — glGetString вернёт NULL и всё упадёт.
 +// Отладочный ImGui там просто выключаем.
 +static bool ImGuiOff() { return strstr(Core.Params, "-xr_metal") != nullptr; }
-+#define XR_IMGUI_GUARD() if (ImGuiOff()) return
++// ImGui 1.92 сам строит атлас шрифтов и просит бэкенд создать текстуру.
++// Отвечаем «готово» с фиктивным id — рисовать всё равно нечем.
++static void ImGuiFakeTextures()
++{
++    for (ImTextureData* tex : ImGui::GetPlatformIO().Textures)
++    {
++        if (tex->Status == ImTextureStatus_WantCreate || tex->Status == ImTextureStatus_WantUpdates)
++        {
++            if (tex->TexID == ImTextureID_Invalid)
++                tex->SetTexID((ImTextureID)1);
++            tex->SetStatus(ImTextureStatus_OK);
++        }
++        else if (tex->Status == ImTextureStatus_WantDestroy)
++        {
++            tex->SetTexID(ImTextureID_Invalid);
++            tex->SetStatus(ImTextureStatus_Destroyed);
++        }
++    }
++}
++#define XR_IMGUI_GUARD() if (ImGuiOff()) { ImGuiFakeTextures(); return; }
 +#else
 +#define XR_IMGUI_GUARD() (void)0
 +#endif
@@ -339,7 +358,7 @@ index 66af8444..6b094530 100644
  void dxImGuiRender::Copy(IImGuiRender& _in)
  {
      *this = *dynamic_cast<dxImGuiRender*>(&_in);
-@@ -44,6 +54,7 @@ void dxImGuiRender::SetState(ImDrawData* data)
+@@ -44,6 +73,7 @@ void dxImGuiRender::SetState(ImDrawData* data)
  
  void dxImGuiRender::Frame()
  {
@@ -347,7 +366,7 @@ index 66af8444..6b094530 100644
  #if defined(USE_DX11)
      ImGui_ImplDX11_NewFrame();
  #elif defined(USE_OGL)
-@@ -53,7 +64,8 @@ void dxImGuiRender::Frame()
+@@ -53,7 +83,8 @@ void dxImGuiRender::Frame()
  
  void dxImGuiRender::Render(ImDrawData* data)
  {
@@ -357,11 +376,17 @@ index 66af8444..6b094530 100644
      if (data->CmdListsCount == 0)
          return;
  #endif
-@@ -85,11 +97,13 @@ void dxImGuiRender::OnDeviceCreate(ImGuiContext* context)
+@@ -85,11 +116,19 @@ void dxImGuiRender::OnDeviceCreate(ImGuiContext* context)
  #if defined(USE_DX11)
      ImGui_ImplDX11_Init(HW.pDevice, HW.get_context(CHW::IMM_CTX_ID));
  #elif defined(USE_OGL)
-+    XR_IMGUI_GUARD();
++#if defined(XR_GL_ES) && defined(__APPLE__)
++    if (ImGuiOff())
++    {
++        io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
++        return;
++    }
++#endif
      ImGui_ImplOpenGL3_Init();
  #endif
  }
@@ -371,7 +396,7 @@ index 66af8444..6b094530 100644
  #if defined(USE_DX11)
      ImGui_ImplDX11_Shutdown();
  #elif defined(USE_OGL)
-@@ -99,6 +113,7 @@ void dxImGuiRender::OnDeviceDestroy()
+@@ -99,6 +138,7 @@ void dxImGuiRender::OnDeviceDestroy()
  
  void dxImGuiRender::OnDeviceResetBegin()
  {
@@ -379,7 +404,7 @@ index 66af8444..6b094530 100644
  #if defined(USE_DX11)
      ImGui_ImplDX11_InvalidateDeviceObjects();
  #elif defined(USE_OGL)
-@@ -108,6 +123,7 @@ void dxImGuiRender::OnDeviceResetBegin()
+@@ -108,6 +148,7 @@ void dxImGuiRender::OnDeviceResetBegin()
  
  void dxImGuiRender::OnDeviceResetEnd()
  {
