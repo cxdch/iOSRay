@@ -1649,10 +1649,10 @@ index 82d7da5d..1f1a7834 100644
              {
 diff --git a/src/xr_3da/ios_bootstrap.mm b/src/xr_3da/ios_bootstrap.mm
 new file mode 100644
-index 00000000..ce7fcb98
+index 00000000..8a0bc01d
 --- /dev/null
 +++ b/src/xr_3da/ios_bootstrap.mm
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,144 @@
 +// iOSRay: подготовка окружения движка на iOS перед entry_point().
 +//
 +// Что делает:
@@ -1764,6 +1764,29 @@ index 00000000..ce7fcb98
 +        {
 +            [fm copyItemAtPath:[res stringByAppendingPathComponent:@"fsgame.ltx"] toPath:fsltx error:nil];
 +            printf("[iOSRay] fsgame.ltx скопирован из бандла\n");
++        }
++        else
++        {
++            // fsgame.ltx с ПК: пути вида C:\... на iPhone не работают. Строки с буквой диска
++            // заменяем на путь внутри папки игры, оригинал сохраняем в fsgame.ltx.pc.
++            NSString* text = [NSString stringWithContentsOfFile:fsltx encoding:NSWindowsCP1251StringEncoding error:nil];
++            if (text)
++            {
++                NSRegularExpression* drive = [NSRegularExpression
++                    regularExpressionWithPattern:@"^(\\s*\\$app_data_root\\$\\s*=).*\\b[A-Za-z]:\\\\.*$"
++                    options:NSRegularExpressionAnchorsMatchLines error:nil];
++                NSString* fixed = [drive stringByReplacingMatchesInString:text options:0
++                    range:NSMakeRange(0, text.length)
++                    withTemplate:@"$1 true| false| \\$fs_root\\$| _appdata_\\\\"];
++                if (![fixed isEqualToString:text])
++                {
++                    NSString* backup = [fsltx stringByAppendingString:@".pc"];
++                    if (![fm fileExistsAtPath:backup])
++                        [fm copyItemAtPath:fsltx toPath:backup error:nil];
++                    [fixed writeToFile:fsltx atomically:YES encoding:NSWindowsCP1251StringEncoding error:nil];
++                    printf("[iOSRay] fsgame.ltx: $app_data_root$ перенесён в папку игры (_appdata_), оригинал — fsgame.ltx.pc\n");
++                }
++            }
 +        }
 +        EnsureLink([gameDir stringByAppendingPathComponent:@"gamedata/shaders/gl"],
 +                   [res stringByAppendingPathComponent:@"gamedata/shaders/gl"]);
