@@ -24,7 +24,6 @@ package() {
     printf 'APPL????' > "$app/PkgInfo"
     cp "$XRAY/res/fsgame.ltx" "$app/res/"
     cp "$ROOT/res/iosray.ltx" "$app/res/"
-    cp -R "$ROOT/app/Settings.bundle" "$app/"   # «Настройки» iOS → iOSRay
     cp -R "$XRAY/res/gamedata" "$app/res/"
 
     if [[ "$variant" == trollstore ]]; then

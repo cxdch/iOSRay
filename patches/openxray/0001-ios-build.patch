@@ -2607,10 +2607,10 @@ index 82d7da5d..0fd1fa17 100644
  #endif
 diff --git a/src/xr_3da/ios_bootstrap.mm b/src/xr_3da/ios_bootstrap.mm
 new file mode 100644
-index 00000000..ca3b093e
+index 00000000..b7244065
 --- /dev/null
 +++ b/src/xr_3da/ios_bootstrap.mm
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,213 @@
 +// iOSRay: подготовка окружения движка на iOS перед entry_point().
 +//
 +// Что делает:
@@ -2624,6 +2624,7 @@ index 00000000..ca3b093e
 +//  4. Делает папку игры текущей: LocatorAPI ищет fsgame.ltx в текущем каталоге.
 +
 +#import <Foundation/Foundation.h>
++#import <UIKit/UIKit.h>
 +#include <unistd.h>
 +#include <stdio.h>
 +#include <string>
@@ -2675,6 +2676,55 @@ index 00000000..ca3b093e
 +} // namespace
 +
 +// Возвращает добавку к командной строке движка (например, "-shoc ").
++// Выбор рендера при запуске: окно с двумя кнопками и обратным отсчётом.
++// Если ничего не нажать за 4 с — запускается последний выбранный рендер.
++// (Settings.bundle у приложений из TrollStore на iOS 15 в «Настройках» не появляется.)
++static bool ChooseMetalRenderer()
++{
++    NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
++    __block bool metal = [[ud stringForKey:@"iosray_renderer"] isEqualToString:@"metal"];
++    __block bool done = false;
++
++    UIWindow* window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
++    window.rootViewController = [UIViewController new];
++    window.rootViewController.view.backgroundColor = UIColor.blackColor;
++    [window makeKeyAndVisible];
++
++    auto title = [](bool m) { return m ? @"Metal (эксперимент)" : @"OpenGL ES"; };
++    __block int left = 4;
++    UIAlertController* alert = [UIAlertController
++        alertControllerWithTitle:@"iOSRay: рендер"
++                         message:[NSString stringWithFormat:@"Запуск через %d с: %@", left, title(metal)]
++                  preferredStyle:UIAlertControllerStyleAlert];
++    void (^pick)(bool) = ^(bool m) {
++        metal = m;
++        done = true;
++        [ud setObject:(m ? @"metal" : @"gles") forKey:@"iosray_renderer"];
++    };
++    [alert addAction:[UIAlertAction actionWithTitle:@"OpenGL ES" style:UIAlertActionStyleDefault
++                                            handler:^(UIAlertAction*) { pick(false); }]];
++    [alert addAction:[UIAlertAction actionWithTitle:@"Metal (эксперимент)" style:UIAlertActionStyleDefault
++                                            handler:^(UIAlertAction*) { pick(true); }]];
++    [window.rootViewController presentViewController:alert animated:YES completion:nil];
++
++    NSTimer* timer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer*) {
++        if (--left <= 0)
++        {
++            done = true;
++            [alert dismissViewControllerAnimated:NO completion:nil];
++            return;
++        }
++        alert.message = [NSString stringWithFormat:@"Запуск через %d с: %@", left, title(metal)];
++    }];
++    while (!done)
++        [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
++    [timer invalidate];
++    if (alert.presentingViewController)
++        [alert dismissViewControllerAnimated:NO completion:nil];
++    window.hidden = YES;
++    return metal;
++}
++
 +extern "C" void xr_ios_touch_start();
 +
 +extern "C" const char* xr_ios_prepare()
@@ -2763,9 +2813,7 @@ index 00000000..ca3b093e
 +        // Запросы видимости (occlusion queries) роняют GL-драйвер iOS (gldModifyQuery,
 +        // SIGBUS в R_occlusion::occq_begin). Отключаем — свет и тени считаются видимыми.
 +        extraArgs += " -no_occq ";
-+        // «Настройки» iOS → iOSRay → Рендер (Settings.bundle)
-+        NSString* renderer = [NSUserDefaults.standardUserDefaults stringForKey:@"iosray_renderer"];
-+        if ([renderer isEqualToString:@"metal"])
++        if (ChooseMetalRenderer())
 +        {
 +            extraArgs += " -xr_metal ";
 +            printf("[iOSRay] рендер: Metal (экспериментальный)\n");
