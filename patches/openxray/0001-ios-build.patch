@@ -1783,6 +1783,31 @@ index 091259f8..2e590cac 100644
      if (m_sequencer_items.size())
          m_sequencer_items.front()->OnMousePress(btn);
  
+diff --git a/src/xrUICore/Windows/UIFrameWindow.cpp b/src/xrUICore/Windows/UIFrameWindow.cpp
+index 51f9d9c2..81a8b4b3 100644
+--- a/src/xrUICore/Windows/UIFrameWindow.cpp
++++ b/src/xrUICore/Windows/UIFrameWindow.cpp
+@@ -195,7 +195,19 @@ void CUIFrameWindow::DrawElements()
+     u32 rect_count = 4; // lt+rt+lb+rb
+     back_len.x = rect.width() - m_tex_rect[fmLT].width() - m_tex_rect[fmRT].width();
+     back_len.y = rect.height() - m_tex_rect[fmLT].height() - m_tex_rect[fmRB].height();
+-    R_ASSERT(back_len.x + EPS_L >= 0.0f && back_len.y + EPS_L >= 0.0f);
++    // На маленьком экране (iPhone, 736x414) рамка бывает меньше своих угловых текстур.
++    // Раньше это был фатальный assert; рисуем углы внахлёст, без середины.
++    if (back_len.x < 0.0f || back_len.y < 0.0f)
++    {
++        static bool reported = false;
++        if (!reported)
++        {
++            reported = true;
++            Msg("~ UIFrameWindow: рамка меньше углов (%.1f x %.1f), рисую без середины", back_len.x, back_len.y);
++        }
++        back_len.x = std::max(back_len.x, 0.0f);
++        back_len.y = std::max(back_len.y, 0.0f);
++    }
+ 
+     u32 cnt = 0;
+     if (back_len.x > 0.0f) // top+bottom
 diff --git a/src/xr_3da/CMakeLists.txt b/src/xr_3da/CMakeLists.txt
 index 2ea56a22..7a2fd57f 100644
 --- a/src/xr_3da/CMakeLists.txt
@@ -2021,7 +2046,7 @@ index 00000000..6e58cbec
 +}
 diff --git a/src/xr_3da/ios_touch.mm b/src/xr_3da/ios_touch.mm
 new file mode 100644
-index 00000000..dc341223
+index 00000000..c873e5d7
 --- /dev/null
 +++ b/src/xr_3da/ios_touch.mm
 @@ -0,0 +1,343 @@
@@ -2097,14 +2122,14 @@ index 00000000..dc341223
 +        _stickKnob = [self circleWithSize:54 alpha:0.35];
 +        _stickBase.hidden = _stickKnob.hidden = YES;
 +
-+        [self addButton:@"Огонь" action:actFire size:86];
-+        [self addButton:@"Прицел" action:actAim size:62];
-+        [self addButton:@"Прыжок" action:actJump size:58];
-+        [self addButton:@"Присед" action:actCrouch size:58];
-+        [self addButton:@"Взять" action:actUse size:54];
-+        [self addButton:@"Перезар." action:actReload size:54];
-+        [self addButton:@"Инв." action:actInventory size:50];
-+        XRTouchButton* menu = [self addButton:@"Меню" action:actMenu size:46];
++        [self addButton:@"ЛКМ" action:actFire size:86];
++        [self addButton:@"ПКМ" action:actAim size:62];
++        [self addButton:@"Space" action:actJump size:58];
++        [self addButton:@"Ctrl" action:actCrouch size:58];
++        [self addButton:@"F" action:actUse size:54];
++        [self addButton:@"R" action:actReload size:54];
++        [self addButton:@"I" action:actInventory size:50];
++        XRTouchButton* menu = [self addButton:@"Esc" action:actMenu size:46];
 +        menu.alwaysVisible = YES;
 +        _gameplay = YES;
 +        self.gameplay = NO;
@@ -2133,7 +2158,7 @@ index 00000000..dc341223
 +    b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.28];
 +    [b setTitle:title forState:UIControlStateNormal];
 +    [b setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.85] forState:UIControlStateNormal];
-+    b.titleLabel.font = [UIFont boldSystemFontOfSize:size > 70 ? 15 : 11];
++    b.titleLabel.font = [UIFont boldSystemFontOfSize:size > 70 ? 17 : 14];
 +    b.titleLabel.adjustsFontSizeToFitWidth = YES;
 +    b.exclusiveTouch = NO;
 +    [b addTarget:self action:@selector(buttonDown:) forControlEvents:UIControlEventTouchDown];
