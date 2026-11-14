@@ -939,7 +939,7 @@ index f34a2fdb..d32231f8 100644
  {
      RCache.set_RT(pRT, 0);
 diff --git a/src/Layers/xrRenderGL/glSH_Texture.cpp b/src/Layers/xrRenderGL/glSH_Texture.cpp
-index 664c2078..4815b15b 100644
+index 664c2078..1df0c3e0 100644
 --- a/src/Layers/xrRenderGL/glSH_Texture.cpp
 +++ b/src/Layers/xrRenderGL/glSH_Texture.cpp
 @@ -94,7 +94,7 @@ void CTexture::apply_theora(CBackend& cmd_list, u32 dwStage)
@@ -951,7 +951,20 @@ index 664c2078..4815b15b 100644
          xr_vector<u32> frame(_w * _h);
          int framePos = 0;
          pTheora->DecompressFrame(frame.data(), 0, framePos);
-@@ -369,7 +369,7 @@ void CTexture::desc_update()
+@@ -229,7 +229,12 @@ void CTexture::Load()
+             glBindTexture(GL_TEXTURE_2D, pTexture);
+             CHK_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0));
+             CHK_GL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0));
++#ifdef XR_GL_ES
++            // В ES внутренний RGBA8 сочетается только с внешним GL_RGBA (кадры переставляются в apply_theora)
++            CHK_GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, _w, _h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr));
++#else
+             CHK_GL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, _w, _h, 0, GL_BGRA, GL_UNSIGNED_BYTE, nullptr));
++#endif
+ 
+             pSurface = pTexture;
+             desc = GL_TEXTURE_2D;
+@@ -369,7 +374,7 @@ void CTexture::desc_update()
      desc_cache = pSurface;
      if (pSurface && (GL_TEXTURE_2D == desc || GL_TEXTURE_2D_MULTISAMPLE == desc))
      {
@@ -1032,7 +1045,7 @@ index 30519005..ecb595f1 100644
  #else
          return (GLint)GL_CLAMP_TO_BORDER;
 diff --git a/src/Layers/xrRenderGL/glTexture.cpp b/src/Layers/xrRenderGL/glTexture.cpp
-index 1cee8526..2435a010 100644
+index 1cee8526..07c6b1f3 100644
 --- a/src/Layers/xrRenderGL/glTexture.cpp
 +++ b/src/Layers/xrRenderGL/glTexture.cpp
 @@ -5,6 +5,9 @@
@@ -1100,11 +1113,27 @@ index 1cee8526..2435a010 100644
  u32 calc_texture_size(int lod, u32 mip_cnt, size_t orig_size)
  {
      if (1 == mip_cnt)
-@@ -110,10 +161,13 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
+@@ -110,10 +161,29 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
  #endif // DEBUG
      gli::texture texture = gli::load((char*)S->pointer(), img_size);
      R_ASSERT2(!texture.empty(), fn);
 +#ifdef XR_GL_ES
++    // Экономия памяти на iOS (пока текстуры распаковываются в RGBA8): пропускаем верхние мипы.
++    // Сколько — решает texture_lod (как в DX-рендерах), плюс потолок 1024 по большей стороне.
++    // Интерфейс не трогаем: UI считает координаты от размера текстуры.
++    if (texture.target() == gli::TARGET_2D && texture.levels() > 1 && !strstr(fn, "textures\\ui\\")
++        && !strstr(fn, "textures/ui/") && !strstr(fn, "\\intro\\"))
++    {
++        size_t skip = size_t(get_texture_load_lod(fn));
++        const auto fits = [&](size_t lvl) { const auto e = texture.extent(lvl); return e.x >= 4 && e.y >= 4; };
++        while (skip + 1 < texture.levels() && std::max(texture.extent(skip).x, texture.extent(skip).y) > 1024)
++            ++skip;
++        while (skip > 0 && (skip >= texture.levels() || !fits(skip)))
++            --skip;
++        if (skip > 0)
++            texture = gli::texture(texture, texture.target(), texture.format(), 0, texture.layers() - 1, 0,
++                texture.faces() - 1, skip, texture.levels() - 1, texture.swizzles());
++    }
 +    texture = DecompressBCIfUnsupported(texture, fn);
 +#endif
  
@@ -1115,7 +1144,7 @@ index 1cee8526..2435a010 100644
      gli::gl GL(gli::gl::PROFILE_ES30);
  #else
      gli::gl GL(gli::gl::PROFILE_GL33);
-@@ -130,7 +184,7 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
+@@ -130,7 +200,7 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
      glTexParameteri(target, GL_TEXTURE_BASE_LEVEL, 0);
      glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, static_cast<GLint>(texture.levels() - 1));
  
@@ -1449,6 +1478,27 @@ index add453d0..c5d5c4b2 100644
      CInifile* ini = CInifile::Create(fn);
  
      nNumChars = 0x100;
+diff --git a/src/xrEngine/defines.cpp b/src/xrEngine/defines.cpp
+index 6bb1d98e..d15c94de 100644
+--- a/src/xrEngine/defines.cpp
++++ b/src/xrEngine/defines.cpp
+@@ -1,4 +1,7 @@
+ #include "stdafx.h"
++#ifdef __APPLE__
++#include <TargetConditionals.h>
++#endif
+ 
+ #ifdef DEBUG
+ ECORE_API bool bDebug = false;
+@@ -23,4 +26,8 @@ Flags32 psDeviceFlags =
+ };
+ 
+ // textures
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++int psTextureLOD = 2; // iOS: по умолчанию на один мип меньше (память A10)
++#else
+ int psTextureLOD = 1;
++#endif
 diff --git a/src/xrGame/MainMenu.cpp b/src/xrGame/MainMenu.cpp
 index 22028756..5dbab994 100644
 --- a/src/xrGame/MainMenu.cpp
@@ -1464,6 +1514,19 @@ index 22028756..5dbab994 100644
  #endif
  }
  
+diff --git a/src/xrGame/ScriptXMLInit.cpp b/src/xrGame/ScriptXMLInit.cpp
+index 7de3d55a..2181079e 100644
+--- a/src/xrGame/ScriptXMLInit.cpp
++++ b/src/xrGame/ScriptXMLInit.cpp
+@@ -189,7 +189,7 @@ CUI3tButton* CScriptXmlInit::Init3tButton(LPCSTR path, CUIWindow* parent)
+ CUITabControl* CScriptXmlInit::InitTab(LPCSTR path, CUIWindow* parent)
+ {
+     CUITabControl* pWnd = xr_new<CUITabControl>();
+-    CUIXmlInit::InitTabControl(m_xml, path, 0, pWnd);
++    CUIXmlInit::InitTabControl(m_xml, path, 0, pWnd, true, ShadowOfChernobylMode);
+     _attach_child(pWnd, parent);
+     return pWnd;
+ }
 diff --git a/src/xrGame/login_manager.cpp b/src/xrGame/login_manager.cpp
 index 3eb004d9..5f34ac1e 100644
 --- a/src/xrGame/login_manager.cpp
@@ -1484,6 +1547,35 @@ index 3eb004d9..5f34ac1e 100644
 +    SDL_OpenURL(url);
  #endif
  }
+ 
+diff --git a/src/xrGame/ui/UIGameTutorial.cpp b/src/xrGame/ui/UIGameTutorial.cpp
+index 091259f8..3cadc6eb 100644
+--- a/src/xrGame/ui/UIGameTutorial.cpp
++++ b/src/xrGame/ui/UIGameTutorial.cpp
+@@ -13,6 +13,9 @@
+ #include "UIActorMenu.h"
+ #include "UIPdaWnd.h"
+ #include "xrScriptEngine/Functor.hpp"
++#ifdef __APPLE__
++#include <TargetConditionals.h>
++#endif
+ 
+ extern ENGINE_API bool bShowPauseString;
+ 
+@@ -362,6 +365,14 @@ bool CUISequencer::GrabInput()
+ 
+ void CUISequencer::IR_OnMousePress(int btn)
+ {
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++    // iOS: тап по экрану пропускает заставочные ролики, как Esc на ПК
++    if (!m_sequencer_items.empty() && smart_cast<CUISequenceVideoItem*>(m_sequencer_items.front()))
++    {
++        Stop();
++        return;
++    }
++#endif
+     if (m_sequencer_items.size())
+         m_sequencer_items.front()->OnMousePress(btn);
  
 diff --git a/src/xr_3da/CMakeLists.txt b/src/xr_3da/CMakeLists.txt
 index 2ea56a22..e38f6b61 100644
