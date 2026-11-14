@@ -1590,6 +1590,96 @@ index 01a427c0..1c00302c 100644
  
  bool g_bLoaded = false;
  ref_light precache_light = 0;
+diff --git a/src/xrEngine/xr_input.cpp b/src/xrEngine/xr_input.cpp
+index b8caddd9..ffeb2605 100644
+--- a/src/xrEngine/xr_input.cpp
++++ b/src/xrEngine/xr_input.cpp
+@@ -832,3 +832,85 @@ void CInput::Feedback(FeedbackType type, float s1, float s2, float duration)
+     default: NODEFAULT;
+     }
+ }
++
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++#include "xr_level_controller.h"
++// ---------------------------------------------------------------------------
++// iOSRay: C-интерфейс для экранного управления (src/xr_3da/ios_touch.mm).
++// Кнопки не знают клавиш: они просят действие, а мы находим, на что оно
++// назначено в default_controls.ltx/user.ltx, и шлём в SDL нужное событие.
++// ---------------------------------------------------------------------------
++extern "C" int xr_ios_input_grabbed()
++{
++    return pInput && pInput->InputIsGrabbed() ? 1 : 0;
++}
++
++static int xr_ios_bound_dik(EGameActions action)
++{
++    for (int i = 0; i < bindtypes_count; ++i)
++    {
++        const int dik = GetActionDik(action, i);
++        if (dik == SDL_SCANCODE_UNKNOWN)
++            continue;
++        if (dik < SDL_NUM_SCANCODES || (dik > MOUSE_INVALID && dik < MOUSE_MAX))
++            return dik;
++    }
++    return SDL_SCANCODE_UNKNOWN;
++}
++
++extern "C" void xr_ios_action(int iosAction, int down)
++{
++    static const EGameActions map[] = {
++        kFWD, kBACK, kL_STRAFE, kR_STRAFE,           // 0..3  движение
++        kWPN_FIRE, kWPN_ZOOM, kJUMP, kCROUCH,        // 4..7
++        kUSE, kWPN_RELOAD, kINVENTORY, kQUIT,        // 8..11
++    };
++    if (iosAction < 0 || iosAction >= int(std::size(map)))
++        return;
++
++    int dik = xr_ios_bound_dik(map[iosAction]);
++    if (map[iosAction] == kQUIT && dik == SDL_SCANCODE_UNKNOWN)
++        dik = SDL_SCANCODE_ESCAPE;
++    if (dik == SDL_SCANCODE_UNKNOWN)
++        return;
++
++    SDL_Event e{};
++    const Uint32 wnd = Device.m_sdlWnd ? SDL_GetWindowID(Device.m_sdlWnd) : 0;
++    if (dik < SDL_NUM_SCANCODES)
++    {
++        e.type = down ? SDL_KEYDOWN : SDL_KEYUP;
++        e.key.windowID = wnd;
++        e.key.state = down ? SDL_PRESSED : SDL_RELEASED;
++        e.key.keysym.scancode = SDL_Scancode(dik);
++        e.key.keysym.sym = SDL_GetKeyFromScancode(SDL_Scancode(dik));
++    }
++    else
++    {
++        // X-Ray: MOUSE_1 левая, MOUSE_2 правая, MOUSE_3 средняя (см. RemapIdx в MouseUpdate)
++        static const Uint8 toSdl[] = { SDL_BUTTON_LEFT, SDL_BUTTON_RIGHT, SDL_BUTTON_MIDDLE, SDL_BUTTON_X1, SDL_BUTTON_X2 };
++        e.type = down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
++        e.button.windowID = wnd;
++        e.button.which = 0;
++        e.button.button = toSdl[dik - MOUSE_1];
++        e.button.state = down ? SDL_PRESSED : SDL_RELEASED;
++        e.button.clicks = 1;
++    }
++    SDL_PushEvent(&e);
++}
++
++extern "C" void xr_ios_look(int dx, int dy)
++{
++    if (!dx && !dy)
++        return;
++    SDL_Event e{};
++    e.type = SDL_MOUSEMOTION;
++    e.motion.windowID = Device.m_sdlWnd ? SDL_GetWindowID(Device.m_sdlWnd) : 0;
++    e.motion.which = 0;
++    e.motion.xrel = dx;
++    e.motion.yrel = dy;
++    SDL_PushEvent(&e);
++}
++#endif
++#endif
 diff --git a/src/xrGame/MainMenu.cpp b/src/xrGame/MainMenu.cpp
 index 22028756..5dbab994 100644
 --- a/src/xrGame/MainMenu.cpp
@@ -1670,7 +1760,7 @@ index 091259f8..2e590cac 100644
          m_sequencer_items.front()->OnMousePress(btn);
  
 diff --git a/src/xr_3da/CMakeLists.txt b/src/xr_3da/CMakeLists.txt
-index 2ea56a22..e38f6b61 100644
+index 2ea56a22..7a2fd57f 100644
 --- a/src/xr_3da/CMakeLists.txt
 +++ b/src/xr_3da/CMakeLists.txt
 @@ -37,6 +37,18 @@ set_target_properties(xr_3da PROPERTIES
@@ -1682,12 +1772,12 @@ index 2ea56a22..e38f6b61 100644
 -)
 +if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
 +    enable_language(OBJCXX)
-+    target_sources(xr_3da PRIVATE ios_bootstrap.mm)
-+    set_source_files_properties(ios_bootstrap.mm PROPERTIES
++    target_sources(xr_3da PRIVATE ios_bootstrap.mm ios_touch.mm)
++    set_source_files_properties(ios_bootstrap.mm ios_touch.mm PROPERTIES
 +        COMPILE_OPTIONS "-fobjc-arc"
 +        SKIP_PRECOMPILE_HEADERS ON
 +        SKIP_UNITY_BUILD_INCLUSION ON)
-+    target_link_libraries(xr_3da PRIVATE SDL2::SDL2main "-framework Foundation")
++    target_link_libraries(xr_3da PRIVATE SDL2::SDL2main "-framework Foundation" "-framework UIKit")
 +    # На iOS исполняемый файл — это .app-бандл; пакет собирает проект iOSRay.
 +    install(TARGETS xr_3da BUNDLE DESTINATION "${CMAKE_INSTALL_BINDIR}")
 +else()
@@ -1754,10 +1844,10 @@ index 82d7da5d..0fd1fa17 100644
  #endif
 diff --git a/src/xr_3da/ios_bootstrap.mm b/src/xr_3da/ios_bootstrap.mm
 new file mode 100644
-index 00000000..8a0bc01d
+index 00000000..6e58cbec
 --- /dev/null
 +++ b/src/xr_3da/ios_bootstrap.mm
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,147 @@
 +// iOSRay: подготовка окружения движка на iOS перед entry_point().
 +//
 +// Что делает:
@@ -1822,6 +1912,8 @@ index 00000000..8a0bc01d
 +} // namespace
 +
 +// Возвращает добавку к командной строке движка (например, "-shoc ").
++extern "C" void xr_ios_touch_start();
++
 +extern "C" const char* xr_ios_prepare()
 +{
 +    static std::string extraArgs;
@@ -1897,8 +1989,303 @@ index 00000000..8a0bc01d
 +                   [res stringByAppendingPathComponent:@"gamedata/shaders/gl"]);
 +
 +        chdir(gameDir.fileSystemRepresentation);
++        xr_ios_touch_start(); // экранное управление появится, когда SDL создаст окно
 +        extraArgs = chosen->args;
 +        fflush(stdout);
 +    }
 +    return extraArgs.c_str();
++}
+diff --git a/src/xr_3da/ios_touch.mm b/src/xr_3da/ios_touch.mm
+new file mode 100644
+index 00000000..ddb0a8ca
+--- /dev/null
++++ b/src/xr_3da/ios_touch.mm
+@@ -0,0 +1,288 @@
++// iOSRay: экранное управление поверх окна SDL (минимальный набор).
++//
++//  * В игре (движок захватил ввод) слой ловит все касания:
++//      левая часть экрана — плавающий стик (W/A/S/D через привязки действий),
++//      правая часть — обзор (относительное движение мыши),
++//      кнопки — действия: огонь, прицел, прыжок, присед, использовать,
++//      перезарядка, инвентарь.
++//  * В меню слой пропускает касания к SDL (там они работают как мышь),
++//    видна только кнопка «Меню» (Esc) в правом верхнем углу.
++//
++// Кнопки не знают клавиш: движок сам ищет, на что назначено действие
++// (xr_ios_action в xrEngine/xr_input.cpp).
++
++#import <UIKit/UIKit.h>
++
++extern "C" int xr_ios_input_grabbed();
++extern "C" void xr_ios_action(int iosAction, int down);
++extern "C" void xr_ios_look(int dx, int dy);
++
++namespace
++{
++enum IosAction
++{
++    actFwd = 0, actBack, actLeft, actRight,
++    actFire, actAim, actJump, actCrouch,
++    actUse, actReload, actInventory, actMenu,
++};
++
++constexpr CGFloat kStickZone = 0.40;      // доля ширины экрана слева под стик
++constexpr CGFloat kStickDeadZone = 14.0;  // пт
++constexpr CGFloat kLookScale = 2.2;       // пикселей «мыши» на пункт касания
++} // namespace
++
++@interface XRTouchButton : UIButton
++@property(nonatomic) int action;
++@property(nonatomic) BOOL alwaysVisible;
++@end
++
++@implementation XRTouchButton
++@end
++
++@interface XRTouchOverlay : UIView
++@property(nonatomic) BOOL gameplay;
++@end
++
++@implementation XRTouchOverlay
++{
++    UITouch* _stickTouch;
++    UITouch* _lookTouch;
++    CGPoint _stickOrigin;
++    CGPoint _lookLast;
++    float _lookRemX, _lookRemY;
++    bool _dir[4];
++    UIView* _stickBase;
++    UIView* _stickKnob;
++    NSMutableArray<XRTouchButton*>* _buttons;
++}
++
++- (instancetype)initWithFrame:(CGRect)frame
++{
++    if ((self = [super initWithFrame:frame]))
++    {
++        self.backgroundColor = UIColor.clearColor;
++        self.multipleTouchEnabled = YES;
++        self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
++        _buttons = [NSMutableArray array];
++
++        _stickBase = [self circleWithSize:120 alpha:0.18];
++        _stickKnob = [self circleWithSize:54 alpha:0.35];
++        _stickBase.hidden = _stickKnob.hidden = YES;
++
++        [self addButton:@"Огонь" action:actFire size:86];
++        [self addButton:@"Прицел" action:actAim size:62];
++        [self addButton:@"Прыжок" action:actJump size:58];
++        [self addButton:@"Присед" action:actCrouch size:58];
++        [self addButton:@"Взять" action:actUse size:54];
++        [self addButton:@"Перезар." action:actReload size:54];
++        [self addButton:@"Инв." action:actInventory size:50];
++        XRTouchButton* menu = [self addButton:@"Меню" action:actMenu size:46];
++        menu.alwaysVisible = YES;
++        _gameplay = YES;
++        self.gameplay = NO;
++    }
++    return self;
++}
++
++- (UIView*)circleWithSize:(CGFloat)size alpha:(CGFloat)alpha
++{
++    UIView* v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, size, size)];
++    v.backgroundColor = [UIColor colorWithWhite:1.0 alpha:alpha];
++    v.layer.cornerRadius = size / 2;
++    v.userInteractionEnabled = NO;
++    [self addSubview:v];
++    return v;
++}
++
++- (XRTouchButton*)addButton:(NSString*)title action:(int)action size:(CGFloat)size
++{
++    XRTouchButton* b = [XRTouchButton buttonWithType:UIButtonTypeCustom];
++    b.action = action;
++    b.frame = CGRectMake(0, 0, size, size);
++    b.layer.cornerRadius = size / 2;
++    b.layer.borderWidth = 1.5;
++    b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.45].CGColor;
++    b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.28];
++    [b setTitle:title forState:UIControlStateNormal];
++    [b setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.85] forState:UIControlStateNormal];
++    b.titleLabel.font = [UIFont boldSystemFontOfSize:size > 70 ? 15 : 11];
++    b.titleLabel.adjustsFontSizeToFitWidth = YES;
++    b.exclusiveTouch = NO;
++    [b addTarget:self action:@selector(buttonDown:) forControlEvents:UIControlEventTouchDown];
++    [b addTarget:self action:@selector(buttonUp:)
++        forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
++    [self addSubview:b];
++    [_buttons addObject:b];
++    return b;
++}
++
++- (void)buttonDown:(XRTouchButton*)b
++{
++    b.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.30];
++    xr_ios_action(b.action, 1);
++}
++
++- (void)buttonUp:(XRTouchButton*)b
++{
++    b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.28];
++    xr_ios_action(b.action, 0);
++}
++
++- (void)layoutSubviews
++{
++    [super layoutSubviews];
++    UIEdgeInsets safe = self.safeAreaInsets;
++    const CGFloat W = self.bounds.size.width - safe.right;
++    const CGFloat H = self.bounds.size.height - safe.bottom;
++    const CGFloat top = safe.top;
++    for (XRTouchButton* b in _buttons)
++    {
++        CGPoint c{};
++        switch (b.action)
++        {
++        case actFire:      c = CGPointMake(W - 75,  H - 85);  break;
++        case actAim:       c = CGPointMake(W - 170, H - 60);  break;
++        case actJump:      c = CGPointMake(W - 60,  H - 180); break;
++        case actCrouch:    c = CGPointMake(W - 150, H - 150); break;
++        case actReload:    c = CGPointMake(W - 250, H - 50);  break;
++        case actUse:       c = CGPointMake(W - 60,  H - 260); break;
++        case actInventory: c = CGPointMake(W - 100, top + 34); break;
++        case actMenu:      c = CGPointMake(W - 36,  top + 30); break;
++        default: break;
++        }
++        b.center = c;
++    }
++}
++
++- (void)setGameplay:(BOOL)gameplay
++{
++    if (gameplay == _gameplay)
++        return;
++    _gameplay = gameplay;
++    for (XRTouchButton* b in _buttons)
++        b.hidden = !(gameplay || b.alwaysVisible);
++    if (!gameplay)
++        [self releaseStick];
++    _lookTouch = nil;
++}
++
++// В меню касания мимо кнопки «Меню» уходят в SDL (под нами)
++- (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event
++{
++    UIView* hit = [super hitTest:point withEvent:event];
++    if (_gameplay)
++        return hit;
++    return (hit && hit != self && !hit.hidden) ? hit : nil;
++}
++
++- (void)setDir:(int)i pressed:(bool)pressed
++{
++    if (_dir[i] == pressed)
++        return;
++    _dir[i] = pressed;
++    xr_ios_action(actFwd + i, pressed ? 1 : 0);
++}
++
++- (void)releaseStick
++{
++    for (int i = 0; i < 4; ++i)
++        [self setDir:i pressed:false];
++    _stickTouch = nil;
++    _stickBase.hidden = _stickKnob.hidden = YES;
++}
++
++- (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
++{
++    for (UITouch* t in touches)
++    {
++        const CGPoint p = [t locationInView:self];
++        if (!_stickTouch && p.x < self.bounds.size.width * kStickZone)
++        {
++            _stickTouch = t;
++            _stickOrigin = p;
++            _stickBase.center = _stickKnob.center = p;
++            _stickBase.hidden = _stickKnob.hidden = NO;
++        }
++        else if (!_lookTouch)
++        {
++            _lookTouch = t;
++            _lookLast = p;
++            _lookRemX = _lookRemY = 0;
++        }
++    }
++}
++
++- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
++{
++    for (UITouch* t in touches)
++    {
++        const CGPoint p = [t locationInView:self];
++        if (t == _stickTouch)
++        {
++            CGFloat dx = p.x - _stickOrigin.x, dy = p.y - _stickOrigin.y;
++            const CGFloat len = sqrt(dx * dx + dy * dy), maxLen = 50;
++            CGPoint knob = p;
++            if (len > maxLen)
++                knob = CGPointMake(_stickOrigin.x + dx / len * maxLen, _stickOrigin.y + dy / len * maxLen);
++            _stickKnob.center = knob;
++            // 8 направлений: ось нажата, если её доля в векторе заметная
++            const bool active = len > kStickDeadZone;
++            [self setDir:0 pressed:active && dy < -0.38 * len];
++            [self setDir:1 pressed:active && dy > 0.38 * len];
++            [self setDir:2 pressed:active && dx < -0.38 * len];
++            [self setDir:3 pressed:active && dx > 0.38 * len];
++        }
++        else if (t == _lookTouch)
++        {
++            _lookRemX += (p.x - _lookLast.x) * kLookScale;
++            _lookRemY += (p.y - _lookLast.y) * kLookScale;
++            _lookLast = p;
++            const int ix = int(_lookRemX), iy = int(_lookRemY);
++            _lookRemX -= ix;
++            _lookRemY -= iy;
++            xr_ios_look(ix, iy);
++        }
++    }
++}
++
++- (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
++{
++    for (UITouch* t in touches)
++    {
++        if (t == _stickTouch)
++            [self releaseStick];
++        else if (t == _lookTouch)
++            _lookTouch = nil;
++    }
++}
++
++- (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
++{
++    [self touchesEnded:touches withEvent:event];
++}
++@end
++
++static XRTouchOverlay* g_overlay;
++
++extern "C" void xr_ios_touch_start()
++{
++    [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer*) {
++        if (!g_overlay)
++        {
++            UIView* host = nil;
++            for (UIWindow* w in UIApplication.sharedApplication.windows)
++                if (w.rootViewController.view)
++                {
++                    host = w.rootViewController.view;
++                    break;
++                }
++            if (!host)
++                return;
++            g_overlay = [[XRTouchOverlay alloc] initWithFrame:host.bounds];
++            [host addSubview:g_overlay];
++        }
++        else if (g_overlay.superview)
++            [g_overlay.superview bringSubviewToFront:g_overlay];
++        g_overlay.gameplay = xr_ios_input_grabbed() != 0;
++    }];
 +}
