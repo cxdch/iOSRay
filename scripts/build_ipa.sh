@@ -61,8 +61,8 @@ build_variant() {
             [[ -e "$j" ]] || continue
             cp "$j" "$app/xrshaders/$(basename "$j" .json | LC_ALL=C sed 's/[^A-Za-z0-9_]/_/g').json"
         done
-        if [[ -f "$ROOT/build/xrshaders.metallib" ]]; then
-            cp "$ROOT/build/xrshaders.metallib" "$app/"
+        if [[ -f "$SHADERS/../xrshaders.metallib" ]]; then
+            cp "$SHADERS/../xrshaders.metallib" "$app/"
             echo "   xrshaders.metallib в пакете"
         fi
         echo "   шейдеров OpenXRay в пакете: $(ls "$app/xrshaders" | wc -l)"
