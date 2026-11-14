@@ -1709,23 +1709,19 @@ index 60fe082f..1d330873 100644
          glReadPixels(0, 0, Device.dwWidth, Device.dwHeight, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl.mm b/src/Layers/xrRenderGL/mtl/glmtl.mm
 new file mode 100644
-index 00000000..d999b03b
+index 00000000..11147d8e
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl.mm
-@@ -0,0 +1,457 @@
-+// iOSRay: Metal-режим рендера (этап 3).
+@@ -0,0 +1,453 @@
++// iOSRay: Metal-режим рендера.
 +//
 +// Рендер OpenXRay продолжает вызывать функции OpenGL ES (через указатели glad),
 +// но в Metal-режиме glad загружается не из драйвера Apple, а отсюда.
-+// На этом этапе почти всё — заглушки, которые «делают вид», что работа выполнена:
-+// объекты получают номера, проверки проходят, буферы — настоящие MTLBuffer
-+// (чтобы glMapBuffer* возвращал память). Каждый кадр Metal очищает экран и
-+// показывает его. Дальше функции будут по одной переводиться на Metal.
++// Здесь: общие запросы (glGet*), имена объектов, буферы (MTLBuffer), шейдеры
++// (glmtl_shaders.cpp). Текстуры, кадровые буферы, состояние и рисование —
++// в glmtl_render.mm. Всё, что не реализовано, — общая заглушка.
 +
-+#import <Metal/Metal.h>
-+#import <QuartzCore/CAMetalLayer.h>
-+#include <glad/gl.h>
-+
++#include "glmtl_internal.h"
 +#include "glmtl_shaders.h"
 +
 +#include <cstdio>
@@ -1738,16 +1734,12 @@ index 00000000..d999b03b
 +{
 +struct MtlState
 +{
-+    id<MTLDevice> device;
-+    id<MTLCommandQueue> queue;
-+    CAMetalLayer* layer;
-+    dispatch_semaphore_t inFlight;
 +    GLuint nextName = 1;
 +    std::unordered_map<GLenum, GLuint> boundBuffer; // цель → имя буфера
 +    std::unordered_map<GLuint, id<MTLBuffer>> buffers;
-+    std::unordered_map<std::string, unsigned> unknownCalls;
-+    unsigned frame = 0;
 +} g;
++
++using xr_mtl::core;
 +
 +const char* const kExtensions[] = {
 +    "GL_KHR_texture_compression_astc_ldr",
@@ -1765,7 +1757,7 @@ index 00000000..d999b03b
 +    switch (name)
 +    {
 +    case GL_VENDOR: return (const GLubyte*)"Apple Inc. (iOSRay Metal)";
-+    case GL_RENDERER: return (const GLubyte*)(g.device ? g.device.name.UTF8String : "Metal");
++    case GL_RENDERER: return (const GLubyte*)(core.device ? core.device.name.UTF8String : "Metal");
 +    case GL_VERSION: return (const GLubyte*)"OpenGL ES 3.0 iOSRay-Metal";
 +    case GL_SHADING_LANGUAGE_VERSION: return (const GLubyte*)"OpenGL ES GLSL ES 3.00";
 +    default: return (const GLubyte*)"";
@@ -1804,8 +1796,8 @@ index 00000000..d999b03b
 +    case GL_MAX_FRAGMENT_UNIFORM_VECTORS: *v = 1024; return;
 +    case GL_VIEWPORT:
 +        v[0] = v[1] = 0;
-+        v[2] = g.layer ? GLint(g.layer.drawableSize.width) : 1;
-+        v[3] = g.layer ? GLint(g.layer.drawableSize.height) : 1;
++        v[2] = core.layer ? GLint(core.layer.drawableSize.width) : 1;
++        v[3] = core.layer ? GLint(core.layer.drawableSize.height) : 1;
 +        return;
 +    default: *v = 0; return;
 +    }
@@ -1949,7 +1941,22 @@ index 00000000..d999b03b
 +GLboolean gl_IsTrue(GLuint) { return GL_TRUE; }
 +
 +// --- буферы: настоящие MTLBuffer, чтобы отображение в память работало -------
-+void gl_BindBuffer(GLenum target, GLuint buffer) { g.boundBuffer[target] = buffer; }
++void gl_BindBuffer(GLenum target, GLuint buffer)
++{
++    if (target == GL_ELEMENT_ARRAY_BUFFER)
++        xr_mtl::SetElementBufferBinding(buffer); // привязка индексов — часть VAO
++    else
++    {
++        if (target == GL_ARRAY_BUFFER)
++            xr_mtl::SetArrayBufferBinding(buffer);
++        g.boundBuffer[target] = buffer;
++    }
++}
++
++GLuint BoundName(GLenum target)
++{
++    return target == GL_ELEMENT_ARRAY_BUFFER ? xr_mtl::ElementBufferBinding() : g.boundBuffer[target];
++}
 +
 +void gl_DeleteBuffers(GLsizei n, const GLuint* ids)
 +{
@@ -1959,17 +1966,17 @@ index 00000000..d999b03b
 +
 +id<MTLBuffer> BoundBuffer(GLenum target)
 +{
-+    const auto it = g.buffers.find(g.boundBuffer[target]);
++    const auto it = g.buffers.find(BoundName(target));
 +    return it == g.buffers.end() ? nil : it->second;
 +}
 +
 +void gl_BufferData(GLenum target, GLsizeiptr size, const void* data, GLenum)
 +{
-+    const GLuint name = g.boundBuffer[target];
++    const GLuint name = BoundName(target);
 +    if (!name || size <= 0)
 +        return;
-+    id<MTLBuffer> buf = data ? [g.device newBufferWithBytes:data length:NSUInteger(size) options:MTLResourceStorageModeShared]
-+                             : [g.device newBufferWithLength:NSUInteger(size) options:MTLResourceStorageModeShared];
++    id<MTLBuffer> buf = data ? [core.device newBufferWithBytes:data length:NSUInteger(size) options:MTLResourceStorageModeShared]
++                             : [core.device newBufferWithLength:NSUInteger(size) options:MTLResourceStorageModeShared];
 +    g.buffers[name] = buf;
 +}
 +
@@ -1980,9 +1987,15 @@ index 00000000..d999b03b
 +        memcpy(static_cast<uint8_t*>(buf.contents) + offset, data, size_t(size));
 +}
 +
-+void* gl_MapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield)
++void* gl_MapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access)
 +{
 +    id<MTLBuffer> buf = BoundBuffer(target);
++    if (buf && (access & GL_MAP_INVALIDATE_BUFFER_BIT))
++    {
++        // «осиротить» буфер: GPU может ещё читать старый — отдаём новый
++        buf = [core.device newBufferWithLength:buf.length options:MTLResourceStorageModeShared];
++        g.buffers[BoundName(target)] = buf;
++    }
 +    if (!buf || NSUInteger(offset + length) > buf.length)
 +        return nullptr;
 +    return static_cast<uint8_t*>(buf.contents) + offset;
@@ -2111,20 +2124,31 @@ index 00000000..d999b03b
 +#undef E
 +} // namespace
 +
++namespace xr_mtl
++{
++Core core;
++
++id<MTLBuffer> BufferObject(GLuint name)
++{
++    const auto it = g.buffers.find(name);
++    return it == g.buffers.end() ? nil : it->second;
++}
++} // namespace xr_mtl
++
 +extern "C" bool xr_mtl_init(void* metalLayer)
 +{
-+    g.device = MTLCreateSystemDefaultDevice();
-+    if (!g.device || !metalLayer)
++    core.device = MTLCreateSystemDefaultDevice();
++    if (!core.device || !metalLayer)
 +        return false;
-+    g.queue = [g.device newCommandQueue];
-+    g.layer = (__bridge CAMetalLayer*)metalLayer;
-+    g.layer.device = g.device;
-+    g.layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-+    g.layer.framebufferOnly = YES;
-+    g.layer.maximumDrawableCount = 3;
-+    g.inFlight = dispatch_semaphore_create(3);
-+    printf("[iOSRay] Metal: %s, слой %.0fx%.0f\n", g.device.name.UTF8String, g.layer.drawableSize.width,
-+        g.layer.drawableSize.height);
++    core.queue = [core.device newCommandQueue];
++    core.layer = (__bridge CAMetalLayer*)metalLayer;
++    core.layer.device = core.device;
++    core.layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
++    core.layer.framebufferOnly = YES;
++    core.layer.maximumDrawableCount = 3;
++    xr_mtl::RenderInit();
++    printf("[iOSRay] Metal: %s, слой %.0fx%.0f\n", core.device.name.UTF8String, core.layer.drawableSize.width,
++        core.layer.drawableSize.height);
 +    fflush(stdout);
 +    return true;
 +}
@@ -2132,50 +2156,1947 @@ index 00000000..d999b03b
 +// Загрузчик для gladLoadGLES2: свои реализации или общая заглушка
 +extern "C" void* xr_mtl_get_proc(const char* name)
 +{
++    if (void* fn = xr_mtl::RenderProc(name))
++        return fn;
 +    for (const Entry& e : kTable)
 +        if (!strcmp(e.name, name))
 +            return e.fn;
 +    return reinterpret_cast<void*>(&gl_noop);
 +}
 +
-+// Конец кадра: пока — очистка экрана тёмно-серым и показ
-+extern "C" void xr_mtl_present()
++// Конец кадра: вывод на экран (glmtl_render.mm)
++extern "C" void xr_mtl_present() { xr_mtl::RenderPresent(); }
+diff --git a/src/Layers/xrRenderGL/mtl/glmtl_internal.h b/src/Layers/xrRenderGL/mtl/glmtl_internal.h
+new file mode 100644
+index 00000000..ad4d1581
+--- /dev/null
++++ b/src/Layers/xrRenderGL/mtl/glmtl_internal.h
+@@ -0,0 +1,36 @@
++// iOSRay: Metal-режим — общее между glmtl.mm (база, буферы, шейдеры) и
++// glmtl_render.mm (текстуры, кадровые буферы, состояние, рисование).
++#pragma once
++
++#import <Metal/Metal.h>
++#import <QuartzCore/CAMetalLayer.h>
++#include <glad/gl.h>
++
++#include <cstddef>
++
++namespace xr_mtl
 +{
-+    if (!g.layer)
++struct Core
++{
++    id<MTLDevice> device;
++    id<MTLCommandQueue> queue;
++    CAMetalLayer* layer;
++};
++extern Core core;
++
++// glmtl.mm: буферные объекты GL → MTLBuffer
++id<MTLBuffer> BufferObject(GLuint name);
++
++// glmtl_render.mm
++struct ProcEntry
++{
++    const char* name;
++    void* fn;
++};
++void* RenderProc(const char* name); // nullptr, если такой функции там нет
++void RenderInit();
++void RenderPresent();
++GLuint ElementBufferBinding();               // привязка GL_ELEMENT_ARRAY_BUFFER (живёт в VAO)
++void SetElementBufferBinding(GLuint buffer);
++void SetArrayBufferBinding(GLuint buffer);   // для glVertexAttribPointer
++} // namespace xr_mtl
+diff --git a/src/Layers/xrRenderGL/mtl/glmtl_render.mm b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
+new file mode 100644
+index 00000000..6b71f282
+--- /dev/null
++++ b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
+@@ -0,0 +1,1877 @@
++// iOSRay: Metal-режим, этап 4b — рисование.
++//
++// Здесь GL-вызовы движка превращаются в работу Metal:
++//   * текстуры (glTexStorage*/glTex*SubImage*) → MTLTexture, сэмплеры → MTLSamplerState;
++//   * кадровые буферы (FBO) → наборы вложений прохода рендера;
++//   * VAO + glVertexAttribPointer → MTLVertexDescriptor;
++//   * состояние (смешивание, глубина, трафарет, отсечение, viewport/scissor) →
++//     PSO + MTLDepthStencilState + настройки энкодера;
++//   * glDraw* → drawPrimitives/drawIndexedPrimitives.
++//
++// Раскладка изображений в памяти такая же, как в GL: строка 0 — низ кадра.
++// Для этого шейдеры переворачивают Y (glmtl_shaders.cpp), поэтому viewport/scissor
++// передаются в Metal без пересчёта, обход граней меняется на противоположный,
++// а при выводе на экран кадр переворачивается обратно.
++
++#include "glmtl_internal.h"
++#include "glmtl_shaders.h"
++
++#include <algorithm>
++#include <cstdarg>
++#include <initializer_list>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++
++namespace xr_mtl
++{
++namespace
++{
++constexpr int kMaxUnits = 32;
++constexpr int kMaxAttribs = 16;
++constexpr int kMaxColor = 4;
++constexpr int kFramesInFlight = 3;
++constexpr NSUInteger kUniformBufferIndex = 0;     // [[buffer(0)]] — gl_DefaultUniformBlock
++constexpr NSUInteger kFirstVertexBufferIndex = 16; // вершинные буферы: 16..29
++constexpr NSUInteger kDummyVertexBufferIndex = 30; // нули для отсутствующих атрибутов
++
++void LogOnce(const std::string& key, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
++std::unordered_set<std::string> g_logged;
++void LogOnce(const std::string& key, const char* fmt, ...)
++{
++    if (!g_logged.insert(key).second || g_logged.size() > 400)
 +        return;
-+    dispatch_semaphore_wait(g.inFlight, DISPATCH_TIME_FOREVER);
-+    @autoreleasepool
++    va_list args;
++    va_start(args, fmt);
++    vprintf(fmt, args);
++    va_end(args);
++    fflush(stdout);
++}
++
++// --- параметры выборки (у текстуры по умолчанию и у объектов-сэмплеров) ----------
++struct SamplerParams
++{
++    int32_t minF = GL_NEAREST_MIPMAP_LINEAR, magF = GL_LINEAR;
++    int32_t wrapS = GL_REPEAT, wrapT = GL_REPEAT, wrapR = GL_REPEAT;
++    int32_t compareMode = GL_NONE, compareFunc = GL_LEQUAL;
++    int32_t maxAniso = 1;
++    int32_t maxLevel = 1000;
++    float minLod = -1000.f, maxLod = 1000.f;
++};
++
++bool operator==(const SamplerParams& a, const SamplerParams& b) { return !memcmp(&a, &b, sizeof(a)); }
++
++struct SamplerParamsHash
++{
++    size_t operator()(const SamplerParams& p) const
 +    {
-+        id<CAMetalDrawable> drawable = [g.layer nextDrawable];
-+        if (!drawable)
-+        {
-+            dispatch_semaphore_signal(g.inFlight);
-+            return;
-+        }
-+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-+        rp.colorAttachments[0].texture = drawable.texture;
-+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0.12, 0.12, 0.13, 1.0);
-+        id<MTLCommandBuffer> cb = [g.queue commandBuffer];
-+        [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
-+        [cb presentDrawable:drawable];
-+        dispatch_semaphore_t sem = g.inFlight;
-+        [cb addCompletedHandler:^(id<MTLCommandBuffer>) { dispatch_semaphore_signal(sem); }];
-+        [cb commit];
++        const auto* w = reinterpret_cast<const uint32_t*>(&p);
++        size_t h = 0;
++        for (size_t i = 0; i < sizeof(p) / 4; ++i)
++            h = h * 31 + w[i];
++        return h;
 +    }
-+    if ((++g.frame % 600) == 1)
++};
++
++struct Texture
++{
++    GLenum target = 0;
++    GLenum internal = 0;
++    MTLPixelFormat format = MTLPixelFormatInvalid;
++    int w = 0, h = 0, d = 1, levels = 1;
++    id<MTLTexture> mtl = nil;
++    SamplerParams params;
++};
++
++struct Fbo
++{
++    GLuint color[kMaxColor] = {};
++    GLint colorLevel[kMaxColor] = {};
++    GLuint depth = 0, stencil = 0;
++    GLenum drawBuffers[kMaxColor] = { GL_COLOR_ATTACHMENT0, GL_NONE, GL_NONE, GL_NONE };
++};
++
++struct Attrib
++{
++    bool enabled = false;
++    GLint size = 4;
++    GLenum type = GL_FLOAT;
++    bool normalized = false;
++    GLsizei stride = 0;
++    uintptr_t offset = 0;
++    GLuint buffer = 0;
++};
++
++struct Vao
++{
++    Attrib attribs[kMaxAttribs];
++    GLuint elementBuffer = 0;
++};
++
++struct StencilFace
++{
++    GLenum func = GL_ALWAYS;
++    GLint ref = 0;
++    GLuint readMask = 0xFFFFFFFF, writeMask = 0xFFFFFFFF;
++    GLenum sfail = GL_KEEP, dpfail = GL_KEEP, dppass = GL_KEEP;
++};
++
++struct State
++{
++    // объекты
++    std::unordered_map<GLuint, Texture> textures;
++    std::unordered_map<GLuint, SamplerParams> samplers;
++    std::unordered_map<GLuint, Fbo> fbos;
++    std::unordered_map<GLuint, Vao> vaos;
++    std::unordered_map<GLuint, Texture> renderbuffers;
++
++    // привязки
++    GLuint activeUnit = 0;
++    GLuint unit2D[kMaxUnits] = {}, unit3D[kMaxUnits] = {}, unitCube[kMaxUnits] = {}, unitArray[kMaxUnits] = {};
++    GLuint unitSampler[kMaxUnits] = {};
++    GLuint drawFbo = 0, readFbo = 0;
++    GLuint vao = 0;
++    GLuint renderbuffer = 0;
++    GLint unpackAlignment = 4;
++
++    // фиксированное состояние
++    bool blend = false, depthTest = false, stencilTest = false, cull = false, scissorTest = false;
++    bool polygonOffsetFill = false;
++    GLenum blendSrcRGB = GL_ONE, blendDstRGB = GL_ZERO, blendSrcA = GL_ONE, blendDstA = GL_ZERO;
++    GLenum blendEqRGB = GL_FUNC_ADD, blendEqA = GL_FUNC_ADD;
++    float blendColor[4] = {};
++    bool colorMask[4] = { true, true, true, true };
++    GLenum depthFunc = GL_LESS;
++    bool depthMask = true;
++    StencilFace stFront, stBack;
++    GLenum cullFace = GL_BACK, frontFace = GL_CCW;
++    GLint viewport[4] = {};
++    GLint scissor[4] = {};
++    float depthNear = 0.f, depthFar = 1.f;
++    float clearColor[4] = {};
++    float clearDepth = 1.f;
++    GLint clearStencil = 0;
++    float polyFactor = 0.f, polyUnits = 0.f;
++
++    // кадр
++    id<MTLCommandBuffer> cmd = nil;
++    id<MTLRenderCommandEncoder> enc = nil;
++    std::string encKey;
++    id<MTLTexture> encColor[kMaxColor] = {};
++    id<MTLTexture> encDepth = nil;
++    id<MTLTexture> presentSource = nil;
++    dispatch_semaphore_t inFlight;
++    unsigned frameIndex = 0;
++
++    // временная память кадра (uniform-блоки, выровненные индексы)
++    struct Ring
 +    {
-+        printf("[iOSRay] Metal: кадр %u\n", g.frame);
-+        fflush(stdout);
++        std::vector<id<MTLBuffer>> chunks;
++        size_t chunk = 0, offset = 0;
++    } rings[kFramesInFlight];
++
++    // кэши
++    std::unordered_map<SamplerParams, id<MTLSamplerState>, SamplerParamsHash> samplerStates;
++    std::unordered_map<std::string, id<MTLRenderPipelineState>> pipelines;
++    std::unordered_map<std::string, id<MTLDepthStencilState>> depthStates;
++    struct Lib
++    {
++        uint32_t generation = 0;
++        id<MTLFunction> fn[2] = { nil, nil };
++        bool failed = false;
++    };
++    std::unordered_map<GLuint, Lib> libraries;
++    id<MTLTexture> dummy2D, dummy3D, dummyCube, dummyDepth, dummyArray;
++    id<MTLBuffer> dummyVertex;
++    id<MTLRenderPipelineState> blitPipeline;
++    id<MTLSamplerState> blitSampler;
++
++    // статистика
++    unsigned draws = 0, skipped = 0, passes = 0;
++} s;
++
++// --- форматы ------------------------------------------------------------------
++MTLPixelFormat PixelFormatOf(GLenum internal)
++{
++    switch (internal)
++    {
++    case GL_RGBA8: case GL_RGBA: case GL_RGB8: case GL_RGB: return MTLPixelFormatRGBA8Unorm;
++    case GL_SRGB8_ALPHA8: case GL_SRGB8: return MTLPixelFormatRGBA8Unorm_sRGB;
++    case 0x93A1: /* GL_BGRA8_EXT */ case 0x80E1: /* GL_BGRA_EXT */ return MTLPixelFormatBGRA8Unorm;
++    case GL_R8: case GL_RED: case GL_LUMINANCE: case GL_ALPHA: return MTLPixelFormatR8Unorm;
++    case GL_RG8: case GL_RG: case GL_LUMINANCE_ALPHA: return MTLPixelFormatRG8Unorm;
++    case GL_RGB10_A2: return MTLPixelFormatRGB10A2Unorm;
++    case GL_R16F: return MTLPixelFormatR16Float;
++    case GL_RG16F: return MTLPixelFormatRG16Float;
++    case GL_RGBA16F: case GL_RGB16F: return MTLPixelFormatRGBA16Float;
++    case GL_R32F: return MTLPixelFormatR32Float;
++    case GL_RG32F: return MTLPixelFormatRG32Float;
++    case GL_RGBA32F: case GL_RGB32F: return MTLPixelFormatRGBA32Float;
++    case 0x822A: /* GL_R16 */ return MTLPixelFormatR16Unorm;
++    case 0x822C: /* GL_RG16 */ return MTLPixelFormatRG16Unorm;
++    case 0x805B: /* GL_RGBA16 */ return MTLPixelFormatRGBA16Unorm;
++    case GL_RGB565: case GL_RGBA4: case GL_RGB5_A1: return MTLPixelFormatRGBA8Unorm; // распаковываем
++    case GL_R11F_G11F_B10F: return MTLPixelFormatRG11B10Float;
++    case GL_DEPTH_COMPONENT16: return MTLPixelFormatDepth16Unorm;
++    case GL_DEPTH_COMPONENT24: case GL_DEPTH_COMPONENT32F: case GL_DEPTH_COMPONENT: return MTLPixelFormatDepth32Float;
++    case GL_DEPTH24_STENCIL8: case GL_DEPTH32F_STENCIL8: case GL_DEPTH_STENCIL: return MTLPixelFormatDepth32Float_Stencil8;
++    case GL_STENCIL_INDEX8: return MTLPixelFormatStencil8;
++    case 0x93B0: /* GL_COMPRESSED_RGBA_ASTC_4x4_KHR */ return MTLPixelFormatASTC_4x4_LDR;
++    case 0x93D0: /* GL_COMPRESSED_SRGB8_ALPHA8_ASTC_4x4_KHR */ return MTLPixelFormatASTC_4x4_sRGB;
++    default:
++        LogOnce("fmt" + std::to_string(internal), "! [iOSRay] Metal: формат текстуры 0x%x не знаю — RGBA8\n", internal);
++        return MTLPixelFormatRGBA8Unorm;
 +    }
 +}
++
++bool IsDepth(MTLPixelFormat f)
++{
++    return f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth32Float_Stencil8
++        || f == MTLPixelFormatStencil8;
++}
++bool HasStencil(MTLPixelFormat f) { return f == MTLPixelFormatDepth32Float_Stencil8 || f == MTLPixelFormatStencil8; }
++bool IsAstc(MTLPixelFormat f) { return f == MTLPixelFormatASTC_4x4_LDR || f == MTLPixelFormatASTC_4x4_sRGB; }
++bool IsBlendable(MTLPixelFormat f)
++{
++    // A10 (Apple3) не смешивает 32-битные float-форматы
++    return f != MTLPixelFormatR32Float && f != MTLPixelFormatRG32Float && f != MTLPixelFormatRGBA32Float;
++}
++
++size_t BytesPerPixel(MTLPixelFormat f)
++{
++    switch (f)
++    {
++    case MTLPixelFormatR8Unorm: return 1;
++    case MTLPixelFormatRG8Unorm: case MTLPixelFormatR16Float: case MTLPixelFormatR16Unorm:
++    case MTLPixelFormatDepth16Unorm: return 2;
++    case MTLPixelFormatRGBA16Float: case MTLPixelFormatRG32Float: case MTLPixelFormatRGBA16Unorm: return 8;
++    case MTLPixelFormatRGBA32Float: return 16;
++    default: return 4;
++    }
++}
++
++size_t ExternalBytesPerPixel(GLenum format, GLenum type)
++{
++    size_t comps = 4;
++    switch (format)
++    {
++    case GL_RED: case GL_LUMINANCE: case GL_ALPHA: case GL_RED_INTEGER: comps = 1; break;
++    case GL_RG: case GL_LUMINANCE_ALPHA: case GL_RG_INTEGER: comps = 2; break;
++    case GL_RGB: case GL_RGB_INTEGER: comps = 3; break;
++    default: comps = 4; break;
++    }
++    switch (type)
++    {
++    case GL_UNSIGNED_SHORT_5_6_5: case GL_UNSIGNED_SHORT_4_4_4_4: case GL_UNSIGNED_SHORT_5_5_5_1: return 2;
++    case GL_UNSIGNED_INT_2_10_10_10_REV: case GL_UNSIGNED_INT_10F_11F_11F_REV: case GL_UNSIGNED_INT_24_8: return 4;
++    case GL_HALF_FLOAT: case GL_UNSIGNED_SHORT: case GL_SHORT: return comps * 2;
++    case GL_FLOAT: case GL_UNSIGNED_INT: case GL_INT: return comps * 4;
++    default: return comps;
++    }
++}
++
++// Пиксели GL (format/type) → байты формата Metal. Возвращает указатель на готовые данные.
++const void* ConvertPixels(const void* src, size_t pixels, GLenum format, GLenum type, MTLPixelFormat dst,
++    std::vector<uint8_t>& tmp)
++{
++    const size_t outBpp = BytesPerPixel(dst);
++    const auto* in = static_cast<const uint8_t*>(src);
++    if (dst == MTLPixelFormatRGBA8Unorm || dst == MTLPixelFormatRGBA8Unorm_sRGB || dst == MTLPixelFormatBGRA8Unorm)
++    {
++        if (type == GL_UNSIGNED_BYTE && (format == GL_RGBA || format == 0x80E1 /*BGRA*/))
++            return src;
++        tmp.resize(pixels * 4);
++        uint8_t* o = tmp.data();
++        for (size_t i = 0; i < pixels; ++i, o += 4)
++        {
++            if (type == GL_UNSIGNED_BYTE && format == GL_RGB)
++            {
++                o[0] = in[i * 3]; o[1] = in[i * 3 + 1]; o[2] = in[i * 3 + 2]; o[3] = 255;
++            }
++            else if (type == GL_UNSIGNED_SHORT_5_6_5)
++            {
++                const uint16_t v = reinterpret_cast<const uint16_t*>(in)[i];
++                o[0] = uint8_t(((v >> 11) & 31) * 255 / 31); o[1] = uint8_t(((v >> 5) & 63) * 255 / 63);
++                o[2] = uint8_t((v & 31) * 255 / 31); o[3] = 255;
++            }
++            else if (type == GL_UNSIGNED_SHORT_4_4_4_4)
++            {
++                const uint16_t v = reinterpret_cast<const uint16_t*>(in)[i];
++                o[0] = uint8_t(((v >> 12) & 15) * 17); o[1] = uint8_t(((v >> 8) & 15) * 17);
++                o[2] = uint8_t(((v >> 4) & 15) * 17); o[3] = uint8_t((v & 15) * 17);
++            }
++            else if (type == GL_UNSIGNED_SHORT_5_5_5_1)
++            {
++                const uint16_t v = reinterpret_cast<const uint16_t*>(in)[i];
++                o[0] = uint8_t(((v >> 11) & 31) * 255 / 31); o[1] = uint8_t(((v >> 6) & 31) * 255 / 31);
++                o[2] = uint8_t(((v >> 1) & 31) * 255 / 31); o[3] = (v & 1) ? 255 : 0;
++            }
++            else if (type == GL_UNSIGNED_BYTE && (format == GL_LUMINANCE || format == GL_RED))
++            {
++                o[0] = o[1] = o[2] = in[i]; o[3] = 255;
++            }
++            else if (type == GL_UNSIGNED_BYTE && format == GL_LUMINANCE_ALPHA)
++            {
++                o[0] = o[1] = o[2] = in[i * 2]; o[3] = in[i * 2 + 1];
++            }
++            else
++            {
++                o[0] = o[1] = o[2] = o[3] = 255;
++            }
++        }
++        return tmp.data();
++    }
++    // RGB float/half → RGBA
++    if (format == GL_RGB && (dst == MTLPixelFormatRGBA16Float || dst == MTLPixelFormatRGBA32Float))
++    {
++        const size_t c = dst == MTLPixelFormatRGBA16Float ? 2 : 4;
++        tmp.assign(pixels * outBpp, 0);
++        for (size_t i = 0; i < pixels; ++i)
++        {
++            memcpy(&tmp[i * outBpp], in + i * 3 * c, 3 * c);
++            if (c == 2)
++                *reinterpret_cast<uint16_t*>(&tmp[i * outBpp + 6]) = 0x3C00; // 1.0h
++            else
++                *reinterpret_cast<float*>(&tmp[i * outBpp + 12]) = 1.f;
++        }
++        return tmp.data();
++    }
++    return src;
++}
++
++id<MTLTexture> MakeTexture(MTLTextureType type, MTLPixelFormat fmt, int w, int h, int d, int levels)
++{
++    MTLTextureDescriptor* td = [MTLTextureDescriptor new];
++    td.textureType = type;
++    td.pixelFormat = fmt;
++    td.width = NSUInteger(std::max(w, 1));
++    td.height = NSUInteger(std::max(h, 1));
++    td.depth = type == MTLTextureType3D ? NSUInteger(std::max(d, 1)) : 1;
++    td.arrayLength = type == MTLTextureType2DArray ? NSUInteger(std::max(d, 1)) : 1;
++    td.mipmapLevelCount = NSUInteger(std::max(levels, 1));
++    td.usage = MTLTextureUsageShaderRead;
++    if (!IsAstc(fmt) && type != MTLTextureType3D)
++        td.usage |= MTLTextureUsageRenderTarget;
++    td.storageMode = IsDepth(fmt) ? MTLStorageModePrivate : MTLStorageModeShared;
++    return [core.device newTextureWithDescriptor:td];
++}
++
++// --- текстуры -------------------------------------------------------------------
++GLuint& UnitSlot(GLenum target, GLuint unit)
++{
++    switch (target)
++    {
++    case GL_TEXTURE_3D: return s.unit3D[unit];
++    case GL_TEXTURE_CUBE_MAP: return s.unitCube[unit];
++    case GL_TEXTURE_2D_ARRAY: return s.unitArray[unit];
++    default: return s.unit2D[unit];
++    }
++}
++
++Texture* BoundTexture(GLenum target)
++{
++    if (target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)
++        target = GL_TEXTURE_CUBE_MAP;
++    const GLuint name = UnitSlot(target, s.activeUnit);
++    const auto it = s.textures.find(name);
++    return it == s.textures.end() ? nullptr : &it->second;
++}
++
++void gl_ActiveTexture(GLenum unit) { s.activeUnit = std::min<GLuint>(unit - GL_TEXTURE0, kMaxUnits - 1); }
++
++void gl_BindTexture(GLenum target, GLuint name)
++{
++    UnitSlot(target, s.activeUnit) = name;
++    if (name)
++    {
++        Texture& t = s.textures[name];
++        if (!t.target)
++            t.target = target;
++    }
++}
++
++void gl_DeleteTextures(GLsizei n, const GLuint* names)
++{
++    for (GLsizei i = 0; i < n; ++i)
++        s.textures.erase(names[i]);
++}
++
++MTLTextureType TypeOf(GLenum target)
++{
++    switch (target)
++    {
++    case GL_TEXTURE_3D: return MTLTextureType3D;
++    case GL_TEXTURE_CUBE_MAP: return MTLTextureTypeCube;
++    case GL_TEXTURE_2D_ARRAY: return MTLTextureType2DArray;
++    default: return MTLTextureType2D;
++    }
++}
++
++void Allocate(Texture& t, GLenum target, GLsizei levels, GLenum internal, GLsizei w, GLsizei h, GLsizei d)
++{
++    t.target = target;
++    t.internal = internal;
++    t.format = PixelFormatOf(internal);
++    t.w = w;
++    t.h = h;
++    t.d = d;
++    t.levels = levels;
++    t.mtl = MakeTexture(TypeOf(target), t.format, w, h, d, levels);
++    if (!t.mtl)
++        LogOnce("tex" + std::to_string(w) + "x" + std::to_string(h) + "f" + std::to_string(internal),
++            "! [iOSRay] Metal: не создать текстуру %dx%dx%d формат 0x%x\n", w, h, d, internal);
++}
++
++void gl_TexStorage2D(GLenum target, GLsizei levels, GLenum internal, GLsizei w, GLsizei h)
++{
++    if (Texture* t = BoundTexture(target))
++        Allocate(*t, target, levels, internal, w, h, 1);
++}
++
++void gl_TexStorage3D(GLenum target, GLsizei levels, GLenum internal, GLsizei w, GLsizei h, GLsizei d)
++{
++    if (Texture* t = BoundTexture(target))
++        Allocate(*t, target, levels, internal, w, h, d);
++}
++
++void Upload(Texture& t, GLint level, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d, NSUInteger slice,
++    GLenum format, GLenum type, const void* data, bool compressed, GLsizei compressedSize)
++{
++    if (!t.mtl || !data || level >= t.levels || t.mtl.storageMode == MTLStorageModePrivate)
++        return;
++    const MTLRegion region = MTLRegionMake3D(NSUInteger(x), NSUInteger(y), NSUInteger(z), NSUInteger(w),
++        NSUInteger(h), NSUInteger(std::max(d, 1)));
++    if (compressed)
++    {
++        if (!IsAstc(t.format))
++            return;
++        const NSUInteger bpr = NSUInteger((w + 3) / 4) * 16;
++        const NSUInteger bpi = bpr * NSUInteger((h + 3) / 4);
++        if (NSUInteger(compressedSize) < bpi * NSUInteger(std::max(d, 1)))
++            return;
++        [t.mtl replaceRegion:region mipmapLevel:NSUInteger(level) slice:slice withBytes:data bytesPerRow:bpr
++               bytesPerImage:t.mtl.textureType == MTLTextureType3D ? bpi : 0];
++        return;
++    }
++    if (IsAstc(t.format))
++        return;
++    std::vector<uint8_t> tmp;
++    const size_t pixels = size_t(w) * size_t(h) * size_t(std::max(d, 1));
++    // GL_UNPACK_ALIGNMENT: строки исходника выровнены
++    const size_t inBpp = ExternalBytesPerPixel(format, type);
++    const size_t inRow = (size_t(w) * inBpp + size_t(s.unpackAlignment) - 1) / size_t(s.unpackAlignment)
++        * size_t(s.unpackAlignment);
++    const void* src = data;
++    std::vector<uint8_t> packed;
++    if (inRow != size_t(w) * inBpp)
++    {
++        packed.resize(size_t(w) * inBpp * size_t(h) * size_t(std::max(d, 1)));
++        for (size_t r = 0; r < size_t(h) * size_t(std::max(d, 1)); ++r)
++            memcpy(&packed[r * size_t(w) * inBpp], static_cast<const uint8_t*>(data) + r * inRow, size_t(w) * inBpp);
++        src = packed.data();
++    }
++    src = ConvertPixels(src, pixels, format, type, t.format, tmp);
++    const NSUInteger bpr = NSUInteger(w) * BytesPerPixel(t.format);
++    [t.mtl replaceRegion:region mipmapLevel:NSUInteger(level) slice:slice withBytes:src bytesPerRow:bpr
++           bytesPerImage:t.mtl.textureType == MTLTextureType3D ? bpr * NSUInteger(h) : 0];
++}
++
++NSUInteger SliceOf(GLenum target)
++{
++    return target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z
++        ? NSUInteger(target - GL_TEXTURE_CUBE_MAP_POSITIVE_X)
++        : 0;
++}
++
++void gl_TexImage2D(GLenum target, GLint level, GLint internal, GLsizei w, GLsizei h, GLint, GLenum format,
++    GLenum type, const void* data)
++{
++    Texture* t = BoundTexture(target);
++    if (!t)
++        return;
++    if (level == 0 && (!t->mtl || t->w != w || t->h != h || t->internal != GLenum(internal)))
++    {
++        const GLenum allocTarget = SliceOf(target) || target == GL_TEXTURE_CUBE_MAP_POSITIVE_X ? GL_TEXTURE_CUBE_MAP : target;
++        Allocate(*t, allocTarget, 1, GLenum(internal), w, h, 1);
++    }
++    Upload(*t, level, 0, 0, 0, w, h, 1, SliceOf(target), format, type, data, false, 0);
++}
++
++void gl_TexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type,
++    const void* data)
++{
++    if (Texture* t = BoundTexture(target))
++        Upload(*t, level, x, y, 0, w, h, 1, SliceOf(target), format, type, data, false, 0);
++}
++
++void gl_TexSubImage3D(GLenum target, GLint level, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d,
++    GLenum format, GLenum type, const void* data)
++{
++    Texture* t = BoundTexture(target);
++    if (!t)
++        return;
++    if (target == GL_TEXTURE_3D)
++        Upload(*t, level, x, y, z, w, h, d, 0, format, type, data, false, 0);
++    else // массив: по слою
++    {
++        const size_t layer = size_t(w) * size_t(h) * ExternalBytesPerPixel(format, type);
++        for (GLsizei i = 0; i < d; ++i)
++            Upload(*t, level, x, y, 0, w, h, 1, NSUInteger(z + i), format, type,
++                static_cast<const uint8_t*>(data) + layer * size_t(i), false, 0);
++    }
++}
++
++void gl_CompressedTexImage2D(GLenum target, GLint level, GLenum internal, GLsizei w, GLsizei h, GLint, GLsizei size,
++    const void* data)
++{
++    Texture* t = BoundTexture(target);
++    if (!t)
++        return;
++    if (level == 0 && (!t->mtl || t->w != w || t->h != h))
++        Allocate(*t, SliceOf(target) || target == GL_TEXTURE_CUBE_MAP_POSITIVE_X ? GL_TEXTURE_CUBE_MAP : target, 1,
++            internal, w, h, 1);
++    Upload(*t, level, 0, 0, 0, w, h, 1, SliceOf(target), 0, 0, data, true, size);
++}
++
++void gl_CompressedTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum,
++    GLsizei size, const void* data)
++{
++    if (Texture* t = BoundTexture(target))
++        Upload(*t, level, x, y, 0, w, h, 1, SliceOf(target), 0, 0, data, true, size);
++}
++
++void gl_CompressedTexSubImage3D(GLenum target, GLint level, GLint x, GLint y, GLint z, GLsizei w, GLsizei h,
++    GLsizei d, GLenum, GLsizei size, const void* data)
++{
++    Texture* t = BoundTexture(target);
++    if (!t)
++        return;
++    if (target == GL_TEXTURE_3D)
++        Upload(*t, level, x, y, z, w, h, d, 0, 0, 0, data, true, size);
++    else
++    {
++        const GLsizei layer = d > 0 ? size / d : size;
++        for (GLsizei i = 0; i < d; ++i)
++            Upload(*t, level, x, y, 0, w, h, 1, NSUInteger(z + i), 0, 0, static_cast<const uint8_t*>(data) + layer * i,
++                true, layer);
++    }
++}
++
++void SetParam(SamplerParams& p, GLenum pname, float v)
++{
++    const auto i = int32_t(v);
++    switch (pname)
++    {
++    case GL_TEXTURE_MIN_FILTER: p.minF = i; break;
++    case GL_TEXTURE_MAG_FILTER: p.magF = i; break;
++    case GL_TEXTURE_WRAP_S: p.wrapS = i; break;
++    case GL_TEXTURE_WRAP_T: p.wrapT = i; break;
++    case GL_TEXTURE_WRAP_R: p.wrapR = i; break;
++    case GL_TEXTURE_COMPARE_MODE: p.compareMode = i; break;
++    case GL_TEXTURE_COMPARE_FUNC: p.compareFunc = i; break;
++    case GL_TEXTURE_MAX_ANISOTROPY: p.maxAniso = std::max(1, i); break;
++    case GL_TEXTURE_MAX_LEVEL: p.maxLevel = i; break;
++    case GL_TEXTURE_MIN_LOD: p.minLod = v; break;
++    case GL_TEXTURE_MAX_LOD: p.maxLod = v; break;
++    default: break;
++    }
++}
++
++void gl_TexParameteri(GLenum target, GLenum pname, GLint v)
++{
++    if (Texture* t = BoundTexture(target))
++        SetParam(t->params, pname, float(v));
++}
++void gl_TexParameterf(GLenum target, GLenum pname, GLfloat v)
++{
++    if (Texture* t = BoundTexture(target))
++        SetParam(t->params, pname, v);
++}
++void gl_TexParameteriv(GLenum target, GLenum pname, const GLint* v)
++{
++    if (v)
++        gl_TexParameteri(target, pname, v[0]);
++}
++
++void gl_GetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint* v)
++{
++    const Texture* t = BoundTexture(target);
++    *v = 0;
++    if (!t)
++        return;
++    switch (pname)
++    {
++    case GL_TEXTURE_WIDTH: *v = std::max(1, t->w >> level); break;
++    case GL_TEXTURE_HEIGHT: *v = std::max(1, t->h >> level); break;
++    case GL_TEXTURE_DEPTH: *v = std::max(1, t->d >> (t->target == GL_TEXTURE_3D ? level : 0)); break;
++    case GL_TEXTURE_INTERNAL_FORMAT: *v = GLint(t->internal); break;
++    default: break;
++    }
++}
++
++void gl_PixelStorei(GLenum pname, GLint v)
++{
++    if (pname == GL_UNPACK_ALIGNMENT && v > 0)
++        s.unpackAlignment = v;
++}
++
++// --- объекты-сэмплеры --------------------------------------------------------------
++void gl_DeleteSamplers(GLsizei n, const GLuint* ids)
++{
++    for (GLsizei i = 0; i < n; ++i)
++        s.samplers.erase(ids[i]);
++}
++void gl_BindSampler(GLuint unit, GLuint sampler)
++{
++    if (unit < kMaxUnits)
++        s.unitSampler[unit] = sampler;
++}
++void gl_SamplerParameteri(GLuint sm, GLenum pname, GLint v) { SetParam(s.samplers[sm], pname, float(v)); }
++void gl_SamplerParameterf(GLuint sm, GLenum pname, GLfloat v) { SetParam(s.samplers[sm], pname, v); }
++void gl_SamplerParameteriv(GLuint sm, GLenum pname, const GLint* v)
++{
++    if (v)
++        SetParam(s.samplers[sm], pname, float(v[0]));
++}
++void gl_SamplerParameterIuiv(GLuint, GLenum, const GLuint*) {} // цвет границы: на A10 нет
++void gl_GetSamplerParameteriv(GLuint sm, GLenum pname, GLint* v)
++{
++    const SamplerParams& p = s.samplers[sm];
++    switch (pname)
++    {
++    case GL_TEXTURE_MIN_FILTER: *v = p.minF; break;
++    case GL_TEXTURE_MAG_FILTER: *v = p.magF; break;
++    default: *v = 0; break;
++    }
++}
++
++MTLSamplerAddressMode AddressOf(int32_t wrap)
++{
++    switch (wrap)
++    {
++    case GL_CLAMP_TO_EDGE: return MTLSamplerAddressModeClampToEdge;
++    case GL_MIRRORED_REPEAT: return MTLSamplerAddressModeMirrorRepeat;
++    case GL_CLAMP_TO_BORDER: return MTLSamplerAddressModeClampToEdge; // нет на A10
++    default: return MTLSamplerAddressModeRepeat;
++    }
++}
++
++MTLCompareFunction CompareOf(GLenum f)
++{
++    switch (f)
++    {
++    case GL_NEVER: return MTLCompareFunctionNever;
++    case GL_LESS: return MTLCompareFunctionLess;
++    case GL_EQUAL: return MTLCompareFunctionEqual;
++    case GL_LEQUAL: return MTLCompareFunctionLessEqual;
++    case GL_GREATER: return MTLCompareFunctionGreater;
++    case GL_NOTEQUAL: return MTLCompareFunctionNotEqual;
++    case GL_GEQUAL: return MTLCompareFunctionGreaterEqual;
++    default: return MTLCompareFunctionAlways;
++    }
++}
++
++id<MTLSamplerState> SamplerStateOf(const SamplerParams& p, int textureLevels)
++{
++    SamplerParams key = p;
++    // без мипов выборка из мипов бессмысленна (и в GL такая текстура «неполная»)
++    if (textureLevels <= 1)
++        key.maxLevel = 0;
++    const auto it = s.samplerStates.find(key);
++    if (it != s.samplerStates.end())
++        return it->second;
++    MTLSamplerDescriptor* d = [MTLSamplerDescriptor new];
++    const bool linearMin = key.minF == GL_LINEAR || key.minF == GL_LINEAR_MIPMAP_NEAREST
++        || key.minF == GL_LINEAR_MIPMAP_LINEAR;
++    d.minFilter = linearMin ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
++    d.magFilter = key.magF == GL_NEAREST ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
++    if (key.maxLevel == 0 || key.minF == GL_NEAREST || key.minF == GL_LINEAR)
++        d.mipFilter = MTLSamplerMipFilterNotMipmapped;
++    else if (key.minF == GL_NEAREST_MIPMAP_NEAREST || key.minF == GL_LINEAR_MIPMAP_NEAREST)
++        d.mipFilter = MTLSamplerMipFilterNearest;
++    else
++        d.mipFilter = MTLSamplerMipFilterLinear;
++    d.sAddressMode = AddressOf(key.wrapS);
++    d.tAddressMode = AddressOf(key.wrapT);
++    d.rAddressMode = AddressOf(key.wrapR);
++    d.maxAnisotropy = NSUInteger(std::clamp(key.maxAniso, 1, 16));
++    d.lodMinClamp = std::max(0.f, key.minLod);
++    d.lodMaxClamp = std::min(key.maxLod, float(key.maxLevel));
++    if (d.lodMaxClamp < d.lodMinClamp)
++        d.lodMaxClamp = d.lodMinClamp;
++    if (key.compareMode == GL_COMPARE_REF_TO_TEXTURE)
++        d.compareFunction = CompareOf(GLenum(key.compareFunc));
++    id<MTLSamplerState> st = [core.device newSamplerStateWithDescriptor:d];
++    s.samplerStates[key] = st;
++    return st;
++}
++
++// --- кадровые буферы и рендербуферы -------------------------------------------------
++void gl_BindFramebuffer(GLenum target, GLuint fb)
++{
++    if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER)
++        s.drawFbo = fb;
++    if (target == GL_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER)
++        s.readFbo = fb;
++}
++
++void gl_DeleteFramebuffers(GLsizei n, const GLuint* ids)
++{
++    for (GLsizei i = 0; i < n; ++i)
++        s.fbos.erase(ids[i]);
++}
++
++Fbo* TargetFbo(GLenum target)
++{
++    const GLuint name = target == GL_READ_FRAMEBUFFER ? s.readFbo : s.drawFbo;
++    return name ? &s.fbos[name] : nullptr;
++}
++
++void Attach(GLenum target, GLenum attachment, GLuint tex, GLint level)
++{
++    Fbo* f = TargetFbo(target);
++    if (!f)
++        return;
++    if (attachment >= GL_COLOR_ATTACHMENT0 && attachment < GL_COLOR_ATTACHMENT0 + kMaxColor)
++    {
++        f->color[attachment - GL_COLOR_ATTACHMENT0] = tex;
++        f->colorLevel[attachment - GL_COLOR_ATTACHMENT0] = level;
++    }
++    else if (attachment == GL_DEPTH_ATTACHMENT)
++        f->depth = tex;
++    else if (attachment == GL_STENCIL_ATTACHMENT)
++        f->stencil = tex;
++    else if (attachment == GL_DEPTH_STENCIL_ATTACHMENT)
++        f->depth = f->stencil = tex;
++}
++
++void gl_FramebufferTexture2D(GLenum target, GLenum attachment, GLenum, GLuint tex, GLint level)
++{
++    Attach(target, attachment, tex, level);
++}
++
++// рендербуферы храним в тех же текстурах (с флагом в старшем бите имени не нужно —
++// имена у нас общие на все объекты)
++void gl_BindRenderbuffer(GLenum, GLuint rb) { s.renderbuffer = rb; }
++void gl_RenderbufferStorage(GLenum, GLenum internal, GLsizei w, GLsizei h)
++{
++    if (!s.renderbuffer)
++        return;
++    Texture& t = s.textures[s.renderbuffer];
++    Allocate(t, GL_TEXTURE_2D, 1, internal, w, h, 1);
++}
++void gl_RenderbufferStorageMultisample(GLenum target, GLsizei, GLenum internal, GLsizei w, GLsizei h)
++{
++    gl_RenderbufferStorage(target, internal, w, h);
++}
++void gl_FramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum, GLuint rb) { Attach(target, attachment, rb, 0); }
++
++void gl_DrawBuffers(GLsizei n, const GLenum* bufs)
++{
++    Fbo* f = TargetFbo(GL_DRAW_FRAMEBUFFER);
++    if (!f)
++        return;
++    for (int i = 0; i < kMaxColor; ++i)
++        f->drawBuffers[i] = i < n ? bufs[i] : GL_NONE;
++}
++
++id<MTLTexture> TexOf(GLuint name)
++{
++    const auto it = s.textures.find(name);
++    return it == s.textures.end() ? nil : it->second.mtl;
++}
++
++// --- кадр и проходы -------------------------------------------------------------------
++void BeginFrameIfNeeded()
++{
++    if (s.cmd)
++        return;
++    dispatch_semaphore_wait(s.inFlight, DISPATCH_TIME_FOREVER);
++    auto& ring = s.rings[s.frameIndex % kFramesInFlight];
++    ring.chunk = 0;
++    ring.offset = 0;
++    s.cmd = [core.queue commandBuffer];
++}
++
++struct Alloc
++{
++    id<MTLBuffer> buffer;
++    NSUInteger offset;
++    uint8_t* ptr;
++};
++
++Alloc Transient(size_t size, size_t align = 256)
++{
++    BeginFrameIfNeeded();
++    auto& ring = s.rings[s.frameIndex % kFramesInFlight];
++    constexpr size_t kChunk = 1 << 20;
++    for (;;)
++    {
++        if (ring.chunk >= ring.chunks.size())
++            ring.chunks.push_back([core.device newBufferWithLength:std::max(kChunk, size)
++                                                           options:MTLResourceStorageModeShared]);
++        id<MTLBuffer> b = ring.chunks[ring.chunk];
++        const size_t off = (ring.offset + align - 1) / align * align;
++        if (off + size <= b.length)
++        {
++            ring.offset = off + size;
++            return { b, NSUInteger(off), static_cast<uint8_t*>(b.contents) + off };
++        }
++        ++ring.chunk;
++        ring.offset = 0;
++    }
++}
++
++void EndEncoder()
++{
++    if (s.enc)
++    {
++        [s.enc endEncoding];
++        s.enc = nil;
++        s.encKey.clear();
++    }
++}
++
++struct PassTargets
++{
++    id<MTLTexture> color[kMaxColor] = {};
++    NSUInteger colorLevel[kMaxColor] = {};
++    id<MTLTexture> depth = nil;
++    id<MTLTexture> stencil = nil;
++    std::string key;
++    bool empty = true;
++    int width = 0, height = 0;
++};
++
++PassTargets CurrentTargets()
++{
++    PassTargets t;
++    char buf[64];
++    if (!s.drawFbo)
++        return t;
++    const Fbo& f = s.fbos[s.drawFbo];
++    for (int i = 0; i < kMaxColor; ++i)
++    {
++        const GLenum db = f.drawBuffers[i];
++        if (db < GL_COLOR_ATTACHMENT0 || db >= GL_COLOR_ATTACHMENT0 + kMaxColor)
++            continue;
++        const int a = int(db - GL_COLOR_ATTACHMENT0);
++        t.color[i] = TexOf(f.color[a]);
++        t.colorLevel[i] = NSUInteger(f.colorLevel[a]);
++    }
++    t.depth = TexOf(f.depth);
++    if (t.depth && !IsDepth(t.depth.pixelFormat))
++        t.depth = nil;
++    if (t.depth && HasStencil(t.depth.pixelFormat))
++        t.stencil = t.depth;
++    else if (f.stencil && f.stencil != f.depth)
++    {
++        id<MTLTexture> st = TexOf(f.stencil);
++        if (st && HasStencil(st.pixelFormat))
++            t.stencil = st;
++    }
++    for (int i = 0; i < kMaxColor; ++i)
++    {
++        snprintf(buf, sizeof(buf), "%p:%u|", (__bridge void*)t.color[i], unsigned(t.colorLevel[i]));
++        t.key += buf;
++        if (t.color[i] && t.empty)
++        {
++            t.empty = false;
++            t.width = int(std::max<NSUInteger>(1, t.color[i].width >> t.colorLevel[i]));
++            t.height = int(std::max<NSUInteger>(1, t.color[i].height >> t.colorLevel[i]));
++        }
++    }
++    snprintf(buf, sizeof(buf), "%p|%p", (__bridge void*)t.depth, (__bridge void*)t.stencil);
++    t.key += buf;
++    if (t.empty && (t.depth || t.stencil))
++    {
++        t.empty = false;
++        id<MTLTexture> d = t.depth ? t.depth : t.stencil;
++        t.width = int(d.width);
++        t.height = int(d.height);
++    }
++    return t;
++}
++
++// Начать проход: clearMask — какие вложения очистить (иначе загрузить)
++void BeginPass(const PassTargets& t, GLbitfield clearMask)
++{
++    BeginFrameIfNeeded();
++    EndEncoder();
++    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
++    for (int i = 0; i < kMaxColor; ++i)
++    {
++        if (!t.color[i])
++            continue;
++        rp.colorAttachments[i].texture = t.color[i];
++        rp.colorAttachments[i].level = t.colorLevel[i];
++        rp.colorAttachments[i].loadAction = (clearMask & GL_COLOR_BUFFER_BIT) ? MTLLoadActionClear : MTLLoadActionLoad;
++        rp.colorAttachments[i].storeAction = MTLStoreActionStore;
++        rp.colorAttachments[i].clearColor = MTLClearColorMake(s.clearColor[0], s.clearColor[1], s.clearColor[2],
++            s.clearColor[3]);
++    }
++    if (t.depth)
++    {
++        rp.depthAttachment.texture = t.depth;
++        rp.depthAttachment.loadAction = (clearMask & GL_DEPTH_BUFFER_BIT) ? MTLLoadActionClear : MTLLoadActionLoad;
++        rp.depthAttachment.storeAction = MTLStoreActionStore;
++        rp.depthAttachment.clearDepth = s.clearDepth;
++    }
++    if (t.stencil)
++    {
++        rp.stencilAttachment.texture = t.stencil;
++        rp.stencilAttachment.loadAction = (clearMask & GL_STENCIL_BUFFER_BIT) ? MTLLoadActionClear : MTLLoadActionLoad;
++        rp.stencilAttachment.storeAction = MTLStoreActionStore;
++        rp.stencilAttachment.clearStencil = uint32_t(s.clearStencil);
++    }
++    s.enc = [s.cmd renderCommandEncoderWithDescriptor:rp];
++    s.encKey = t.key;
++    for (int i = 0; i < kMaxColor; ++i)
++        s.encColor[i] = t.color[i];
++    s.encDepth = t.depth;
++    ++s.passes;
++}
++
++void gl_Clear(GLbitfield mask)
++{
++    const PassTargets t = CurrentTargets();
++    if (t.empty)
++        return;
++    // Очищаем загрузкой прохода. Scissor при этом не учитывается (пока).
++    BeginPass(t, mask);
++}
++
++void gl_ClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a)
++{
++    s.clearColor[0] = r; s.clearColor[1] = g; s.clearColor[2] = b; s.clearColor[3] = a;
++}
++void gl_ClearDepthf(GLfloat d) { s.clearDepth = d; }
++void gl_ClearStencil(GLint v) { s.clearStencil = v; }
++
++// --- VAO ----------------------------------------------------------------------------
++GLuint g_arrayBuffer = 0;
++
++void gl_BindVertexArray(GLuint vao) { s.vao = vao; }
++void gl_DeleteVertexArrays(GLsizei n, const GLuint* ids)
++{
++    for (GLsizei i = 0; i < n; ++i)
++        if (ids[i])
++            s.vaos.erase(ids[i]);
++}
++void gl_EnableVertexAttribArray(GLuint i)
++{
++    if (i < kMaxAttribs)
++        s.vaos[s.vao].attribs[i].enabled = true;
++}
++void gl_DisableVertexAttribArray(GLuint i)
++{
++    if (i < kMaxAttribs)
++        s.vaos[s.vao].attribs[i].enabled = false;
++}
++void gl_VertexAttribPointer(GLuint i, GLint size, GLenum type, GLboolean norm, GLsizei stride, const void* ptr)
++{
++    if (i >= kMaxAttribs)
++        return;
++    Attrib& a = s.vaos[s.vao].attribs[i];
++    a.size = size;
++    a.type = type;
++    a.normalized = norm == GL_TRUE;
++    a.stride = stride;
++    a.offset = reinterpret_cast<uintptr_t>(ptr);
++    a.buffer = g_arrayBuffer;
++}
++
++MTLVertexFormat VertexFormatOf(const Attrib& a)
++{
++    switch (a.type)
++    {
++    case GL_FLOAT:
++        return a.size == 1 ? MTLVertexFormatFloat : a.size == 2 ? MTLVertexFormatFloat2
++            : a.size == 3 ? MTLVertexFormatFloat3 : MTLVertexFormatFloat4;
++    case GL_HALF_FLOAT:
++        return a.size <= 2 ? MTLVertexFormatHalf2 : a.size == 3 ? MTLVertexFormatHalf3 : MTLVertexFormatHalf4;
++    case GL_UNSIGNED_BYTE:
++        if (a.normalized)
++            return a.size <= 2 ? MTLVertexFormatUChar2Normalized : a.size == 3 ? MTLVertexFormatUChar3Normalized
++                : MTLVertexFormatUChar4Normalized;
++        return a.size <= 2 ? MTLVertexFormatUChar2 : a.size == 3 ? MTLVertexFormatUChar3 : MTLVertexFormatUChar4;
++    case GL_BYTE:
++        if (a.normalized)
++            return a.size <= 2 ? MTLVertexFormatChar2Normalized : a.size == 3 ? MTLVertexFormatChar3Normalized
++                : MTLVertexFormatChar4Normalized;
++        return a.size <= 2 ? MTLVertexFormatChar2 : a.size == 3 ? MTLVertexFormatChar3 : MTLVertexFormatChar4;
++    case GL_SHORT:
++        if (a.normalized)
++            return a.size <= 2 ? MTLVertexFormatShort2Normalized : a.size == 3 ? MTLVertexFormatShort3Normalized
++                : MTLVertexFormatShort4Normalized;
++        return a.size <= 2 ? MTLVertexFormatShort2 : a.size == 3 ? MTLVertexFormatShort3 : MTLVertexFormatShort4;
++    case GL_UNSIGNED_SHORT:
++        if (a.normalized)
++            return a.size <= 2 ? MTLVertexFormatUShort2Normalized : a.size == 3 ? MTLVertexFormatUShort3Normalized
++                : MTLVertexFormatUShort4Normalized;
++        return a.size <= 2 ? MTLVertexFormatUShort2 : a.size == 3 ? MTLVertexFormatUShort3 : MTLVertexFormatUShort4;
++    default: return MTLVertexFormatFloat4;
++    }
++}
++
++size_t VertexFormatSize(const Attrib& a)
++{
++    size_t c = 4;
++    switch (a.type)
++    {
++    case GL_FLOAT: c = 4; break;
++    case GL_HALF_FLOAT: case GL_SHORT: case GL_UNSIGNED_SHORT: c = 2; break;
++    default: c = 1; break;
++    }
++    return c * size_t(a.size);
++}
++
++// --- состояние -----------------------------------------------------------------------
++void SetCap(GLenum cap, bool on)
++{
++    switch (cap)
++    {
++    case GL_BLEND: s.blend = on; break;
++    case GL_DEPTH_TEST: s.depthTest = on; break;
++    case GL_STENCIL_TEST: s.stencilTest = on; break;
++    case GL_CULL_FACE: s.cull = on; break;
++    case GL_SCISSOR_TEST: s.scissorTest = on; break;
++    case GL_POLYGON_OFFSET_FILL: s.polygonOffsetFill = on; break;
++    default: break;
++    }
++}
++void gl_Enable(GLenum cap) { SetCap(cap, true); }
++void gl_Disable(GLenum cap) { SetCap(cap, false); }
++GLboolean gl_IsEnabled(GLenum cap)
++{
++    switch (cap)
++    {
++    case GL_BLEND: return s.blend;
++    case GL_DEPTH_TEST: return s.depthTest;
++    case GL_STENCIL_TEST: return s.stencilTest;
++    case GL_CULL_FACE: return s.cull;
++    case GL_SCISSOR_TEST: return s.scissorTest;
++    default: return GL_FALSE;
++    }
++}
++void gl_BlendFunc(GLenum src, GLenum dst)
++{
++    s.blendSrcRGB = s.blendSrcA = src;
++    s.blendDstRGB = s.blendDstA = dst;
++}
++void gl_BlendFuncSeparate(GLenum sr, GLenum dr, GLenum sa, GLenum da)
++{
++    s.blendSrcRGB = sr; s.blendDstRGB = dr; s.blendSrcA = sa; s.blendDstA = da;
++}
++void gl_BlendEquation(GLenum e) { s.blendEqRGB = s.blendEqA = e; }
++void gl_BlendEquationSeparate(GLenum rgb, GLenum a) { s.blendEqRGB = rgb; s.blendEqA = a; }
++void gl_BlendColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a)
++{
++    s.blendColor[0] = r; s.blendColor[1] = g; s.blendColor[2] = b; s.blendColor[3] = a;
++}
++void gl_ColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a)
++{
++    s.colorMask[0] = r; s.colorMask[1] = g; s.colorMask[2] = b; s.colorMask[3] = a;
++}
++void gl_DepthFunc(GLenum f) { s.depthFunc = f; }
++void gl_DepthMask(GLboolean m) { s.depthMask = m == GL_TRUE; }
++void gl_DepthRangef(GLfloat n, GLfloat f) { s.depthNear = n; s.depthFar = f; }
++void gl_StencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask)
++{
++    for (StencilFace* f : { &s.stFront, &s.stBack })
++        if ((face == GL_FRONT_AND_BACK) || (face == GL_FRONT && f == &s.stFront) || (face == GL_BACK && f == &s.stBack))
++        {
++            f->func = func;
++            f->ref = ref;
++            f->readMask = mask;
++        }
++}
++void gl_StencilFunc(GLenum func, GLint ref, GLuint mask) { gl_StencilFuncSeparate(GL_FRONT_AND_BACK, func, ref, mask); }
++void gl_StencilMaskSeparate(GLenum face, GLuint mask)
++{
++    if (face != GL_BACK)
++        s.stFront.writeMask = mask;
++    if (face != GL_FRONT)
++        s.stBack.writeMask = mask;
++}
++void gl_StencilMask(GLuint mask) { gl_StencilMaskSeparate(GL_FRONT_AND_BACK, mask); }
++void gl_StencilOpSeparate(GLenum face, GLenum sf, GLenum df, GLenum dp)
++{
++    for (StencilFace* f : { &s.stFront, &s.stBack })
++        if ((face == GL_FRONT_AND_BACK) || (face == GL_FRONT && f == &s.stFront) || (face == GL_BACK && f == &s.stBack))
++        {
++            f->sfail = sf;
++            f->dpfail = df;
++            f->dppass = dp;
++        }
++}
++void gl_StencilOp(GLenum sf, GLenum df, GLenum dp) { gl_StencilOpSeparate(GL_FRONT_AND_BACK, sf, df, dp); }
++void gl_CullFace(GLenum m) { s.cullFace = m; }
++void gl_FrontFace(GLenum m) { s.frontFace = m; }
++void gl_Viewport(GLint x, GLint y, GLsizei w, GLsizei h)
++{
++    s.viewport[0] = x; s.viewport[1] = y; s.viewport[2] = w; s.viewport[3] = h;
++}
++void gl_Scissor(GLint x, GLint y, GLsizei w, GLsizei h)
++{
++    s.scissor[0] = x; s.scissor[1] = y; s.scissor[2] = w; s.scissor[3] = h;
++}
++void gl_PolygonOffset(GLfloat factor, GLfloat units)
++{
++    s.polyFactor = factor;
++    s.polyUnits = units;
++}
++
++MTLBlendFactor BlendFactorOf(GLenum f)
++{
++    switch (f)
++    {
++    case GL_ZERO: return MTLBlendFactorZero;
++    case GL_ONE: return MTLBlendFactorOne;
++    case GL_SRC_COLOR: return MTLBlendFactorSourceColor;
++    case GL_ONE_MINUS_SRC_COLOR: return MTLBlendFactorOneMinusSourceColor;
++    case GL_DST_COLOR: return MTLBlendFactorDestinationColor;
++    case GL_ONE_MINUS_DST_COLOR: return MTLBlendFactorOneMinusDestinationColor;
++    case GL_SRC_ALPHA: return MTLBlendFactorSourceAlpha;
++    case GL_ONE_MINUS_SRC_ALPHA: return MTLBlendFactorOneMinusSourceAlpha;
++    case GL_DST_ALPHA: return MTLBlendFactorDestinationAlpha;
++    case GL_ONE_MINUS_DST_ALPHA: return MTLBlendFactorOneMinusDestinationAlpha;
++    case GL_CONSTANT_COLOR: return MTLBlendFactorBlendColor;
++    case GL_ONE_MINUS_CONSTANT_COLOR: return MTLBlendFactorOneMinusBlendColor;
++    case GL_CONSTANT_ALPHA: return MTLBlendFactorBlendAlpha;
++    case GL_ONE_MINUS_CONSTANT_ALPHA: return MTLBlendFactorOneMinusBlendAlpha;
++    case GL_SRC_ALPHA_SATURATE: return MTLBlendFactorSourceAlphaSaturated;
++    default: return MTLBlendFactorOne;
++    }
++}
++
++MTLBlendOperation BlendOpOf(GLenum e)
++{
++    switch (e)
++    {
++    case GL_FUNC_SUBTRACT: return MTLBlendOperationSubtract;
++    case GL_FUNC_REVERSE_SUBTRACT: return MTLBlendOperationReverseSubtract;
++    case GL_MIN: return MTLBlendOperationMin;
++    case GL_MAX: return MTLBlendOperationMax;
++    default: return MTLBlendOperationAdd;
++    }
++}
++
++MTLStencilOperation StencilOpOf(GLenum op)
++{
++    switch (op)
++    {
++    case GL_ZERO: return MTLStencilOperationZero;
++    case GL_REPLACE: return MTLStencilOperationReplace;
++    case GL_INCR: return MTLStencilOperationIncrementClamp;
++    case GL_DECR: return MTLStencilOperationDecrementClamp;
++    case GL_INVERT: return MTLStencilOperationInvert;
++    case GL_INCR_WRAP: return MTLStencilOperationIncrementWrap;
++    case GL_DECR_WRAP: return MTLStencilOperationDecrementWrap;
++    default: return MTLStencilOperationKeep;
++    }
++}
++
++// --- шейдеры → MTLFunction -------------------------------------------------------------
++const State::Lib* LibraryOf(GLuint program, const Program& p)
++{
++    State::Lib& lib = s.libraries[program];
++    if (lib.generation == p.generation && (lib.fn[0] || lib.failed))
++        return &lib;
++    lib = State::Lib{};
++    lib.generation = p.generation;
++    MTLCompileOptions* opts = [MTLCompileOptions new];
++    opts.languageVersion = MTLLanguageVersion2_1;
++    opts.fastMathEnabled = YES;
++    for (int st = 0; st < 2; ++st)
++    {
++        if (p.msl[st].empty())
++            continue;
++        NSError* err = nil;
++        NSString* src = [NSString stringWithUTF8String:p.msl[st].c_str()];
++        id<MTLLibrary> l = [core.device newLibraryWithSource:src options:opts error:&err];
++        if (!l)
++        {
++            lib.failed = true;
++            LogOnce("lib" + std::to_string(program), "! [iOSRay] Metal: MSL программы %u (%s) не собран:\n%s\n",
++                program, st ? "PS" : "VS", err.localizedDescription.UTF8String);
++            return &lib;
++        }
++        lib.fn[st] = [l newFunctionWithName:@"main0"];
++    }
++    if (!lib.fn[0])
++        lib.failed = true;
++    return &lib;
++}
++
++// --- рисование ---------------------------------------------------------------------
++struct VertexSetup
++{
++    MTLVertexDescriptor* desc = nil;
++    std::string key;
++    struct Bind
++    {
++        id<MTLBuffer> buffer;
++        NSUInteger offset;
++        NSUInteger index;
++    };
++    std::vector<Bind> binds;
++    bool needDummy = false;
++};
++
++bool BuildVertexSetup(const Program& p, VertexSetup& vs)
++{
++    vs.desc = [MTLVertexDescriptor vertexDescriptor];
++    const Vao& vao = s.vaos[s.vao];
++    struct Group
++    {
++        GLuint buffer;
++        GLsizei stride;
++        uintptr_t base;
++    };
++    std::vector<Group> groups;
++    char buf[96];
++    for (const VertexInput& in : p.vsInputs)
++    {
++        if (in.location >= kMaxAttribs)
++            continue;
++        const Attrib& a = vao.attribs[in.location];
++        id<MTLBuffer> mb = a.enabled ? BufferObject(a.buffer) : nil;
++        MTLVertexAttributeDescriptor* ad = vs.desc.attributes[in.location];
++        if (!mb)
++        {
++            ad.format = in.isInt ? MTLVertexFormatInt4 : MTLVertexFormatFloat4;
++            ad.offset = 0;
++            ad.bufferIndex = kDummyVertexBufferIndex;
++            vs.needDummy = true;
++            snprintf(buf, sizeof(buf), "a%u:d|", in.location);
++            vs.key += buf;
++            continue;
++        }
++        const GLsizei stride = a.stride ? a.stride : GLsizei(VertexFormatSize(a));
++        size_t g = 0;
++        for (; g < groups.size(); ++g)
++            if (groups[g].buffer == a.buffer && groups[g].stride == stride)
++                break;
++        if (g == groups.size())
++            groups.push_back({ a.buffer, stride, a.offset });
++        else
++            groups[g].base = std::min(groups[g].base, a.offset);
++    }
++    // второй проход: смещения относительно базы группы
++    for (const VertexInput& in : p.vsInputs)
++    {
++        if (in.location >= kMaxAttribs)
++            continue;
++        const Attrib& a = vao.attribs[in.location];
++        if (!a.enabled || !BufferObject(a.buffer))
++            continue;
++        const GLsizei stride = a.stride ? a.stride : GLsizei(VertexFormatSize(a));
++        for (size_t g = 0; g < groups.size(); ++g)
++            if (groups[g].buffer == a.buffer && groups[g].stride == stride)
++            {
++                MTLVertexAttributeDescriptor* ad = vs.desc.attributes[in.location];
++                ad.format = VertexFormatOf(a);
++                ad.offset = NSUInteger(a.offset - groups[g].base);
++                ad.bufferIndex = kFirstVertexBufferIndex + g;
++                snprintf(buf, sizeof(buf), "a%u:%d:%lu:%lu|", in.location, int(ad.format), (unsigned long)ad.offset,
++                    (unsigned long)g);
++                vs.key += buf;
++                break;
++            }
++    }
++    for (size_t g = 0; g < groups.size(); ++g)
++    {
++        if (kFirstVertexBufferIndex + g >= kDummyVertexBufferIndex)
++            return false;
++        MTLVertexBufferLayoutDescriptor* ld = vs.desc.layouts[kFirstVertexBufferIndex + g];
++        ld.stride = NSUInteger(groups[g].stride);
++        ld.stepFunction = MTLVertexStepFunctionPerVertex;
++        vs.binds.push_back({ BufferObject(groups[g].buffer), NSUInteger(groups[g].base), kFirstVertexBufferIndex + g });
++        snprintf(buf, sizeof(buf), "L%lu:%d|", (unsigned long)g, int(groups[g].stride));
++        vs.key += buf;
++    }
++    if (vs.needDummy)
++    {
++        MTLVertexBufferLayoutDescriptor* ld = vs.desc.layouts[kDummyVertexBufferIndex];
++        ld.stride = 16;
++        ld.stepFunction = MTLVertexStepFunctionConstant;
++        ld.stepRate = 0;
++    }
++    return true;
++}
++
++id<MTLRenderPipelineState> PipelineOf(GLuint program, const Program& p, const State::Lib& lib, const VertexSetup& vs,
++    const PassTargets& t)
++{
++    std::string key;
++    key.reserve(256);
++    char buf[160];
++    snprintf(buf, sizeof(buf), "%u:%u|", program, p.generation);
++    key += buf;
++    key += vs.key;
++    for (int i = 0; i < kMaxColor; ++i)
++    {
++        snprintf(buf, sizeof(buf), "c%d|", t.color[i] ? int(t.color[i].pixelFormat) : 0);
++        key += buf;
++    }
++    snprintf(buf, sizeof(buf), "d%d s%d b%d %x %x %x %x %x %x m%d%d%d%d", t.depth ? int(t.depth.pixelFormat) : 0,
++        t.stencil ? int(t.stencil.pixelFormat) : 0, int(s.blend), s.blendSrcRGB, s.blendDstRGB, s.blendSrcA,
++        s.blendDstA, s.blendEqRGB, s.blendEqA, s.colorMask[0], s.colorMask[1], s.colorMask[2], s.colorMask[3]);
++    key += buf;
++    const auto it = s.pipelines.find(key);
++    if (it != s.pipelines.end())
++        return it->second;
++
++    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
++    d.vertexFunction = lib.fn[0];
++    d.fragmentFunction = lib.fn[1];
++    d.vertexDescriptor = vs.desc;
++    MTLColorWriteMask mask = MTLColorWriteMaskNone;
++    if (s.colorMask[0]) mask |= MTLColorWriteMaskRed;
++    if (s.colorMask[1]) mask |= MTLColorWriteMaskGreen;
++    if (s.colorMask[2]) mask |= MTLColorWriteMaskBlue;
++    if (s.colorMask[3]) mask |= MTLColorWriteMaskAlpha;
++    for (int i = 0; i < kMaxColor; ++i)
++    {
++        if (!t.color[i])
++            continue;
++        MTLRenderPipelineColorAttachmentDescriptor* c = d.colorAttachments[i];
++        c.pixelFormat = t.color[i].pixelFormat;
++        c.writeMask = mask;
++        c.blendingEnabled = s.blend && IsBlendable(c.pixelFormat);
++        c.sourceRGBBlendFactor = BlendFactorOf(s.blendSrcRGB);
++        c.destinationRGBBlendFactor = BlendFactorOf(s.blendDstRGB);
++        c.sourceAlphaBlendFactor = BlendFactorOf(s.blendSrcA);
++        c.destinationAlphaBlendFactor = BlendFactorOf(s.blendDstA);
++        c.rgbBlendOperation = BlendOpOf(s.blendEqRGB);
++        c.alphaBlendOperation = BlendOpOf(s.blendEqA);
++    }
++    if (t.depth)
++        d.depthAttachmentPixelFormat = t.depth.pixelFormat;
++    if (t.stencil)
++        d.stencilAttachmentPixelFormat = t.stencil.pixelFormat;
++    NSError* err = nil;
++    id<MTLRenderPipelineState> pso = [core.device newRenderPipelineStateWithDescriptor:d error:&err];
++    if (!pso)
++        LogOnce("pso" + std::to_string(program), "! [iOSRay] Metal: PSO программы %u не создан: %s\n", program,
++            err.localizedDescription.UTF8String);
++    s.pipelines[key] = pso;
++    return pso;
++}
++
++id<MTLDepthStencilState> DepthStateOf(const PassTargets& t)
++{
++    const bool depth = t.depth && s.depthTest;
++    const bool stencil = t.stencil && s.stencilTest;
++    char buf[160];
++    snprintf(buf, sizeof(buf), "%d%d%x%d|%x%x%x%x%x%x|%x%x%x%x%x%x", depth, stencil, s.depthFunc, s.depthMask,
++        s.stFront.func, s.stFront.readMask, s.stFront.writeMask, s.stFront.sfail, s.stFront.dpfail, s.stFront.dppass,
++        s.stBack.func, s.stBack.readMask, s.stBack.writeMask, s.stBack.sfail, s.stBack.dpfail, s.stBack.dppass);
++    const std::string key = buf;
++    const auto it = s.depthStates.find(key);
++    if (it != s.depthStates.end())
++        return it->second;
++    MTLDepthStencilDescriptor* d = [MTLDepthStencilDescriptor new];
++    d.depthCompareFunction = depth ? CompareOf(s.depthFunc) : MTLCompareFunctionAlways;
++    d.depthWriteEnabled = depth && s.depthMask;
++    if (stencil)
++    {
++        for (int f = 0; f < 2; ++f)
++        {
++            const StencilFace& sf = f ? s.stBack : s.stFront;
++            MTLStencilDescriptor* sd = [MTLStencilDescriptor new];
++            sd.stencilCompareFunction = CompareOf(sf.func);
++            sd.stencilFailureOperation = StencilOpOf(sf.sfail);
++            sd.depthFailureOperation = StencilOpOf(sf.dpfail);
++            sd.depthStencilPassOperation = StencilOpOf(sf.dppass);
++            sd.readMask = sf.readMask & 0xFF;
++            sd.writeMask = sf.writeMask & 0xFF;
++            if (f)
++                d.backFaceStencil = sd;
++            else
++                d.frontFaceStencil = sd;
++        }
++    }
++    id<MTLDepthStencilState> ds = [core.device newDepthStencilStateWithDescriptor:d];
++    s.depthStates[key] = ds;
++    return ds;
++}
++
++id<MTLTexture> DummyFor(GLenum samplerType)
++{
++    switch (samplerType)
++    {
++    case GL_SAMPLER_3D: return s.dummy3D;
++    case GL_SAMPLER_CUBE: return s.dummyCube;
++    case GL_SAMPLER_2D_SHADOW: return s.dummyDepth;
++    case GL_SAMPLER_2D_ARRAY: return s.dummyArray;
++    default: return s.dummy2D;
++    }
++}
++
++bool PrepareDraw(MTLPrimitiveType& prim, GLenum mode)
++{
++    switch (mode)
++    {
++    case GL_TRIANGLES: prim = MTLPrimitiveTypeTriangle; break;
++    case GL_TRIANGLE_STRIP: prim = MTLPrimitiveTypeTriangleStrip; break;
++    case GL_LINES: prim = MTLPrimitiveTypeLine; break;
++    case GL_LINE_STRIP: prim = MTLPrimitiveTypeLineStrip; break;
++    case GL_POINTS: prim = MTLPrimitiveTypePoint; break;
++    default:
++        LogOnce("prim" + std::to_string(mode), "! [iOSRay] Metal: примитив 0x%x не поддержан\n", mode);
++        return false;
++    }
++
++    const GLuint program = CurrentProgram();
++    const Program* p = FindProgram(program);
++    if (!p || !p->linked)
++        return false;
++    const State::Lib* lib = LibraryOf(program, *p);
++    if (!lib || lib->failed)
++        return false;
++
++    const PassTargets t = CurrentTargets();
++    if (t.empty)
++        return false;
++
++    VertexSetup vs;
++    if (!BuildVertexSetup(*p, vs))
++        return false;
++    id<MTLRenderPipelineState> pso = PipelineOf(program, *p, *lib, vs, t);
++    if (!pso)
++        return false;
++
++    if (!s.enc || s.encKey != t.key)
++        BeginPass(t, 0);
++    id<MTLRenderCommandEncoder> e = s.enc;
++    [e setRenderPipelineState:pso];
++    [e setDepthStencilState:DepthStateOf(t)];
++    [e setStencilFrontReferenceValue:uint32_t(s.stFront.ref) & 0xFF backReferenceValue:uint32_t(s.stBack.ref) & 0xFF];
++    [e setCullMode:s.cull ? (s.cullFace == GL_FRONT ? MTLCullModeFront : s.cullFace == GL_BACK ? MTLCullModeBack
++                                                                                              : MTLCullModeNone)
++                          : MTLCullModeNone];
++    // Y перевёрнут в шейдере → обход граней в Metal противоположный GL
++    [e setFrontFacingWinding:s.frontFace == GL_CCW ? MTLWindingClockwise : MTLWindingCounterClockwise];
++    if (s.polygonOffsetFill)
++        [e setDepthBias:s.polyUnits slopeScale:s.polyFactor clamp:0];
++    else
++        [e setDepthBias:0 slopeScale:0 clamp:0];
++    [e setBlendColorRed:s.blendColor[0] green:s.blendColor[1] blue:s.blendColor[2] alpha:s.blendColor[3]];
++
++    MTLViewport vp;
++    vp.originX = s.viewport[0];
++    vp.originY = s.viewport[1];
++    vp.width = s.viewport[2];
++    vp.height = s.viewport[3];
++    vp.znear = s.depthNear;
++    vp.zfar = s.depthFar;
++    [e setViewport:vp];
++    MTLScissorRect sc = { 0, 0, NSUInteger(t.width), NSUInteger(t.height) };
++    if (s.scissorTest)
++    {
++        const int x0 = std::clamp(s.scissor[0], 0, t.width), y0 = std::clamp(s.scissor[1], 0, t.height);
++        const int x1 = std::clamp(s.scissor[0] + s.scissor[2], 0, t.width);
++        const int y1 = std::clamp(s.scissor[1] + s.scissor[3], 0, t.height);
++        sc = { NSUInteger(x0), NSUInteger(y0), NSUInteger(std::max(0, x1 - x0)), NSUInteger(std::max(0, y1 - y0)) };
++        if (sc.width == 0 || sc.height == 0)
++            return false;
++    }
++    [e setScissorRect:sc];
++
++    for (const VertexSetup::Bind& b : vs.binds)
++        [e setVertexBuffer:b.buffer offset:b.offset atIndex:b.index];
++    if (vs.needDummy)
++        [e setVertexBuffer:s.dummyVertex offset:0 atIndex:kDummyVertexBufferIndex];
++
++    // uniform-блоки стадий
++    for (int st = 0; st < 2; ++st)
++    {
++        const std::vector<uint8_t>& block = p->block[st];
++        if (block.empty())
++            continue;
++        const Alloc a = Transient(block.size());
++        memcpy(a.ptr, block.data(), block.size());
++        if (st == 0)
++            [e setVertexBuffer:a.buffer offset:a.offset atIndex:kUniformBufferIndex];
++        else
++            [e setFragmentBuffer:a.buffer offset:a.offset atIndex:kUniformBufferIndex];
++    }
++
++    // текстуры и сэмплеры
++    for (const Uniform& u : p->uniforms)
++    {
++        if (!u.isSampler)
++            continue;
++        const GLuint unit = GLuint(std::clamp<GLint>(u.samplerUnit, 0, kMaxUnits - 1));
++        const GLuint name = u.glType == GL_SAMPLER_3D ? s.unit3D[unit]
++            : u.glType == GL_SAMPLER_CUBE             ? s.unitCube[unit]
++                                                      : s.unit2D[unit];
++        const auto it = s.textures.find(name);
++        const Texture* tex = it == s.textures.end() ? nullptr : &it->second;
++        id<MTLTexture> mt = tex ? tex->mtl : nil;
++        const bool wantDepth = u.glType == GL_SAMPLER_2D_SHADOW;
++        if (mt && wantDepth != IsDepth(mt.pixelFormat))
++            mt = nil; // несовпадение типа текстуры и сэмплера в шейдере
++        if (mt && (mt.textureType == MTLTextureTypeCube) != (u.glType == GL_SAMPLER_CUBE))
++            mt = nil;
++        if (mt && (mt.textureType == MTLTextureType3D) != (u.glType == GL_SAMPLER_3D))
++            mt = nil;
++        if (!mt)
++            mt = DummyFor(u.glType);
++        SamplerParams sp = tex ? tex->params : SamplerParams{};
++        if (s.unitSampler[unit])
++            sp = s.samplers[s.unitSampler[unit]];
++        if (!wantDepth)
++            sp.compareMode = GL_NONE;
++        id<MTLSamplerState> ss = SamplerStateOf(sp, mt ? int(mt.mipmapLevelCount) : 1);
++        for (int st = 0; st < 2; ++st)
++        {
++            if (!u.slot[st].present)
++                continue;
++            const NSUInteger idx = u.slot[st].textureIndex;
++            if (st == 0)
++            {
++                [e setVertexTexture:mt atIndex:idx];
++                [e setVertexSamplerState:ss atIndex:idx];
++            }
++            else
++            {
++                [e setFragmentTexture:mt atIndex:idx];
++                [e setFragmentSamplerState:ss atIndex:idx];
++            }
++        }
++    }
++    ++s.draws;
++    return true;
++}
++
++void gl_DrawArrays(GLenum mode, GLint first, GLsizei count)
++{
++    MTLPrimitiveType prim;
++    if (count <= 0 || !PrepareDraw(prim, mode))
++    {
++        ++s.skipped;
++        return;
++    }
++    [s.enc drawPrimitives:prim vertexStart:NSUInteger(first) vertexCount:NSUInteger(count)];
++}
++
++void DrawIndexed(GLenum mode, GLsizei count, GLenum type, const void* indices, GLint baseVertex)
++{
++    MTLPrimitiveType prim;
++    id<MTLBuffer> ib = BufferObject(s.vaos[s.vao].elementBuffer);
++    if (count <= 0 || !ib || !PrepareDraw(prim, mode))
++    {
++        ++s.skipped;
++        return;
++    }
++    const MTLIndexType it = type == GL_UNSIGNED_INT ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
++    const size_t isz = type == GL_UNSIGNED_INT ? 4 : 2;
++    NSUInteger off = NSUInteger(reinterpret_cast<uintptr_t>(indices));
++    if (off + NSUInteger(count) * isz > ib.length)
++    {
++        ++s.skipped;
++        return;
++    }
++    if (off % 4)
++    {
++        // Metal хочет смещение индексов, кратное 4: копируем во временный буфер
++        const Alloc a = Transient(size_t(count) * isz, 4);
++        memcpy(a.ptr, static_cast<const uint8_t*>(ib.contents) + off, size_t(count) * isz);
++        ib = a.buffer;
++        off = a.offset;
++    }
++    if (baseVertex)
++        [s.enc drawIndexedPrimitives:prim indexCount:NSUInteger(count) indexType:it indexBuffer:ib
++                   indexBufferOffset:off instanceCount:1 baseVertex:baseVertex baseInstance:0];
++    else
++        [s.enc drawIndexedPrimitives:prim indexCount:NSUInteger(count) indexType:it indexBuffer:ib
++                   indexBufferOffset:off];
++}
++
++void gl_DrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices)
++{
++    DrawIndexed(mode, count, type, indices, 0);
++}
++void gl_DrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type, const void* indices, GLint baseVertex)
++{
++    DrawIndexed(mode, count, type, indices, baseVertex);
++}
++void gl_DrawRangeElements(GLenum mode, GLuint, GLuint, GLsizei count, GLenum type, const void* indices)
++{
++    DrawIndexed(mode, count, type, indices, 0);
++}
++
++// --- копирования ---------------------------------------------------------------------
++id<MTLTexture> ReadColor0()
++{
++    if (!s.readFbo)
++        return nil;
++    const Fbo& f = s.fbos[s.readFbo];
++    return TexOf(f.color[0]);
++}
++
++void gl_BlitFramebuffer(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0, GLint dx1, GLint dy1,
++    GLbitfield mask, GLenum)
++{
++    if (!(mask & GL_COLOR_BUFFER_BIT))
++        return;
++    id<MTLTexture> src = ReadColor0();
++    if (!s.drawFbo)
++    {
++        s.presentSource = src; // вывод на экран — в RenderPresent
++        return;
++    }
++    const PassTargets t = CurrentTargets();
++    id<MTLTexture> dst = t.color[0];
++    if (!src || !dst || src.pixelFormat != dst.pixelFormat || sx1 - sx0 != dx1 - dx0 || sy1 - sy0 != dy1 - dy0)
++    {
++        LogOnce("blit", "! [iOSRay] Metal: glBlitFramebuffer с масштабом/форматом пока пропускается\n");
++        return;
++    }
++    BeginFrameIfNeeded();
++    EndEncoder();
++    id<MTLBlitCommandEncoder> b = [s.cmd blitCommandEncoder];
++    [b copyFromTexture:src sourceSlice:0 sourceLevel:0
++          sourceOrigin:MTLOriginMake(NSUInteger(sx0), NSUInteger(sy0), 0)
++            sourceSize:MTLSizeMake(NSUInteger(sx1 - sx0), NSUInteger(sy1 - sy0), 1)
++             toTexture:dst destinationSlice:0 destinationLevel:0
++     destinationOrigin:MTLOriginMake(NSUInteger(dx0), NSUInteger(dy0), 0)];
++    [b endEncoding];
++}
++
++void gl_CopyTexSubImage2D(GLenum target, GLint level, GLint dx, GLint dy, GLint x, GLint y, GLsizei w, GLsizei h)
++{
++    Texture* t = BoundTexture(target);
++    id<MTLTexture> src = ReadColor0();
++    if (!t || !t->mtl || !src || src.pixelFormat != t->mtl.pixelFormat)
++        return;
++    BeginFrameIfNeeded();
++    EndEncoder();
++    id<MTLBlitCommandEncoder> b = [s.cmd blitCommandEncoder];
++    [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(NSUInteger(x), NSUInteger(y), 0)
++            sourceSize:MTLSizeMake(NSUInteger(w), NSUInteger(h), 1)
++             toTexture:t->mtl destinationSlice:SliceOf(target) destinationLevel:NSUInteger(level)
++     destinationOrigin:MTLOriginMake(NSUInteger(dx), NSUInteger(dy), 0)];
++    [b endEncoding];
++}
++
++void gl_GenerateMipmap(GLenum target)
++{
++    Texture* t = BoundTexture(target);
++    if (!t || !t->mtl || t->levels <= 1 || IsAstc(t->format) || IsDepth(t->format))
++        return;
++    BeginFrameIfNeeded();
++    EndEncoder();
++    id<MTLBlitCommandEncoder> b = [s.cmd blitCommandEncoder];
++    [b generateMipmapsForTexture:t->mtl];
++    [b endEncoding];
++}
++
++// --- вывод кадра -------------------------------------------------------------------------
++const char* const kBlitMsl = R"(
++#include <metal_stdlib>
++using namespace metal;
++struct V { float4 p [[position]]; float2 uv; };
++vertex V vs_blit(uint vid [[vertex_id]])
++{
++    const float2 pos = float2((vid << 1) & 2, vid & 2);
++    V o;
++    o.p = float4(pos * 2.0 - 1.0, 0.0, 1.0);
++    o.uv = pos; // строка 0 исходника — низ кадра (как в GL)
++    return o;
++}
++fragment float4 fs_blit(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler sm [[sampler(0)]])
++{
++    return float4(t.sample(sm, in.uv).rgb, 1.0);
++}
++)";
++
++id<MTLTexture> MakeDummy(MTLTextureType type, MTLPixelFormat fmt)
++{
++    id<MTLTexture> t = MakeTexture(type, fmt, 1, 1, 1, 1);
++    if (!IsDepth(fmt))
++    {
++        const uint32_t black = 0xFF000000u;
++        const int slices = type == MTLTextureTypeCube ? 6 : 1;
++        for (int i = 0; i < slices; ++i)
++            [t replaceRegion:MTLRegionMake3D(0, 0, 0, 1, 1, 1) mipmapLevel:0 slice:NSUInteger(i) withBytes:&black
++                 bytesPerRow:4 bytesPerImage:type == MTLTextureType3D ? 4 : 0];
++    }
++    return t;
++}
++} // namespace
++
++// --- внешний интерфейс -------------------------------------------------------------
++GLuint ElementBufferBinding() { return s.vaos[s.vao].elementBuffer; }
++void SetElementBufferBinding(GLuint buffer) { s.vaos[s.vao].elementBuffer = buffer; }
++void SetArrayBufferBinding(GLuint buffer) { g_arrayBuffer = buffer; }
++
++void RenderInit()
++{
++    s.inFlight = dispatch_semaphore_create(kFramesInFlight);
++    s.dummy2D = MakeDummy(MTLTextureType2D, MTLPixelFormatRGBA8Unorm);
++    s.dummy3D = MakeDummy(MTLTextureType3D, MTLPixelFormatRGBA8Unorm);
++    s.dummyCube = MakeDummy(MTLTextureTypeCube, MTLPixelFormatRGBA8Unorm);
++    s.dummyArray = MakeDummy(MTLTextureType2DArray, MTLPixelFormatRGBA8Unorm);
++    s.dummyDepth = MakeDummy(MTLTextureType2D, MTLPixelFormatDepth32Float);
++    s.dummyVertex = [core.device newBufferWithLength:64 options:MTLResourceStorageModeShared];
++    memset(s.dummyVertex.contents, 0, 64);
++
++    NSError* err = nil;
++    id<MTLLibrary> lib = [core.device newLibraryWithSource:@(kBlitMsl) options:nil error:&err];
++    if (lib)
++    {
++        MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
++        d.vertexFunction = [lib newFunctionWithName:@"vs_blit"];
++        d.fragmentFunction = [lib newFunctionWithName:@"fs_blit"];
++        d.colorAttachments[0].pixelFormat = core.layer.pixelFormat;
++        s.blitPipeline = [core.device newRenderPipelineStateWithDescriptor:d error:&err];
++    }
++    if (!s.blitPipeline)
++        printf("! [iOSRay] Metal: шейдер вывода на экран не собран: %s\n", err.localizedDescription.UTF8String);
++    MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
++    sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
++    s.blitSampler = [core.device newSamplerStateWithDescriptor:sd];
++    fflush(stdout);
++}
++
++void RenderPresent()
++{
++    BeginFrameIfNeeded();
++    EndEncoder();
++    @autoreleasepool
++    {
++        id<CAMetalDrawable> drawable = [core.layer nextDrawable];
++        if (drawable)
++        {
++            MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
++            rp.colorAttachments[0].texture = drawable.texture;
++            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
++            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
++            rp.colorAttachments[0].clearColor = MTLClearColorMake(0.12, 0.12, 0.13, 1.0);
++            id<MTLRenderCommandEncoder> e = [s.cmd renderCommandEncoderWithDescriptor:rp];
++            if (s.presentSource && s.blitPipeline)
++            {
++                [e setRenderPipelineState:s.blitPipeline];
++                [e setFragmentTexture:s.presentSource atIndex:0];
++                [e setFragmentSamplerState:s.blitSampler atIndex:0];
++                [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
++            }
++            [e endEncoding];
++            [s.cmd presentDrawable:drawable];
++        }
++        dispatch_semaphore_t sem = s.inFlight;
++        [s.cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
++            if (cb.error)
++                printf("! [iOSRay] Metal: ошибка GPU: %s\n", cb.error.localizedDescription.UTF8String);
++            dispatch_semaphore_signal(sem);
++        }];
++        [s.cmd commit];
++        s.cmd = nil;
++    }
++    ++s.frameIndex;
++    if ((s.frameIndex % 600) == 1)
++    {
++        printf("[iOSRay] Metal: кадр %u — рисований %u (пропущено %u), проходов %u, PSO %zu, источник %s\n",
++            s.frameIndex, s.draws, s.skipped, s.passes, s.pipelines.size(),
++            s.presentSource ? [NSString stringWithFormat:@"%lux%lu", (unsigned long)s.presentSource.width,
++                                                          (unsigned long)s.presentSource.height].UTF8String
++                            : "нет");
++        fflush(stdout);
++    }
++    s.draws = s.skipped = s.passes = 0;
++    s.presentSource = nil;
++}
++
++#define E(n, f) { n, reinterpret_cast<void*>(&f) }
++const ProcEntry kRenderProcs[] = {
++    E("glActiveTexture", gl_ActiveTexture),
++    E("glBindTexture", gl_BindTexture),
++    E("glDeleteTextures", gl_DeleteTextures),
++    E("glTexStorage2D", gl_TexStorage2D),
++    E("glTexStorage3D", gl_TexStorage3D),
++    E("glTexImage2D", gl_TexImage2D),
++    E("glTexSubImage2D", gl_TexSubImage2D),
++    E("glTexSubImage3D", gl_TexSubImage3D),
++    E("glCompressedTexImage2D", gl_CompressedTexImage2D),
++    E("glCompressedTexSubImage2D", gl_CompressedTexSubImage2D),
++    E("glCompressedTexSubImage3D", gl_CompressedTexSubImage3D),
++    E("glTexParameteri", gl_TexParameteri),
++    E("glTexParameterf", gl_TexParameterf),
++    E("glTexParameteriv", gl_TexParameteriv),
++    E("glGetTexLevelParameteriv", gl_GetTexLevelParameteriv),
++    E("glPixelStorei", gl_PixelStorei),
++    E("glGenerateMipmap", gl_GenerateMipmap),
++    E("glDeleteSamplers", gl_DeleteSamplers),
++    E("glBindSampler", gl_BindSampler),
++    E("glSamplerParameteri", gl_SamplerParameteri),
++    E("glSamplerParameterf", gl_SamplerParameterf),
++    E("glSamplerParameteriv", gl_SamplerParameteriv),
++    E("glSamplerParameterIuiv", gl_SamplerParameterIuiv),
++    E("glGetSamplerParameteriv", gl_GetSamplerParameteriv),
++    E("glBindFramebuffer", gl_BindFramebuffer),
++    E("glDeleteFramebuffers", gl_DeleteFramebuffers),
++    E("glFramebufferTexture2D", gl_FramebufferTexture2D),
++    E("glBindRenderbuffer", gl_BindRenderbuffer),
++    E("glRenderbufferStorage", gl_RenderbufferStorage),
++    E("glRenderbufferStorageMultisample", gl_RenderbufferStorageMultisample),
++    E("glFramebufferRenderbuffer", gl_FramebufferRenderbuffer),
++    E("glDrawBuffers", gl_DrawBuffers),
++    E("glClear", gl_Clear),
++    E("glClearColor", gl_ClearColor),
++    E("glClearDepthf", gl_ClearDepthf),
++    E("glClearStencil", gl_ClearStencil),
++    E("glBindVertexArray", gl_BindVertexArray),
++    E("glDeleteVertexArrays", gl_DeleteVertexArrays),
++    E("glEnableVertexAttribArray", gl_EnableVertexAttribArray),
++    E("glDisableVertexAttribArray", gl_DisableVertexAttribArray),
++    E("glVertexAttribPointer", gl_VertexAttribPointer),
++    E("glEnable", gl_Enable),
++    E("glDisable", gl_Disable),
++    E("glIsEnabled", gl_IsEnabled),
++    E("glBlendFunc", gl_BlendFunc),
++    E("glBlendFuncSeparate", gl_BlendFuncSeparate),
++    E("glBlendEquation", gl_BlendEquation),
++    E("glBlendEquationSeparate", gl_BlendEquationSeparate),
++    E("glBlendColor", gl_BlendColor),
++    E("glColorMask", gl_ColorMask),
++    E("glDepthFunc", gl_DepthFunc),
++    E("glDepthMask", gl_DepthMask),
++    E("glDepthRangef", gl_DepthRangef),
++    E("glStencilFunc", gl_StencilFunc),
++    E("glStencilFuncSeparate", gl_StencilFuncSeparate),
++    E("glStencilMask", gl_StencilMask),
++    E("glStencilMaskSeparate", gl_StencilMaskSeparate),
++    E("glStencilOp", gl_StencilOp),
++    E("glStencilOpSeparate", gl_StencilOpSeparate),
++    E("glCullFace", gl_CullFace),
++    E("glFrontFace", gl_FrontFace),
++    E("glViewport", gl_Viewport),
++    E("glScissor", gl_Scissor),
++    E("glPolygonOffset", gl_PolygonOffset),
++    E("glDrawArrays", gl_DrawArrays),
++    E("glDrawElements", gl_DrawElements),
++    E("glDrawElementsBaseVertex", gl_DrawElementsBaseVertex),
++    E("glDrawElementsBaseVertexOES", gl_DrawElementsBaseVertex),
++    E("glDrawElementsBaseVertexEXT", gl_DrawElementsBaseVertex),
++    E("glDrawRangeElements", gl_DrawRangeElements),
++    E("glBlitFramebuffer", gl_BlitFramebuffer),
++    E("glCopyTexSubImage2D", gl_CopyTexSubImage2D),
++};
++#undef E
++
++void* RenderProc(const char* name)
++{
++    for (const ProcEntry& e : kRenderProcs)
++        if (!strcmp(e.name, name))
++            return e.fn;
++    return nullptr;
++}
++} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_shaders.cpp b/src/Layers/xrRenderGL/mtl/glmtl_shaders.cpp
 new file mode 100644
-index 00000000..c9d0f269
+index 00000000..5f3f6a9e
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_shaders.cpp
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,467 @@
 +// iOSRay: Metal-режим, этап 4 — шейдеры.
 +//
 +// Движок отдаёт GLSL ES 3.00 через glShaderSource/glLinkProgram. Здесь при
@@ -2286,6 +4207,15 @@ index 00000000..c9d0f269
 +        opt.set_msl_version(2, 1);
 +        opt.enable_decoration_binding = true;
 +        msl.set_msl_options(opt);
++        if (stage == 0)
++        {
++            // Хранить картинку в памяти так же, как GL (строка 0 — низ кадра):
++            // переворот Y в вершинном шейдере; глубина GL [-w,w] → Metal [0,w].
++            spirv_cross::CompilerGLSL::Options common = msl.get_common_options();
++            common.vertex.flip_vert_y = true;
++            common.vertex.fixup_clipspace = true;
++            msl.set_common_options(common);
++        }
 +
 +        // Как в GL: наружу видны только реально используемые uniform и сэмплеры
 +        auto active = msl.get_active_interface_variables();
@@ -2315,6 +4245,14 @@ index 00000000..c9d0f269
 +            }
 +            break; // relaxed-правила дают ровно один блок
 +        }
++
++        if (stage == 0)
++            for (const spirv_cross::Resource& r : res.stage_inputs)
++            {
++                const spirv_cross::SPIRType& t = msl.get_type(r.type_id);
++                const bool isInt = t.basetype == spirv_cross::SPIRType::Int || t.basetype == spirv_cross::SPIRType::UInt;
++                p.vsInputs.push_back({ msl.get_decoration(r.id, spv::DecorationLocation), t.vecsize, isInt });
++            }
 +
 +        uint32_t texIndex = 0; // слоты текстур Metal — подряд, в порядке объявления
 +        for (const spirv_cross::Resource& r : res.sampled_images)
@@ -2346,7 +4284,9 @@ index 00000000..c9d0f269
 +        g_glslangReady = glslang::InitializeProcess();
 +
 +    p.uniforms.clear();
++    p.vsInputs.clear();
 +    p.log.clear();
++    ++p.generation;
 +    for (int s = 0; s < 2; ++s)
 +    {
 +        p.msl[s].clear();
@@ -2626,10 +4566,10 @@ index 00000000..c9d0f269
 +} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_shaders.h b/src/Layers/xrRenderGL/mtl/glmtl_shaders.h
 new file mode 100644
-index 00000000..cffd05f9
+index 00000000..db2ec5c4
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_shaders.h
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,77 @@
 +// iOSRay: Metal-режим — шейдеры GLSL → SPIR-V → MSL и их рефлексия.
 +#pragma once
 +
@@ -2665,8 +4605,17 @@ index 00000000..cffd05f9
 +    UniformSlot slot[2];
 +};
 +
++struct VertexInput // вход вершинного шейдера ([[attribute(location)]])
++{
++    uint32_t location;
++    uint32_t components;
++    bool isInt;
++};
++
 +struct Program
 +{
++    uint32_t generation = 0; // растёт при каждой линковке (ключ кэшей PSO)
++    std::vector<VertexInput> vsInputs;
 +    std::vector<GLuint> attached;
 +    bool linked = false;
 +    std::string log;
@@ -2699,7 +4648,7 @@ index 00000000..cffd05f9
 +    bool transpose);
 +} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderPC_GL/CMakeLists.txt b/src/Layers/xrRenderPC_GL/CMakeLists.txt
-index 9018d8bb..65f255bd 100644
+index 9018d8bb..45648ac4 100644
 --- a/src/Layers/xrRenderPC_GL/CMakeLists.txt
 +++ b/src/Layers/xrRenderPC_GL/CMakeLists.txt
 @@ -423,6 +423,38 @@ target_compile_definitions(xrRender_GL
@@ -2717,8 +4666,8 @@ index 9018d8bb..65f255bd 100644
 +    target_compile_definitions(xrRender_GL PRIVATE XR_USE_ASTC)
 +    # Экспериментальный Metal-режим (iOSRay): GL-вызовы рендера → Metal
 +    enable_language(OBJCXX)
-+    target_sources(xrRender_GL PRIVATE ../xrRenderGL/mtl/glmtl.mm)
-+    set_source_files_properties(../xrRenderGL/mtl/glmtl.mm PROPERTIES
++    target_sources(xrRender_GL PRIVATE ../xrRenderGL/mtl/glmtl.mm ../xrRenderGL/mtl/glmtl_render.mm)
++    set_source_files_properties(../xrRenderGL/mtl/glmtl.mm ../xrRenderGL/mtl/glmtl_render.mm PROPERTIES
 +        COMPILE_OPTIONS "-fobjc-arc"
 +        SKIP_PRECOMPILE_HEADERS ON
 +        SKIP_UNITY_BUILD_INCLUSION ON)
