@@ -23,6 +23,7 @@ package() {
         -e "s/@VARIANT@/engine-$variant/" "$ROOT/app/engine-Info.plist" > "$app/Info.plist"
     printf 'APPL????' > "$app/PkgInfo"
     cp "$XRAY/res/fsgame.ltx" "$app/res/"
+    cp "$ROOT/res/iosray.ltx" "$app/res/"
     cp -R "$XRAY/res/gamedata" "$app/res/"
 
     if [[ "$variant" == trollstore ]]; then

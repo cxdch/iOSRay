@@ -1584,6 +1584,31 @@ index 01a427c0..1c00302c 100644
  
  bool g_bLoaded = false;
  ref_light precache_light = 0;
+diff --git a/src/xrEngine/x_ray.cpp b/src/xrEngine/x_ray.cpp
+index 20d2e576..d4d6cdc0 100644
+--- a/src/xrEngine/x_ray.cpp
++++ b/src/xrEngine/x_ray.cpp
+@@ -6,6 +6,9 @@
+ // AlexMX - Alexander Maksimchuk
+ //-----------------------------------------------------------------------------
+ #include "stdafx.h"
++#ifdef __APPLE__
++#include <TargetConditionals.h>
++#endif
+ 
+ #include "x_ray.h"
+ 
+@@ -197,6 +200,10 @@ void execUserScript()
+     ZoneScoped;
+     Console->Execute("default_controls");
+     Console->ExecuteScript(Console->ConfigFile);
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++    // iOSRay: настройки графики для телефона ($fs_root$/iosray.ltx) поверх user.ltx
++    Console->ExecuteScript("iosray");
++#endif
+ }
+ 
+ constexpr pcstr FRAME_MARK_APPLICATION_STARTUP = "Application startup";
 diff --git a/src/xrEngine/xr_input.cpp b/src/xrEngine/xr_input.cpp
 index b8caddd9..d0dfc953 100644
 --- a/src/xrEngine/xr_input.cpp
@@ -1704,6 +1729,22 @@ index b8caddd9..d0dfc953 100644
 +}
 +#endif
 +#endif
+diff --git a/src/xrEngine/xr_ioc_cmd.cpp b/src/xrEngine/xr_ioc_cmd.cpp
+index f8520bc6..fb30cee2 100644
+--- a/src/xrEngine/xr_ioc_cmd.cpp
++++ b/src/xrEngine/xr_ioc_cmd.cpp
+@@ -226,6 +226,11 @@ void CCC_LoadCFG::Execute(pcstr args)
+         while (!F->eof())
+         {
+             F->r_string(str, sizeof(str));
++            pcstr first = str;
++            while (*first == ' ' || *first == '\t')
++                ++first;
++            if (*first == ';' || *first == 0) // комментарий или пустая строка
++                continue;
+             if (allow(str))
+                 Console->Execute(str);
+         }
 diff --git a/src/xrGame/MainMenu.cpp b/src/xrGame/MainMenu.cpp
 index 22028756..5dbab994 100644
 --- a/src/xrGame/MainMenu.cpp
@@ -1893,10 +1934,10 @@ index 82d7da5d..0fd1fa17 100644
  #endif
 diff --git a/src/xr_3da/ios_bootstrap.mm b/src/xr_3da/ios_bootstrap.mm
 new file mode 100644
-index 00000000..6e58cbec
+index 00000000..072c8893
 --- /dev/null
 +++ b/src/xr_3da/ios_bootstrap.mm
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,153 @@
 +// iOSRay: подготовка окружения движка на iOS перед entry_point().
 +//
 +// Что делает:
@@ -2033,6 +2074,12 @@ index 00000000..6e58cbec
 +                    printf("[iOSRay] fsgame.ltx: $app_data_root$ перенесён в папку игры (_appdata_), оригинал — fsgame.ltx.pc\n");
 +                }
 +            }
++        }
++        NSString* perf = [gameDir stringByAppendingPathComponent:@"iosray.ltx"];
++        if (![fm fileExistsAtPath:perf])
++        {
++            [fm copyItemAtPath:[res stringByAppendingPathComponent:@"iosray.ltx"] toPath:perf error:nil];
++            printf("[iOSRay] iosray.ltx (настройки графики) скопирован из бандла\n");
 +        }
 +        EnsureLink([gameDir stringByAppendingPathComponent:@"gamedata/shaders/gl"],
 +                   [res stringByAppendingPathComponent:@"gamedata/shaders/gl"]);
