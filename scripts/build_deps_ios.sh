@@ -36,6 +36,7 @@ fetch theora https://github.com/xiph/theora.git       v1.2.0
 fetch lzo    https://github.com/nemequ/lzo.git        master
 fetch sdl2   https://github.com/libsdl-org/SDL.git    release-2.30.9
 fetch openal https://github.com/kcat/openal-soft.git  1.24.1
+fetch astcenc https://github.com/ARM-software/astc-encoder.git 5.2.0
 LUAJIT_REV=5a5cd82e435a7b08d61b4e0af887493d24d9eca1   # подмодуль OpenXRay/LuaJIT в xray-16
 if [[ ! -d "$SRC/luajit" ]]; then
     git init -q "$SRC/luajit"
@@ -50,6 +51,12 @@ cmake_build "$SRC/lzo"    lzo    -DENABLE_SHARED=OFF -DENABLE_STATIC=ON
 cmake_build "$SRC/sdl2"   sdl2   -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST=OFF
 cmake_build "$SRC/openal" openal -DLIBTYPE=STATIC -DALSOFT_UTILS=OFF -DALSOFT_EXAMPLES=OFF \
     -DALSOFT_INSTALL_EXAMPLES=OFF -DALSOFT_INSTALL_UTILS=OFF -DALSOFT_BACKEND_COREAUDIO=ON
+
+# ARM astcenc: пересжатие текстур DXT → ASTC 4x4 прямо на телефоне (кэшируется на диск).
+cmake_build "$SRC/astcenc" astcenc -DASTCENC_ISA_NEON=ON -DASTCENC_CLI=OFF \
+    -DASTCENC_UNIVERSAL_BUILD=OFF -DASTCENC_SHAREDLIB=OFF -DASTCENC_INVARIANCE=OFF
+cp "$(find "$SRC/build-astcenc" -name 'libastcenc-neon-static.a' | head -1)" "$PREFIX/lib/libastcenc.a"
+cp "$SRC/astcenc/Source/astcenc.h" "$PREFIX/include/astcenc.h"
 
 # LuaJIT: штатная кросс-сборка Makefile'ом. JIT на iOS запрещён — только интерпретатор.
 echo "== luajit"
