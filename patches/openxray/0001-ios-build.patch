@@ -1103,20 +1103,27 @@ index 30519005..ecb595f1 100644
  #else
          return (GLint)GL_CLAMP_TO_BORDER;
 diff --git a/src/Layers/xrRenderGL/glTexture.cpp b/src/Layers/xrRenderGL/glTexture.cpp
-index 1cee8526..07c6b1f3 100644
+index 1cee8526..ef552b94 100644
 --- a/src/Layers/xrRenderGL/glTexture.cpp
 +++ b/src/Layers/xrRenderGL/glTexture.cpp
-@@ -5,6 +5,9 @@
+@@ -5,6 +5,16 @@
  #include "stdafx.h"
  
  #include <gli/gli.hpp>
 +#ifdef XR_GL_ES
 +#include "glBCDecode.h"
 +#endif
++#ifdef XR_USE_ASTC
++#include <astcenc.h>
++#include <chrono>
++#include <cstdio>
++#include <thread>
++#include <sys/stat.h>
++#endif
  
  namespace xray::render::RENDER_NAMESPACE
  {
-@@ -42,6 +45,54 @@ int get_texture_load_lod(LPCSTR fn)
+@@ -42,6 +52,229 @@ int get_texture_load_lod(LPCSTR fn)
      return 2;
  }
  
@@ -1168,10 +1175,185 @@ index 1cee8526..07c6b1f3 100644
 +}
 +#endif
 +
++#ifdef XR_USE_ASTC
++// ---------------------------------------------------------------------------
++// iOSRay: DXT → ASTC 4x4 (ARM astcenc) с кэшем на диске.
++// Память — как у DXT (8 бит на пиксель), вместо 32 бит у распакованного RGBA8.
++// Первый раз текстура сжимается (медленно), потом читается из
++// $app_data_root$/astc_cache/<ключ>.xra. Кэш можно удалить в любой момент.
++// ---------------------------------------------------------------------------
++namespace
++{
++struct AstcCache
++{
++    astcenc_context* ctx[2]{}; // [0] — UNORM, [1] — sRGB
++    bool initialized = false;
++    bool usable = false;
++    string_path dir{};
++    u32 fromCache = 0, encoded = 0;
++    double encodeSeconds = 0;
++} g_astc;
++
++constexpr unsigned ASTC_THREADS = 2; // у A10 два быстрых ядра
++constexpr u32 XRA_MAGIC = 0x31415258; // "XRA1"
++
++struct XraHeader
++{
++    u32 magic, target, format, w, h, d, layers, faces, levels, size;
++};
++
++bool AstcInit()
++{
++    if (g_astc.initialized)
++        return g_astc.usable;
++    g_astc.initialized = true;
++    if (!GLAD_GL_KHR_texture_compression_astc_ldr)
++    {
++        Msg("! ASTC: GPU не поддерживает ASTC LDR — остаюсь на RGBA8");
++        return false;
++    }
++    for (int i = 0; i < 2; ++i)
++    {
++        astcenc_config cfg{};
++        if (astcenc_config_init(i ? ASTCENC_PRF_LDR_SRGB : ASTCENC_PRF_LDR, 4, 4, 1, ASTCENC_PRE_FASTEST, 0, &cfg)
++                != ASTCENC_SUCCESS
++            || astcenc_context_alloc(&cfg, ASTC_THREADS, &g_astc.ctx[i]) != ASTCENC_SUCCESS)
++        {
++            Msg("! ASTC: не удалось создать кодер astcenc");
++            return false;
++        }
++    }
++    FS.update_path(g_astc.dir, "$app_data_root$", "astc_cache\\");
++    for (char* c = g_astc.dir; *c; ++c)
++        if (*c == '\\')
++            *c = '/';
++    mkdir(g_astc.dir, 0755);
++    Msg("* ASTC: включено, кэш: %s", g_astc.dir);
++    g_astc.usable = true;
++    return true;
++}
++
++u64 Fnv1a(const void* data, size_t n, u64 h = 1469598103934665603ull)
++{
++    const u8* p = static_cast<const u8*>(data);
++    for (size_t i = 0; i < n; ++i)
++        h = (h ^ p[i]) * 1099511628211ull;
++    return h;
++}
++
++void CachePath(string_path& out, pcstr name, size_t fileSize, const gli::texture& t)
++{
++    u64 h = Fnv1a(name, xr_strlen(name));
++    const u32 extra[] = { u32(fileSize), u32(t.levels()), u32(t.extent().x), u32(t.extent().y), u32(t.faces()),
++        u32(t.format()) };
++    h = Fnv1a(extra, sizeof(extra), h);
++    xr_sprintf(out, "%s%016llx.xra", g_astc.dir, (unsigned long long)h);
++}
++
++bool CacheLoad(pcstr path, gli::texture& out)
++{
++    FILE* f = fopen(path, "rb");
++    if (!f)
++        return false;
++    XraHeader hd{};
++    bool ok = fread(&hd, sizeof(hd), 1, f) == 1 && hd.magic == XRA_MAGIC;
++    if (ok)
++    {
++        gli::texture t(gli::target(hd.target), gli::format(hd.format), gli::extent3d(hd.w, hd.h, hd.d), hd.layers,
++            hd.faces, hd.levels);
++        ok = t.size() == hd.size && fread(t.data(), 1, t.size(), f) == t.size();
++        if (ok)
++            out = std::move(t);
++    }
++    fclose(f);
++    return ok;
++}
++
++void CacheSave(pcstr path, const gli::texture& t)
++{
++    string_path tmp;
++    xr_sprintf(tmp, "%s.tmp", path);
++    FILE* f = fopen(tmp, "wb");
++    if (!f)
++        return;
++    const auto e = t.extent();
++    const XraHeader hd{ XRA_MAGIC, u32(t.target()), u32(t.format()), u32(e.x), u32(e.y), u32(e.z), u32(t.layers()),
++        u32(t.faces()), u32(t.levels()), u32(t.size()) };
++    const bool ok = fwrite(&hd, sizeof(hd), 1, f) == 1 && fwrite(t.data(), 1, t.size(), f) == t.size();
++    fclose(f);
++    if (ok)
++        rename(tmp, path);
++    else
++        remove(tmp);
++}
++
++bool EncodeLevel(astcenc_context* ctx, u8* rgba, u32 w, u32 h, u8* out, size_t outSize)
++{
++    void* slices[] = { rgba };
++    astcenc_image img{ w, h, 1, ASTCENC_TYPE_U8, slices };
++    const astcenc_swizzle swz{ ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A };
++    astcenc_error err0 = ASTCENC_SUCCESS, err1 = ASTCENC_SUCCESS;
++    if (w * h >= 128 * 128)
++    {
++        std::thread helper([&] { err1 = astcenc_compress_image(ctx, &img, &swz, out, outSize, 1); });
++        err0 = astcenc_compress_image(ctx, &img, &swz, out, outSize, 0);
++        helper.join();
++    }
++    else
++        err0 = astcenc_compress_image(ctx, &img, &swz, out, outSize, 0);
++    astcenc_compress_reset(ctx);
++    return err0 == ASTCENC_SUCCESS && err1 == ASTCENC_SUCCESS;
++}
++} // namespace
++
++// Вместо распаковки DXT в RGBA8: ASTC из кэша или пересжатие.
++static gli::texture ConvertBCForES(const gli::texture& t, pcstr name, size_t fileSize)
++{
++    if (!gli::is_compressed(t.format()) || GLAD_GL_EXT_texture_compression_s3tc || !AstcInit())
++        return DecompressBCIfUnsupported(t, name);
++
++    string_path cache;
++    CachePath(cache, name, fileSize, t);
++    gli::texture cached;
++    if (CacheLoad(cache, cached))
++    {
++        ++g_astc.fromCache;
++        return cached;
++    }
++
++    const gli::texture rgba = DecompressBCIfUnsupported(t, name);
++    if (gli::is_compressed(rgba.format()))
++        return rgba; // формат, который мы не распаковываем — как есть
++    const bool srgb = rgba.format() == gli::FORMAT_RGBA8_SRGB_PACK8;
++    gli::texture out(rgba.target(), srgb ? gli::FORMAT_RGBA_ASTC_4X4_SRGB_BLOCK16 : gli::FORMAT_RGBA_ASTC_4X4_UNORM_BLOCK16,
++        rgba.extent(), rgba.layers(), rgba.faces(), rgba.levels());
++
++    const auto t0 = std::chrono::steady_clock::now();
++    for (size_t layer = 0; layer < rgba.layers(); ++layer)
++        for (size_t face = 0; face < rgba.faces(); ++face)
++            for (size_t level = 0; level < rgba.levels(); ++level)
++            {
++                const auto e = rgba.extent(level);
++                auto* src = static_cast<u8*>(const_cast<void*>(rgba.data(layer, face, level)));
++                auto* dst = static_cast<u8*>(out.data(layer, face, level));
++                if (!EncodeLevel(g_astc.ctx[srgb ? 1 : 0], src, u32(e.x), u32(e.y), dst, out.size(level)))
++                {
++                    Msg("! ASTC: ошибка сжатия %s — оставляю RGBA8", name);
++                    return rgba;
++                }
++            }
++    g_astc.encodeSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++    CacheSave(cache, out);
++    if ((++g_astc.encoded % 100) == 1)
++        Msg("* ASTC: сжато %u текстур за %.0f с, из кэша %u", g_astc.encoded, g_astc.encodeSeconds, g_astc.fromCache);
++    return out;
++}
++#endif // XR_USE_ASTC
++
  u32 calc_texture_size(int lod, u32 mip_cnt, size_t orig_size)
  {
      if (1 == mip_cnt)
-@@ -110,10 +161,29 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
+@@ -110,10 +343,33 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
  #endif // DEBUG
      gli::texture texture = gli::load((char*)S->pointer(), img_size);
      R_ASSERT2(!texture.empty(), fn);
@@ -1192,7 +1374,11 @@ index 1cee8526..07c6b1f3 100644
 +            texture = gli::texture(texture, texture.target(), texture.format(), 0, texture.layers() - 1, 0,
 +                texture.faces() - 1, skip, texture.levels() - 1, texture.swizzles());
 +    }
++#ifdef XR_USE_ASTC
++    texture = ConvertBCForES(texture, fn, img_size);
++#else
 +    texture = DecompressBCIfUnsupported(texture, fn);
++#endif
 +#endif
  
      u32 mip_cnt = u32(-1); // XXX: write to it when reading with GLI!
@@ -1202,7 +1388,7 @@ index 1cee8526..07c6b1f3 100644
      gli::gl GL(gli::gl::PROFILE_ES30);
  #else
      gli::gl GL(gli::gl::PROFILE_GL33);
-@@ -130,7 +200,7 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
+@@ -130,7 +386,7 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
      glTexParameteri(target, GL_TEXTURE_BASE_LEVEL, 0);
      glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, static_cast<GLint>(texture.levels() - 1));
  
@@ -1332,16 +1518,22 @@ index 60fe082f..1d330873 100644
          rgba.resize(Device.dwWidth * Device.dwHeight * 4);
          glReadPixels(0, 0, Device.dwWidth, Device.dwHeight, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
 diff --git a/src/Layers/xrRenderPC_GL/CMakeLists.txt b/src/Layers/xrRenderPC_GL/CMakeLists.txt
-index 9018d8bb..380be9f2 100644
+index 9018d8bb..6667522d 100644
 --- a/src/Layers/xrRenderPC_GL/CMakeLists.txt
 +++ b/src/Layers/xrRenderPC_GL/CMakeLists.txt
-@@ -423,6 +423,11 @@ target_compile_definitions(xrRender_GL
+@@ -423,6 +423,17 @@ target_compile_definitions(xrRender_GL
      PURE_DYNAMIC_CAST
  )
  
 +if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
 +    # На iOS есть только OpenGL ES 3.0 — используем путь WebGL 2 / ES 3.0.
 +    target_compile_definitions(xrRender_GL PRIVATE XR_GL_ES)
++    # ARM astcenc: DXT → ASTC 4x4 на устройстве (у GPU Apple нет S3TC)
++    find_library(XR_ASTCENC_LIBRARY NAMES astcenc REQUIRED)
++    find_path(XR_ASTCENC_INCLUDE_DIR astcenc.h REQUIRED)
++    target_include_directories(xrRender_GL PRIVATE "${XR_ASTCENC_INCLUDE_DIR}")
++    target_link_libraries(xrRender_GL PRIVATE "${XR_ASTCENC_LIBRARY}")
++    target_compile_definitions(xrRender_GL PRIVATE XR_USE_ASTC)
 +endif()
 +
  set_target_properties(xrRender_GL PROPERTIES
