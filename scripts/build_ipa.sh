@@ -56,6 +56,15 @@ build_variant() {
     if [[ -n "$SHADERS" && -d "$SHADERS" ]]; then
         mkdir -p "$app/xrshaders"
         cp "$SHADERS"/*.metal "$app/xrshaders/"
+        # отражение SPIRV-Cross под именами функций metallib (всё, кроме [A-Za-z0-9_], → «_»)
+        for j in "$SHADERS"/*.json; do
+            [[ -e "$j" ]] || continue
+            cp "$j" "$app/xrshaders/$(basename "$j" .json | LC_ALL=C sed 's/[^A-Za-z0-9_]/_/g').json"
+        done
+        if [[ -f "$ROOT/build/xrshaders.metallib" ]]; then
+            cp "$ROOT/build/xrshaders.metallib" "$app/"
+            echo "   xrshaders.metallib в пакете"
+        fi
         echo "   шейдеров OpenXRay в пакете: $(ls "$app/xrshaders" | wc -l)"
     fi
 

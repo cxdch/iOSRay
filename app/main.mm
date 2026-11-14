@@ -166,6 +166,141 @@ static BOOL SupportsBC(id<MTLDevice> dev)
 // Занимает память блоками по 32 МБ (с записью в каждую страницу), пока
 // os_proc_available_memory() не опустится ниже запаса. Затем всё освобождает.
 // Показывает реальный бюджет приложения до jetsam для этой сборки и этого телефона.
+// ---------------------------------------------------------------------------
+// Офлайн-библиотека xrshaders.metallib (собрана в CI): для Metal-рендера движка.
+// Проверяем, что из неё на этом GPU создаются настоящие PSO:
+//   * вершинный шейдер — PSO без растеризации, вершинный формат из отражения Metal;
+//   * пиксельный — PSO с подставным вершинным шейдером, который выдаёт ровно те
+//     входы [[user(locnN)]], что ждёт пиксельный (берём из *.json от SPIRV-Cross).
+// ---------------------------------------------------------------------------
+static NSString* MSLType(NSString* glsl)
+{
+    NSDictionary* map = @{ @"float": @"float", @"vec2": @"float2", @"vec3": @"float3", @"vec4": @"float4",
+                           @"int": @"int", @"ivec2": @"int2", @"ivec3": @"int3", @"ivec4": @"int4",
+                           @"uint": @"uint", @"uvec2": @"uint2", @"uvec3": @"uint3", @"uvec4": @"uint4" };
+    return map[glsl];
+}
+
+static MTLVertexFormat AttrFormat(MTLDataType t)
+{
+    switch (t)
+    {
+    case MTLDataTypeFloat: return MTLVertexFormatFloat;
+    case MTLDataTypeFloat2: return MTLVertexFormatFloat2;
+    case MTLDataTypeFloat3: return MTLVertexFormatFloat3;
+    case MTLDataTypeFloat4: return MTLVertexFormatFloat4;
+    case MTLDataTypeInt: return MTLVertexFormatInt;
+    case MTLDataTypeInt2: return MTLVertexFormatInt2;
+    case MTLDataTypeInt3: return MTLVertexFormatInt3;
+    case MTLDataTypeInt4: return MTLVertexFormatInt4;
+    case MTLDataTypeUInt: return MTLVertexFormatUInt;
+    case MTLDataTypeUInt2: return MTLVertexFormatUInt2;
+    case MTLDataTypeUInt3: return MTLVertexFormatUInt3;
+    case MTLDataTypeUInt4: return MTLVertexFormatUInt4;
+    default: return MTLVertexFormatFloat4;
+    }
+}
+
+static void RunMetallibTest(id<MTLDevice> device)
+{
+    NSString* res = [NSBundle mainBundle].resourcePath;
+    NSString* libPath = [res stringByAppendingPathComponent:@"xrshaders.metallib"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:libPath])
+    {
+        XRLog(@"metallib: нет в пакете — пропускаю");
+        return;
+    }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSError* err = nil;
+        CFTimeInterval t0 = CACurrentMediaTime();
+        id<MTLLibrary> lib = [device newLibraryWithURL:[NSURL fileURLWithPath:libPath] error:&err];
+        if (!lib)
+        {
+            XRLog(@"metallib: НЕ загрузилась: %@", err.localizedDescription);
+            return;
+        }
+        NSArray<NSString*>* names = [lib.functionNames sortedArrayUsingSelector:@selector(compare:)];
+        XRLog(@"metallib: загружена за %.0f мс, функций %lu", (CACurrentMediaTime() - t0) * 1000.0,
+              (unsigned long)names.count);
+        NSString* jsonDir = [res stringByAppendingPathComponent:@"xrshaders"];
+        NSInteger okV = 0, okP = 0, fail = 0;
+        CFTimeInterval start = CACurrentMediaTime();
+        for (NSString* name in names)
+        {
+            @autoreleasepool
+            {
+                id<MTLFunction> fn = [lib newFunctionWithName:name];
+                MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
+                pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+                if (fn.functionType == MTLFunctionTypeVertex)
+                {
+                    MTLVertexDescriptor* vd = [MTLVertexDescriptor new];
+                    NSUInteger offset = 0;
+                    for (MTLVertexAttribute* a in fn.vertexAttributes)
+                    {
+                        if (!a.active)
+                            continue;
+                        vd.attributes[a.attributeIndex].format = AttrFormat(a.attributeType);
+                        vd.attributes[a.attributeIndex].offset = offset;
+                        vd.attributes[a.attributeIndex].bufferIndex = 30;
+                        offset += 16;
+                    }
+                    vd.layouts[30].stride = MAX(offset, (NSUInteger)16);
+                    pd.vertexFunction = fn;
+                    pd.vertexDescriptor = vd;
+                    pd.rasterizationEnabled = NO;
+                }
+                else
+                {
+                    // Входы и выходы пиксельного шейдера — из отражения SPIRV-Cross
+                    NSData* jd = [NSData dataWithContentsOfFile:[jsonDir stringByAppendingPathComponent:
+                                                                    [name stringByAppendingString:@".json"]]];
+                    NSDictionary* js = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
+                    NSMutableString* members = [NSMutableString new];
+                    NSMutableString* zeros = [NSMutableString new];
+                    for (NSDictionary* in in js[@"inputs"])
+                    {
+                        NSString* t = MSLType(in[@"type"]);
+                        if (!t)
+                            continue;
+                        [members appendFormat:@"  %@ v%@ [[user(locn%@)]];\n", t, in[@"location"], in[@"location"]];
+                        [zeros appendFormat:@"  o.v%@ = %@(0);\n", in[@"location"], t];
+                    }
+                    NSString* src = [NSString stringWithFormat:
+                        @"#include <metal_stdlib>\nusing namespace metal;\n"
+                         "struct VOut {\n  float4 pos [[position]];\n%@};\n"
+                         "vertex VOut xr_dummy_vs(uint vid [[vertex_id]]) {\n  VOut o;\n  o.pos = float4(0);\n%@  return o;\n}\n",
+                        members, zeros];
+                    id<MTLLibrary> vl = [device newLibraryWithSource:src options:nil error:&err];
+                    pd.vertexFunction = [vl newFunctionWithName:@"xr_dummy_vs"];
+                    pd.fragmentFunction = fn;
+                    for (NSDictionary* out in js[@"outputs"])
+                    {
+                        NSUInteger loc = [out[@"location"] unsignedIntegerValue];
+                        NSString* t = out[@"type"];
+                        pd.colorAttachments[loc].pixelFormat = [t hasPrefix:@"ivec"] || [t isEqual:@"int"]
+                            ? MTLPixelFormatRGBA32Sint
+                            : ([t hasPrefix:@"uvec"] || [t isEqual:@"uint"]) ? MTLPixelFormatRGBA32Uint
+                                                                            : MTLPixelFormatRGBA16Float;
+                    }
+                }
+                err = nil;
+                id<MTLRenderPipelineState> pso = [device newRenderPipelineStateWithDescriptor:pd error:&err];
+                if (pso)
+                    fn.functionType == MTLFunctionTypeVertex ? ++okV : ++okP;
+                else
+                {
+                    ++fail;
+                    NSString* e = err.localizedDescription ?: @"?";
+                    XRLog(@"  PSO FAIL %@: %@", name, [e substringToIndex:MIN(e.length, (NSUInteger)300)]);
+                }
+            }
+        }
+        XRLog(@"metallib: PSO готовы — вершинных %ld, пиксельных %ld, ошибок %ld, за %.1f с", (long)okV, (long)okP,
+              (long)fail, CACurrentMediaTime() - start);
+    });
+}
+
 static std::atomic<bool> gMemTestRunning{false};
 static std::atomic<double> gMemTestResultMB{0};
 
@@ -286,6 +421,7 @@ fragment float4 tri_fs(VOut in [[stage_in]]) { return float4(in.color, 1.0); }
     self.active = YES;
 
     [_shaderTest runWithDevice:_device];
+    RunMetallibTest(_device);
 }
 
 - (void)logDeviceInfo
