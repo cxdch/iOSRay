@@ -37,6 +37,8 @@ fetch lzo    https://github.com/nemequ/lzo.git        master
 fetch sdl2   https://github.com/libsdl-org/SDL.git    release-2.30.9
 fetch openal https://github.com/kcat/openal-soft.git  1.24.1
 fetch astcenc https://github.com/ARM-software/astc-encoder.git 5.2.0
+fetch glslang https://github.com/KhronosGroup/glslang.git 16.6.0
+fetch spirv-cross https://github.com/KhronosGroup/SPIRV-Cross.git vulkan-sdk-1.4.363.0
 LUAJIT_REV=5a5cd82e435a7b08d61b4e0af887493d24d9eca1   # подмодуль OpenXRay/LuaJIT в xray-16
 if [[ ! -d "$SRC/luajit" ]]; then
     git init -q "$SRC/luajit"
@@ -73,3 +75,13 @@ cp "$SRC/luajit/src/libluajit.a" "$PREFIX/lib/libluajit.a"
 
 echo "Готово: $PREFIX"
 ls "$PREFIX/lib"/*.a
+
+# Metal-рендер: компиляция GLSL движка в MSL прямо на телефоне
+# (GLSL --glslang--> SPIR-V --SPIRV-Cross--> MSL + рефлексия uniform/сэмплеров).
+cmake_build "$SRC/glslang" glslang -DENABLE_OPT=OFF -DGLSLANG_TESTS=OFF \
+    -DENABLE_GLSLANG_BINARIES=OFF -DENABLE_HLSL=OFF \
+    -DGLSLANG_ENABLE_INSTALL=ON -DBUILD_EXTERNAL=OFF
+cmake_build "$SRC/spirv-cross" spirv-cross -DSPIRV_CROSS_CLI=OFF \
+    -DSPIRV_CROSS_ENABLE_TESTS=OFF -DSPIRV_CROSS_ENABLE_HLSL=OFF \
+    -DSPIRV_CROSS_ENABLE_CPP=OFF -DSPIRV_CROSS_ENABLE_C_API=OFF \
+    -DSPIRV_CROSS_SHARED=OFF -DSPIRV_CROSS_STATIC=ON

@@ -1709,10 +1709,10 @@ index 60fe082f..1d330873 100644
          glReadPixels(0, 0, Device.dwWidth, Device.dwHeight, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl.mm b/src/Layers/xrRenderGL/mtl/glmtl.mm
 new file mode 100644
-index 00000000..39d782d8
+index 00000000..d999b03b
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl.mm
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,457 @@
 +// iOSRay: Metal-режим рендера (этап 3).
 +//
 +// Рендер OpenXRay продолжает вызывать функции OpenGL ES (через указатели glad),
@@ -1725,6 +1725,8 @@ index 00000000..39d782d8
 +#import <Metal/Metal.h>
 +#import <QuartzCore/CAMetalLayer.h>
 +#include <glad/gl.h>
++
++#include "glmtl_shaders.h"
 +
 +#include <cstdio>
 +#include <cstring>
@@ -1830,15 +1832,38 @@ index 00000000..39d782d8
 +
 +GLuint gl_CreateShaderProgramv(GLenum, GLsizei, const GLchar* const*) { return g.nextName++; }
 +
-+void gl_GetShaderiv(GLuint, GLenum pname, GLint* v)
++// --- шейдеры и программы (этап 4): см. glmtl_shaders.cpp ----------------------
++GLuint gl_CreateShader(GLenum type)
 +{
-+    *v = (pname == GL_COMPILE_STATUS || pname == GL_DELETE_STATUS) ? GL_TRUE : 0;
++    const GLuint id = g.nextName++;
++    xr_mtl::CreateShader(id, type);
++    return id;
++}
++void gl_ShaderSource(GLuint id, GLsizei n, const GLchar* const* s, const GLint* l) { xr_mtl::ShaderSource(id, n, s, l); }
++void gl_DeleteShader(GLuint id) { xr_mtl::DeleteShader(id); }
++GLuint gl_CreateProgram()
++{
++    const GLuint id = g.nextName++;
++    xr_mtl::CreateProgram(id);
++    return id;
++}
++void gl_DeleteProgram(GLuint id) { xr_mtl::DeleteProgram(id); }
++void gl_AttachShader(GLuint p, GLuint s) { xr_mtl::AttachShader(p, s); }
++void gl_DetachShader(GLuint p, GLuint s) { xr_mtl::DetachShader(p, s); }
++void gl_LinkProgram(GLuint p) { xr_mtl::LinkProgram(p); }
++void gl_UseProgram(GLuint p) { xr_mtl::UseProgram(p); }
++void gl_GetActiveUniform(GLuint p, GLuint i, GLsizei b, GLsizei* l, GLint* sz, GLenum* t, GLchar* n)
++{
++    xr_mtl::GetActiveUniform(p, i, b, l, sz, t, n);
 +}
 +
-+void gl_GetProgramiv(GLuint, GLenum pname, GLint* v)
++// Компиляция откладывается до линковки: там видны обе стадии сразу
++void gl_GetShaderiv(GLuint, GLenum pname, GLint* v)
 +{
-+    *v = (pname == GL_LINK_STATUS || pname == GL_VALIDATE_STATUS) ? GL_TRUE : 0;
++    *v = (pname == GL_COMPILE_STATUS) ? GL_TRUE : 0;
 +}
++
++void gl_GetProgramiv(GLuint p, GLenum pname, GLint* v) { xr_mtl::GetProgramiv(p, pname, v); }
 +
 +void gl_GetProgramPipelineiv(GLuint, GLenum pname, GLint* v)
 +{
@@ -1853,7 +1878,66 @@ index 00000000..39d782d8
 +        log[0] = 0;
 +}
 +
-+GLint gl_GetUniformLocation(GLuint, const GLchar*) { return -1; } // констант пока нет
++GLint gl_GetUniformLocation(GLuint p, const GLchar* n) { return xr_mtl::GetUniformLocation(p, n); }
++
++// glUniform* / glProgramUniform*: пишем в теневые блоки программы
++#define XR_U_SCALAR(N, T, ...)                                                   \
++    void gl_Uniform##N(GLint l, __VA_ARGS__)                                     \
++    {                                                                            \
++        const T v[] = { XR_U_ARGS_##N };                                         \
++        xr_mtl::SetUniform(0, l, 1, v, 1, sizeof(v) / sizeof(T), false);        \
++    }                                                                            \
++    void gl_ProgramUniform##N(GLuint p, GLint l, __VA_ARGS__)                    \
++    {                                                                            \
++        const T v[] = { XR_U_ARGS_##N };                                         \
++        xr_mtl::SetUniform(p, l, 1, v, 1, sizeof(v) / sizeof(T), false);        \
++    }
++#define XR_U_ARGS_1f x
++#define XR_U_ARGS_2f x, y
++#define XR_U_ARGS_3f x, y, z
++#define XR_U_ARGS_4f x, y, z, w
++#define XR_U_ARGS_1i x
++#define XR_U_ARGS_2i x, y
++#define XR_U_ARGS_3i x, y, z
++#define XR_U_ARGS_4i x, y, z, w
++XR_U_SCALAR(1f, GLfloat, GLfloat x)
++XR_U_SCALAR(2f, GLfloat, GLfloat x, GLfloat y)
++XR_U_SCALAR(3f, GLfloat, GLfloat x, GLfloat y, GLfloat z)
++XR_U_SCALAR(4f, GLfloat, GLfloat x, GLfloat y, GLfloat z, GLfloat w)
++XR_U_SCALAR(1i, GLint, GLint x)
++XR_U_SCALAR(2i, GLint, GLint x, GLint y)
++XR_U_SCALAR(3i, GLint, GLint x, GLint y, GLint z)
++XR_U_SCALAR(4i, GLint, GLint x, GLint y, GLint z, GLint w)
++
++#define XR_U_VEC(N, T, R)                                                                                      \
++    void gl_Uniform##N##v(GLint l, GLsizei c, const T* v) { xr_mtl::SetUniform(0, l, c, v, 1, R, false); }   \
++    void gl_ProgramUniform##N##v(GLuint p, GLint l, GLsizei c, const T* v) { xr_mtl::SetUniform(p, l, c, v, 1, R, false); }
++XR_U_VEC(1f, GLfloat, 1)
++XR_U_VEC(2f, GLfloat, 2)
++XR_U_VEC(3f, GLfloat, 3)
++XR_U_VEC(4f, GLfloat, 4)
++XR_U_VEC(1i, GLint, 1)
++XR_U_VEC(2i, GLint, 2)
++XR_U_VEC(3i, GLint, 3)
++XR_U_VEC(4i, GLint, 4)
++
++// MatrixCxR: C столбцов, R строк
++#define XR_U_MAT(N, C, R)                                                                                    \
++    void gl_UniformMatrix##N##fv(GLint l, GLsizei c, GLboolean t, const GLfloat* v)                          \
++    {                                                                                                        \
++        xr_mtl::SetUniform(0, l, c, v, C, R, t == GL_TRUE);                                                  \
++    }                                                                                                        \
++    void gl_ProgramUniformMatrix##N##fv(GLuint p, GLint l, GLsizei c, GLboolean t, const GLfloat* v)         \
++    {                                                                                                        \
++        xr_mtl::SetUniform(p, l, c, v, C, R, t == GL_TRUE);                                                  \
++    }
++XR_U_MAT(2, 2, 2)
++XR_U_MAT(3, 3, 3)
++XR_U_MAT(4, 4, 4)
++XR_U_MAT(4x2, 4, 2)
++XR_U_MAT(4x3, 4, 3)
++XR_U_MAT(3x4, 3, 4)
++XR_U_MAT(2x4, 2, 4)
 +GLint gl_GetAttribLocation(GLuint, const GLchar*) { return -1; }
 +GLuint gl_GetUniformBlockIndex(GLuint, const GLchar*) { return GL_INVALID_INDEX; }
 +
@@ -1942,16 +2026,70 @@ index 00000000..39d782d8
 +    E("glGenQueries", gl_GenNames),
 +    E("glGenProgramPipelines", gl_GenNames),
 +    E("glGenTransformFeedbacks", gl_GenNames),
-+    E("glCreateShader", gl_CreateName),
-+    E("glCreateProgram", gl_CreateName),
++    E("glCreateShader", gl_CreateShader),
++    E("glShaderSource", gl_ShaderSource),
++    E("glDeleteShader", gl_DeleteShader),
++    E("glCreateProgram", gl_CreateProgram),
++    E("glDeleteProgram", gl_DeleteProgram),
++    E("glAttachShader", gl_AttachShader),
++    E("glDetachShader", gl_DetachShader),
++    E("glLinkProgram", gl_LinkProgram),
++    E("glUseProgram", gl_UseProgram),
++    E("glGetActiveUniform", gl_GetActiveUniform),
 +    E("glCreateShaderProgramv", gl_CreateShaderProgramv),
 +    E("glGetShaderiv", gl_GetShaderiv),
 +    E("glGetProgramiv", gl_GetProgramiv),
 +    E("glGetProgramPipelineiv", gl_GetProgramPipelineiv),
 +    E("glGetShaderInfoLog", gl_GetInfoLog),
-+    E("glGetProgramInfoLog", gl_GetInfoLog),
++    E("glGetProgramInfoLog", xr_mtl::GetProgramInfoLog),
 +    E("glGetProgramPipelineInfoLog", gl_GetInfoLog),
 +    E("glGetUniformLocation", gl_GetUniformLocation),
++    E("glUniform1f", gl_Uniform1f),
++    E("glProgramUniform1f", gl_ProgramUniform1f),
++    E("glUniform1fv", gl_Uniform1fv),
++    E("glProgramUniform1fv", gl_ProgramUniform1fv),
++    E("glUniform2f", gl_Uniform2f),
++    E("glProgramUniform2f", gl_ProgramUniform2f),
++    E("glUniform2fv", gl_Uniform2fv),
++    E("glProgramUniform2fv", gl_ProgramUniform2fv),
++    E("glUniform3f", gl_Uniform3f),
++    E("glProgramUniform3f", gl_ProgramUniform3f),
++    E("glUniform3fv", gl_Uniform3fv),
++    E("glProgramUniform3fv", gl_ProgramUniform3fv),
++    E("glUniform4f", gl_Uniform4f),
++    E("glProgramUniform4f", gl_ProgramUniform4f),
++    E("glUniform4fv", gl_Uniform4fv),
++    E("glProgramUniform4fv", gl_ProgramUniform4fv),
++    E("glUniform1i", gl_Uniform1i),
++    E("glProgramUniform1i", gl_ProgramUniform1i),
++    E("glUniform1iv", gl_Uniform1iv),
++    E("glProgramUniform1iv", gl_ProgramUniform1iv),
++    E("glUniform2i", gl_Uniform2i),
++    E("glProgramUniform2i", gl_ProgramUniform2i),
++    E("glUniform2iv", gl_Uniform2iv),
++    E("glProgramUniform2iv", gl_ProgramUniform2iv),
++    E("glUniform3i", gl_Uniform3i),
++    E("glProgramUniform3i", gl_ProgramUniform3i),
++    E("glUniform3iv", gl_Uniform3iv),
++    E("glProgramUniform3iv", gl_ProgramUniform3iv),
++    E("glUniform4i", gl_Uniform4i),
++    E("glProgramUniform4i", gl_ProgramUniform4i),
++    E("glUniform4iv", gl_Uniform4iv),
++    E("glProgramUniform4iv", gl_ProgramUniform4iv),
++    E("glUniformMatrix2fv", gl_UniformMatrix2fv),
++    E("glProgramUniformMatrix2fv", gl_ProgramUniformMatrix2fv),
++    E("glUniformMatrix3fv", gl_UniformMatrix3fv),
++    E("glProgramUniformMatrix3fv", gl_ProgramUniformMatrix3fv),
++    E("glUniformMatrix4fv", gl_UniformMatrix4fv),
++    E("glProgramUniformMatrix4fv", gl_ProgramUniformMatrix4fv),
++    E("glUniformMatrix4x2fv", gl_UniformMatrix4x2fv),
++    E("glProgramUniformMatrix4x2fv", gl_ProgramUniformMatrix4x2fv),
++    E("glUniformMatrix4x3fv", gl_UniformMatrix4x3fv),
++    E("glProgramUniformMatrix4x3fv", gl_ProgramUniformMatrix4x3fv),
++    E("glUniformMatrix3x4fv", gl_UniformMatrix3x4fv),
++    E("glProgramUniformMatrix3x4fv", gl_ProgramUniformMatrix3x4fv),
++    E("glUniformMatrix2x4fv", gl_UniformMatrix2x4fv),
++    E("glProgramUniformMatrix2x4fv", gl_ProgramUniformMatrix2x4fv),
 +    E("glGetAttribLocation", gl_GetAttribLocation),
 +    E("glGetUniformBlockIndex", gl_GetUniformBlockIndex),
 +    E("glFenceSync", gl_FenceSync),
@@ -2032,11 +2170,539 @@ index 00000000..39d782d8
 +        fflush(stdout);
 +    }
 +}
+diff --git a/src/Layers/xrRenderGL/mtl/glmtl_shaders.cpp b/src/Layers/xrRenderGL/mtl/glmtl_shaders.cpp
+new file mode 100644
+index 00000000..c9d0f269
+--- /dev/null
++++ b/src/Layers/xrRenderGL/mtl/glmtl_shaders.cpp
+@@ -0,0 +1,448 @@
++// iOSRay: Metal-режим, этап 4 — шейдеры.
++//
++// Движок отдаёт GLSL ES 3.00 через glShaderSource/glLinkProgram. Здесь при
++// линковке исходники собираются glslang в SPIR-V (Vulkan-правила «relaxed»: все
++// свободные uniform попадают в один блок gl_DefaultUniformBlock), затем
++// SPIRV-Cross переводит SPIR-V в MSL и даёт точную рефлексию:
++//   * какие uniform есть, их тип и смещение в блоке (для glGetActiveUniform и
++//     glUniform*, значения копируются в теневой буфер каждой стадии);
++//   * какие сэмплеры есть и в какие слоты текстур Metal они попадают.
++// MSL пока только сохраняется; создание MTLLibrary и рисование — следующий шаг.
++
++#include "glmtl_shaders.h"
++
++#include <glslang/Public/ResourceLimits.h>
++#include <glslang/Public/ShaderLang.h>
++#include <glslang/SPIRV/GlslangToSpv.h>
++#include <spirv_cross/spirv_msl.hpp>
++
++#include <chrono>
++#include <cstdio>
++#include <cstring>
++#include <memory>
++#include <unordered_map>
++
++namespace xr_mtl
++{
++namespace
++{
++std::unordered_map<GLuint, Shader> g_shaders;
++std::unordered_map<GLuint, Program> g_programs;
++GLuint g_current = 0;
++
++struct LinkStats
++{
++    unsigned ok = 0, failed = 0;
++    double seconds = 0;
++} g_stats;
++
++bool g_glslangReady = false;
++
++// GLSL ES 3.00 не поддерживается для Vulkan-SPIR-V, а 3.10 — надмножество 3.00.
++std::string PatchVersion(std::string src)
++{
++    const size_t pos = src.find("#version 300 es");
++    if (pos != std::string::npos)
++        src.replace(pos, 15, "#version 310 es");
++    return src;
++}
++
++GLenum GLTypeOf(const spirv_cross::SPIRType& t)
++{
++    using BT = spirv_cross::SPIRType::BaseType;
++    const unsigned n = t.vecsize, c = t.columns;
++    if (c > 1)
++    {
++        if (c == 4 && n == 4) return GL_FLOAT_MAT4;
++        if (c == 4 && n == 3) return GL_FLOAT_MAT4x3;
++        if (c == 4 && n == 2) return GL_FLOAT_MAT4x2;
++        if (c == 3 && n == 3) return GL_FLOAT_MAT3;
++        if (c == 2 && n == 2) return GL_FLOAT_MAT2;
++        if (c == 3 && n == 4) return GL_FLOAT_MAT3x4;
++        if (c == 2 && n == 4) return GL_FLOAT_MAT2x4;
++        return GL_FLOAT_MAT4;
++    }
++    switch (t.basetype)
++    {
++    case BT::Int:
++    case BT::UInt:
++        return n == 1 ? GL_INT : n == 2 ? GL_INT_VEC2 : n == 3 ? GL_INT_VEC3 : GL_INT_VEC4;
++    case BT::Boolean:
++        return n == 1 ? GL_BOOL : n == 2 ? GL_BOOL_VEC2 : n == 3 ? GL_BOOL_VEC3 : GL_BOOL_VEC4;
++    default:
++        return n == 1 ? GL_FLOAT : n == 2 ? GL_FLOAT_VEC2 : n == 3 ? GL_FLOAT_VEC3 : GL_FLOAT_VEC4;
++    }
++}
++
++GLenum GLSamplerTypeOf(const spirv_cross::SPIRType& t)
++{
++    // Движок (glr_constants.cpp) знает только эти типы сэмплеров
++    if (t.image.depth)
++        return GL_SAMPLER_2D_SHADOW;
++    switch (t.image.dim)
++    {
++    case spv::Dim3D: return GL_SAMPLER_3D;
++    case spv::DimCube: return GL_SAMPLER_CUBE;
++    default: return GL_SAMPLER_2D;
++    }
++}
++
++Uniform& FindOrAdd(Program& p, const std::string& name)
++{
++    for (Uniform& u : p.uniforms)
++        if (u.name == name)
++            return u;
++    p.uniforms.emplace_back();
++    p.uniforms.back().name = name;
++    return p.uniforms.back();
++}
++
++// SPIR-V одной стадии → MSL + рефлексия в программу
++bool Reflect(Program& p, int stage, std::vector<uint32_t>&& spirv, std::string& log)
++{
++    try
++    {
++        spirv_cross::CompilerMSL msl(std::move(spirv));
++        spirv_cross::CompilerMSL::Options opt;
++        opt.platform = spirv_cross::CompilerMSL::Options::iOS;
++        opt.set_msl_version(2, 1);
++        opt.enable_decoration_binding = true;
++        msl.set_msl_options(opt);
++
++        // Как в GL: наружу видны только реально используемые uniform и сэмплеры
++        auto active = msl.get_active_interface_variables();
++        const spirv_cross::ShaderResources res = msl.get_shader_resources(active);
++        msl.set_enabled_interface_variables(std::move(active));
++
++        for (const spirv_cross::Resource& r : res.uniform_buffers)
++        {
++            const spirv_cross::SPIRType& block = msl.get_type(r.base_type_id);
++            const size_t size = msl.get_declared_struct_size(block);
++            p.block[stage].assign(size, 0);
++            p.blockBinding[stage] = 0; // [[buffer(0)]]
++            msl.set_decoration(r.id, spv::DecorationBinding, 0);
++            for (const spirv_cross::BufferRange& br : msl.get_active_buffer_ranges(r.id))
++            {
++                const uint32_t m = br.index;
++                const spirv_cross::SPIRType& mt = msl.get_type(block.member_types[m]);
++                Uniform& u = FindOrAdd(p, msl.get_member_name(r.base_type_id, m));
++                u.glType = GLTypeOf(mt);
++                u.arraySize = mt.array.empty() ? 1 : GLint(mt.array[0]);
++                UniformSlot& s = u.slot[stage];
++                s.present = true;
++                s.offset = msl.type_struct_member_offset(block, m);
++                s.arrayStride = mt.array.empty() ? 0 : msl.type_struct_member_array_stride(block, m);
++                s.matrixStride = mt.columns > 1 ? msl.type_struct_member_matrix_stride(block, m) : 0;
++                s.isBool = mt.basetype == spirv_cross::SPIRType::Boolean;
++            }
++            break; // relaxed-правила дают ровно один блок
++        }
++
++        uint32_t texIndex = 0; // слоты текстур Metal — подряд, в порядке объявления
++        for (const spirv_cross::Resource& r : res.sampled_images)
++        {
++            const spirv_cross::SPIRType& t = msl.get_type(r.type_id);
++            Uniform& u = FindOrAdd(p, r.name);
++            u.glType = GLSamplerTypeOf(t);
++            u.isSampler = true;
++            u.slot[stage].present = true;
++            u.slot[stage].textureIndex = texIndex;
++            msl.set_decoration(r.id, spv::DecorationBinding, texIndex++);
++        }
++
++        p.msl[stage] = msl.compile();
++        return true;
++    }
++    catch (const std::exception& e)
++    {
++        log += std::string("SPIRV-Cross: ") + e.what() + "\n";
++        return false;
++    }
++}
++
++const EShLanguage kStages[2] = { EShLangVertex, EShLangFragment };
++
++bool Link(GLuint id, Program& p)
++{
++    if (!g_glslangReady)
++        g_glslangReady = glslang::InitializeProcess();
++
++    p.uniforms.clear();
++    p.log.clear();
++    for (int s = 0; s < 2; ++s)
++    {
++        p.msl[s].clear();
++        p.block[s].clear();
++    }
++
++    const EShMessages msgs = EShMessages(EShMsgSpvRules | EShMsgVulkanRules);
++    std::unique_ptr<glslang::TShader> sh[2];
++    std::string sources[2];
++    glslang::TProgram prog;
++
++    for (GLuint sid : p.attached)
++    {
++        const auto it = g_shaders.find(sid);
++        if (it == g_shaders.end())
++            continue;
++        const int stage = it->second.type == GL_VERTEX_SHADER ? 0 : it->second.type == GL_FRAGMENT_SHADER ? 1 : -1;
++        if (stage < 0)
++            continue;
++        sources[stage] = PatchVersion(it->second.source);
++        const char* src = sources[stage].c_str();
++        auto& s = sh[stage];
++        s = std::make_unique<glslang::TShader>(kStages[stage]);
++        s->setStrings(&src, 1);
++        s->setEnvInput(glslang::EShSourceGlsl, kStages[stage], glslang::EShClientVulkan, 100);
++        s->setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
++        s->setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_0);
++        s->setEnvInputVulkanRulesRelaxed();
++        s->setAutoMapBindings(true);
++        s->setAutoMapLocations(true);
++        if (!s->parse(GetDefaultResources(), 310, false, msgs))
++        {
++            p.log += std::string(stage ? "PS: " : "VS: ") + s->getInfoLog() + "\n";
++            return false;
++        }
++        prog.addShader(s.get());
++    }
++    if (!sh[0])
++    {
++        p.log += "нет вершинного шейдера\n";
++        return false;
++    }
++    if (!prog.link(msgs) || !prog.mapIO())
++    {
++        p.log += std::string("link: ") + prog.getInfoLog() + "\n";
++        return false;
++    }
++    for (int s = 0; s < 2; ++s)
++    {
++        if (!sh[s])
++            continue;
++        std::vector<uint32_t> spirv;
++        glslang::SpvOptions so;
++        so.disableOptimizer = true;
++        glslang::GlslangToSpv(*prog.getIntermediate(kStages[s]), spirv, &so);
++        if (!Reflect(p, s, std::move(spirv), p.log))
++            return false;
++    }
++    (void)id;
++    return true;
++}
++
++Program* Get(GLuint program)
++{
++    const auto it = g_programs.find(program);
++    return it == g_programs.end() ? nullptr : &it->second;
++}
++
++// Запись значений uniform в теневые блоки стадий.
++// cols×rows — размер одного элемента (вектор: cols=1), count — элементов массива.
++void Write(GLuint program, GLint location, GLsizei count, const void* data, unsigned cols, unsigned rows,
++    bool transpose)
++{
++    Program* p = Get(program);
++    if (!p || location < 0 || !data)
++        return;
++    const size_t index = size_t(location) >> 8, first = size_t(location) & 0xff;
++    if (index >= p->uniforms.size())
++        return;
++    Uniform& u = p->uniforms[index];
++    if (u.isSampler)
++    {
++        u.samplerUnit = *static_cast<const GLint*>(data);
++        return;
++    }
++    const auto* src = static_cast<const uint32_t*>(data);
++    const unsigned elemWords = cols * rows;
++    for (int s = 0; s < 2; ++s)
++    {
++        const UniformSlot& sl = u.slot[s];
++        if (!sl.present || p->block[s].empty())
++            continue;
++        uint8_t* base = p->block[s].data();
++        const size_t blockSize = p->block[s].size();
++        for (GLsizei e = 0; e < count && first + e < size_t(u.arraySize); ++e)
++        {
++            const uint32_t* el = src + size_t(e) * elemWords;
++            const size_t elOff = sl.offset + (first + e) * sl.arrayStride;
++            for (unsigned c = 0; c < cols; ++c)
++            {
++                const size_t colOff = elOff + c * (cols > 1 ? sl.matrixStride : 0);
++                if (colOff + rows * 4 > blockSize)
++                    break;
++                auto* dst = reinterpret_cast<uint32_t*>(base + colOff);
++                for (unsigned r = 0; r < rows; ++r)
++                {
++                    // GL: без transpose данные по столбцам, с transpose — по строкам
++                    uint32_t v = transpose ? el[r * cols + c] : el[c * rows + r];
++                    if (sl.isBool)
++                        v = v != 0;
++                    dst[r] = v;
++                }
++            }
++        }
++    }
++}
++} // namespace
++
++// --- объекты шейдеров ---------------------------------------------------------
++void CreateShader(GLuint id, GLenum type) { g_shaders[id] = Shader{ type, {} }; }
++
++void ShaderSource(GLuint id, GLsizei count, const GLchar* const* strings, const GLint* lengths)
++{
++    std::string& s = g_shaders[id].source;
++    s.clear();
++    for (GLsizei i = 0; i < count; ++i)
++    {
++        if (!strings[i])
++            continue;
++        if (lengths && lengths[i] >= 0)
++            s.append(strings[i], size_t(lengths[i]));
++        else
++            s.append(strings[i]);
++    }
++}
++
++void DeleteShader(GLuint id) { g_shaders.erase(id); }
++
++// --- программы ----------------------------------------------------------------
++void CreateProgram(GLuint id) { g_programs[id] = Program{}; }
++void DeleteProgram(GLuint id) { g_programs.erase(id); }
++
++void AttachShader(GLuint program, GLuint shader)
++{
++    if (Program* p = Get(program))
++        p->attached.push_back(shader);
++}
++
++void DetachShader(GLuint program, GLuint shader)
++{
++    if (Program* p = Get(program))
++        for (auto it = p->attached.begin(); it != p->attached.end(); ++it)
++            if (*it == shader)
++            {
++                p->attached.erase(it);
++                break;
++            }
++}
++
++void LinkProgram(GLuint id)
++{
++    Program* p = Get(id);
++    if (!p)
++        return;
++    const auto t0 = std::chrono::steady_clock::now();
++    p->linked = Link(id, *p);
++    g_stats.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++    if (p->linked)
++        ++g_stats.ok;
++    else
++    {
++        ++g_stats.failed;
++        if (g_stats.failed <= 20)
++        {
++            printf("! [iOSRay] Metal: шейдер не собран (%u):\n%s", id, p->log.c_str());
++            fflush(stdout);
++        }
++    }
++    if (((g_stats.ok + g_stats.failed) % 100) == 0)
++    {
++        printf("* [iOSRay] Metal: шейдеров %u (ошибок %u), %.1f с\n", g_stats.ok + g_stats.failed, g_stats.failed,
++            g_stats.seconds);
++        fflush(stdout);
++    }
++}
++
++void UseProgram(GLuint id) { g_current = id; }
++GLuint CurrentProgram() { return g_current; }
++const Program* FindProgram(GLuint id) { return Get(id); }
++
++void GetProgramiv(GLuint id, GLenum pname, GLint* v)
++{
++    const Program* p = Get(id);
++    switch (pname)
++    {
++    case GL_LINK_STATUS: *v = p && p->linked; return;
++    case GL_VALIDATE_STATUS: *v = GL_TRUE; return;
++    case GL_DELETE_STATUS: *v = GL_FALSE; return;
++    case GL_INFO_LOG_LENGTH: *v = p ? GLint(p->log.size() + 1) : 0; return;
++    case GL_ATTACHED_SHADERS: *v = p ? GLint(p->attached.size()) : 0; return;
++    case GL_ACTIVE_UNIFORMS: *v = p ? GLint(p->uniforms.size()) : 0; return;
++    case GL_ACTIVE_UNIFORM_MAX_LENGTH:
++    {
++        GLint m = 0;
++        if (p)
++            for (const Uniform& u : p->uniforms)
++                m = std::max<GLint>(m, GLint(u.name.size() + 4)); // + "[0]" + '\0'
++        *v = m;
++        return;
++    }
++    default: *v = 0; return;
++    }
++}
++
++void GetProgramInfoLog(GLuint id, GLsizei bufSize, GLsizei* length, GLchar* log)
++{
++    const Program* p = Get(id);
++    const std::string s = p ? p->log : std::string();
++    const GLsizei n = bufSize > 0 ? std::min<GLsizei>(bufSize - 1, GLsizei(s.size())) : 0;
++    if (log && bufSize > 0)
++    {
++        memcpy(log, s.data(), size_t(n));
++        log[n] = 0;
++    }
++    if (length)
++        *length = n;
++}
++
++void GetActiveUniform(GLuint id, GLuint index, GLsizei bufSize, GLsizei* length, GLint* size, GLenum* type,
++    GLchar* name)
++{
++    const Program* p = Get(id);
++    if (!p || index >= p->uniforms.size())
++        return;
++    const Uniform& u = p->uniforms[index];
++    std::string n = u.name;
++    if (u.arraySize > 1)
++        n += "[0]";
++    const GLsizei len = bufSize > 0 ? std::min<GLsizei>(bufSize - 1, GLsizei(n.size())) : 0;
++    if (name && bufSize > 0)
++    {
++        memcpy(name, n.data(), size_t(len));
++        name[len] = 0;
++    }
++    if (length)
++        *length = len;
++    if (size)
++        *size = u.arraySize;
++    if (type)
++        *type = u.glType;
++}
++
++GLint GetUniformLocation(GLuint id, const GLchar* name)
++{
++    const Program* p = Get(id);
++    if (!p || !name)
++        return -1;
++    std::string n = name;
++    GLint element = 0;
++    const size_t br = n.find('[');
++    if (br != std::string::npos)
++    {
++        element = GLint(atoi(n.c_str() + br + 1));
++        n.resize(br);
++    }
++    for (size_t i = 0; i < p->uniforms.size(); ++i)
++        if (p->uniforms[i].name == n)
++            return GLint(i << 8) | (element & 0xff);
++    return -1;
++}
++
++void SetUniform(GLuint program, GLint location, GLsizei count, const void* data, unsigned cols, unsigned rows,
++    bool transpose)
++{
++    Write(program ? program : g_current, location, count, data, cols, rows, transpose);
++}
++} // namespace xr_mtl
+diff --git a/src/Layers/xrRenderGL/mtl/glmtl_shaders.h b/src/Layers/xrRenderGL/mtl/glmtl_shaders.h
+new file mode 100644
+index 00000000..cffd05f9
+--- /dev/null
++++ b/src/Layers/xrRenderGL/mtl/glmtl_shaders.h
+@@ -0,0 +1,68 @@
++// iOSRay: Metal-режим — шейдеры GLSL → SPIR-V → MSL и их рефлексия.
++#pragma once
++
++#include <glad/gl.h>
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace xr_mtl
++{
++struct Shader
++{
++    GLenum type;
++    std::string source;
++};
++
++struct UniformSlot // где uniform лежит в конкретной стадии (0 — VS, 1 — PS)
++{
++    bool present = false;
++    bool isBool = false;
++    uint32_t offset = 0, arrayStride = 0, matrixStride = 0;
++    uint32_t textureIndex = 0; // для сэмплеров: слот текстуры Metal
++};
++
++struct Uniform
++{
++    std::string name;
++    GLenum glType = GL_FLOAT_VEC4;
++    GLint arraySize = 1;
++    bool isSampler = false;
++    GLint samplerUnit = 0; // значение, выставленное движком через glUniform1i
++    UniformSlot slot[2];
++};
++
++struct Program
++{
++    std::vector<GLuint> attached;
++    bool linked = false;
++    std::string log;
++    std::string msl[2];
++    std::vector<uint8_t> block[2]; // теневой gl_DefaultUniformBlock стадии
++    uint32_t blockBinding[2] = { 0, 0 };
++    std::vector<Uniform> uniforms;
++};
++
++void CreateShader(GLuint id, GLenum type);
++void ShaderSource(GLuint id, GLsizei count, const GLchar* const* strings, const GLint* lengths);
++void DeleteShader(GLuint id);
++
++void CreateProgram(GLuint id);
++void DeleteProgram(GLuint id);
++void AttachShader(GLuint program, GLuint shader);
++void DetachShader(GLuint program, GLuint shader);
++void LinkProgram(GLuint id);
++void UseProgram(GLuint id);
++GLuint CurrentProgram();
++const Program* FindProgram(GLuint id);
++
++void GetProgramiv(GLuint id, GLenum pname, GLint* v);
++void GetProgramInfoLog(GLuint id, GLsizei bufSize, GLsizei* length, GLchar* log);
++void GetActiveUniform(GLuint id, GLuint index, GLsizei bufSize, GLsizei* length, GLint* size, GLenum* type,
++    GLchar* name);
++GLint GetUniformLocation(GLuint id, const GLchar* name);
++// program == 0 — текущая программа (glUniform*), иначе glProgramUniform*
++void SetUniform(GLuint program, GLint location, GLsizei count, const void* data, unsigned cols, unsigned rows,
++    bool transpose);
++} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderPC_GL/CMakeLists.txt b/src/Layers/xrRenderPC_GL/CMakeLists.txt
-index 9018d8bb..08a78f0e 100644
+index 9018d8bb..65f255bd 100644
 --- a/src/Layers/xrRenderPC_GL/CMakeLists.txt
 +++ b/src/Layers/xrRenderPC_GL/CMakeLists.txt
-@@ -423,6 +423,25 @@ target_compile_definitions(xrRender_GL
+@@ -423,6 +423,38 @@ target_compile_definitions(xrRender_GL
      PURE_DYNAMIC_CAST
  )
  
@@ -2057,6 +2723,19 @@ index 9018d8bb..08a78f0e 100644
 +        SKIP_PRECOMPILE_HEADERS ON
 +        SKIP_UNITY_BUILD_INCLUSION ON)
 +    target_link_libraries(xrRender_GL PRIVATE "-framework Metal" "-framework QuartzCore")
++    # Этап 4: GLSL → SPIR-V (glslang) → MSL + рефлексия (SPIRV-Cross) прямо на устройстве
++    target_sources(xrRender_GL PRIVATE ../xrRenderGL/mtl/glmtl_shaders.cpp)
++    set_source_files_properties(../xrRenderGL/mtl/glmtl_shaders.cpp PROPERTIES
++        COMPILE_OPTIONS "-fexceptions"
++        SKIP_PRECOMPILE_HEADERS ON
++        SKIP_UNITY_BUILD_INCLUSION ON)
++    find_path(XR_GLSLANG_INCLUDE_DIR glslang/Public/ShaderLang.h REQUIRED)
++    target_include_directories(xrRender_GL PRIVATE "${XR_GLSLANG_INCLUDE_DIR}")
++    foreach(lib glslang-default-resource-limits SPIRV glslang MachineIndependent GenericCodeGen OSDependent
++                spirv-cross-msl spirv-cross-glsl spirv-cross-core)
++        find_library(XR_LIB_${lib} NAMES ${lib} REQUIRED)
++        target_link_libraries(xrRender_GL PRIVATE "${XR_LIB_${lib}}")
++    endforeach()
 +endif()
 +
  set_target_properties(xrRender_GL PROPERTIES
