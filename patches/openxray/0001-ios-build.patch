@@ -319,18 +319,74 @@ index 0f6315b6..01085c78 100644
          rows.resize(count * 3);
          for (u32 mid = 0; mid < count; mid++)
 diff --git a/src/Layers/xrRender/dxImGuiRender.cpp b/src/Layers/xrRender/dxImGuiRender.cpp
-index 66af8444..acdb812c 100644
+index 66af8444..6b094530 100644
 --- a/src/Layers/xrRender/dxImGuiRender.cpp
 +++ b/src/Layers/xrRender/dxImGuiRender.cpp
-@@ -53,7 +53,7 @@ void dxImGuiRender::Frame()
+@@ -10,6 +10,16 @@
+ 
+ namespace xray::render::RENDER_NAMESPACE
+ {
++#if defined(USE_OGL) && defined(XR_GL_ES) && defined(__APPLE__)
++// iOSRay: в Metal-режиме GL-контекста нет, а бэкенд ImGui ходит в системный
++// OpenGL ES напрямую (мимо glad) — glGetString вернёт NULL и всё упадёт.
++// Отладочный ImGui там просто выключаем.
++static bool ImGuiOff() { return strstr(Core.Params, "-xr_metal") != nullptr; }
++#define XR_IMGUI_GUARD() if (ImGuiOff()) return
++#else
++#define XR_IMGUI_GUARD() (void)0
++#endif
++
+ void dxImGuiRender::Copy(IImGuiRender& _in)
+ {
+     *this = *dynamic_cast<dxImGuiRender*>(&_in);
+@@ -44,6 +54,7 @@ void dxImGuiRender::SetState(ImDrawData* data)
+ 
+ void dxImGuiRender::Frame()
+ {
++    XR_IMGUI_GUARD();
+ #if defined(USE_DX11)
+     ImGui_ImplDX11_NewFrame();
+ #elif defined(USE_OGL)
+@@ -53,7 +64,8 @@ void dxImGuiRender::Frame()
  
  void dxImGuiRender::Render(ImDrawData* data)
  {
 -#ifdef XR_PLATFORM_WEB
++    XR_IMGUI_GUARD();
 +#ifdef XR_GL_ES
      if (data->CmdListsCount == 0)
          return;
  #endif
+@@ -85,11 +97,13 @@ void dxImGuiRender::OnDeviceCreate(ImGuiContext* context)
+ #if defined(USE_DX11)
+     ImGui_ImplDX11_Init(HW.pDevice, HW.get_context(CHW::IMM_CTX_ID));
+ #elif defined(USE_OGL)
++    XR_IMGUI_GUARD();
+     ImGui_ImplOpenGL3_Init();
+ #endif
+ }
+ void dxImGuiRender::OnDeviceDestroy()
+ {
++    XR_IMGUI_GUARD();
+ #if defined(USE_DX11)
+     ImGui_ImplDX11_Shutdown();
+ #elif defined(USE_OGL)
+@@ -99,6 +113,7 @@ void dxImGuiRender::OnDeviceDestroy()
+ 
+ void dxImGuiRender::OnDeviceResetBegin()
+ {
++    XR_IMGUI_GUARD();
+ #if defined(USE_DX11)
+     ImGui_ImplDX11_InvalidateDeviceObjects();
+ #elif defined(USE_OGL)
+@@ -108,6 +123,7 @@ void dxImGuiRender::OnDeviceResetBegin()
+ 
+ void dxImGuiRender::OnDeviceResetEnd()
+ {
++    XR_IMGUI_GUARD();
+ #if defined(USE_DX11)
+     ImGui_ImplDX11_CreateDeviceObjects();
+ #elif defined(USE_OGL)
 diff --git a/src/Layers/xrRender/r__occlusion.cpp b/src/Layers/xrRender/r__occlusion.cpp
 index 30681103..7d83cec9 100644
 --- a/src/Layers/xrRender/r__occlusion.cpp
