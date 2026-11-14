@@ -20,6 +20,7 @@ for f in "$SRC"/*.metal; do
     rm -f "$TMP/$n.air"
   fi
 done
+mkdir -p "$(dirname "$OUT")"
 xcrun -sdk iphoneos metallib "$TMP"/*.air -o "$OUT"
 echo "metallib: $ok шейдеров собрано, $fail с ошибками → $OUT ($(du -h "$OUT" | cut -f1))"
 rm -rf "$TMP"
