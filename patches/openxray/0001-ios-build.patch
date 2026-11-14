@@ -1427,7 +1427,7 @@ index 6734e1d6..c3ce2fc6 100644
  #endif
  
 diff --git a/src/Layers/xrRenderPC_GL/rgl_shaders.cpp b/src/Layers/xrRenderPC_GL/rgl_shaders.cpp
-index ceb4d5ab..ff925b70 100644
+index ceb4d5ab..b6f0f288 100644
 --- a/src/Layers/xrRenderPC_GL/rgl_shaders.cpp
 +++ b/src/Layers/xrRenderPC_GL/rgl_shaders.cpp
 @@ -1,5 +1,5 @@
@@ -1446,7 +1446,19 @@ index ceb4d5ab..ff925b70 100644
      options.add("#version 300 es");
  #else
      options.add("#version 410");
-@@ -419,7 +419,7 @@ HRESULT CRender::shader_compile(pcstr name, IReader* fs, pcstr pFunctionName,
+@@ -407,7 +407,11 @@ HRESULT CRender::shader_compile(pcstr name, IReader* fs, pcstr pFunctionName,
+         sh_name.append(ps_r_sun_quality);
+     }
+     else
++    {
++        // GLSL ES не считает неопределённый макрос нулём в #if (… || SUN_QUALITY==2)
++        options.add("SUN_QUALITY", "0");
+         sh_name.append(static_cast<u32>(0));
++    }
+ 
+     // Steep parallax
+     {
+@@ -419,7 +423,7 @@ HRESULT CRender::shader_compile(pcstr name, IReader* fs, pcstr pFunctionName,
      appendShaderOption(o.gbuffer_opt, "GBUFFER_OPTIMIZATION", "1");
  
      // Shader Model 4.1
@@ -1455,7 +1467,7 @@ index ceb4d5ab..ff925b70 100644
      appendShaderOption(o.dx11_sm4_1, "SM_4_1", "1");
      // Despite the fact that glsl 4.1 is claimed to be supported on macOS,
      // the issue is that gatherTextureOffset requires compile-time constant offset argument.
-@@ -559,7 +559,7 @@ HRESULT CRender::shader_compile(pcstr name, IReader* fs, pcstr pFunctionName,
+@@ -559,7 +563,7 @@ HRESULT CRender::shader_compile(pcstr name, IReader* fs, pcstr pFunctionName,
          sources.compile(fs, options);
  
          // Compile the shader from sources
@@ -1773,6 +1785,33 @@ index 7de3d55a..2181079e 100644
      _attach_child(pWnd, parent);
      return pWnd;
  }
+diff --git a/src/xrGame/ai/monsters/dog/dog.cpp b/src/xrGame/ai/monsters/dog/dog.cpp
+index f69d70fc..eb2d8e1c 100644
+--- a/src/xrGame/ai/monsters/dog/dog.cpp
++++ b/src/xrGame/ai/monsters/dog/dog.cpp
+@@ -275,9 +275,21 @@ void CAI_Dog::start_animation()
+         return;
+     }
+ 
++    // У моделей собак ТЧ нет части анимаций ЧН/ЗП (stand_idle_smelling_up_0 и др.) —
++    // вместо фатальной ошибки просто пропускаем «особую» анимацию.
++    IKinematicsAnimated* ka = smart_cast<IKinematicsAnimated*>(Visual());
++    const MotionID motion = ka->ID_Cycle_Safe(get_current_animation());
++    if (!motion.valid())
++    {
++        b_state_anim = false;
++        b_anim_end = true;
++        b_state_end = false;
++        return;
++    }
++
+     b_state_anim = true;
+     com_man().script_capture(ControlCom::eControlAnimation);
+-    smart_cast<IKinematicsAnimated*>(Visual())->PlayCycle(get_current_animation(), TRUE, animation_end, this);
++    ka->PlayCycle(motion, TRUE, animation_end, this);
+     b_state_end = true;
+ }
+ 
 diff --git a/src/xrGame/login_manager.cpp b/src/xrGame/login_manager.cpp
 index 3eb004d9..5f34ac1e 100644
 --- a/src/xrGame/login_manager.cpp
