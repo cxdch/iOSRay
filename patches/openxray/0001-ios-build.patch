@@ -2165,10 +2165,10 @@ index 82d7da5d..0fd1fa17 100644
  #endif
 diff --git a/src/xr_3da/ios_bootstrap.mm b/src/xr_3da/ios_bootstrap.mm
 new file mode 100644
-index 00000000..072c8893
+index 00000000..1b2f3b33
 --- /dev/null
 +++ b/src/xr_3da/ios_bootstrap.mm
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,156 @@
 +// iOSRay: подготовка окружения движка на iOS перед entry_point().
 +//
 +// Что делает:
@@ -2318,6 +2318,9 @@ index 00000000..072c8893
 +        chdir(gameDir.fileSystemRepresentation);
 +        xr_ios_touch_start(); // экранное управление появится, когда SDL создаст окно
 +        extraArgs = chosen->args;
++        // Запросы видимости (occlusion queries) роняют GL-драйвер iOS (gldModifyQuery,
++        // SIGBUS в R_occlusion::occq_begin). Отключаем — свет и тени считаются видимыми.
++        extraArgs += " -no_occq ";
 +        fflush(stdout);
 +    }
 +    return extraArgs.c_str();
