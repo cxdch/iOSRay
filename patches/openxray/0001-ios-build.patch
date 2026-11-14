@@ -899,7 +899,7 @@ index 7625fcb3..d751ea19 100644
              pp.constants.parse(&pp.pp, RC_dest_all);
  #else
 diff --git a/src/Layers/xrRenderGL/glSH_RT.cpp b/src/Layers/xrRenderGL/glSH_RT.cpp
-index f34a2fdb..d32231f8 100644
+index f34a2fdb..aba9afa5 100644
 --- a/src/Layers/xrRenderGL/glSH_RT.cpp
 +++ b/src/Layers/xrRenderGL/glSH_RT.cpp
 @@ -33,7 +33,7 @@ void CRT::create(LPCSTR Name, u32 w, u32 h, D3DFORMAT f, u32 SampleCount /*= 1*/
@@ -911,7 +911,65 @@ index f34a2fdb..d32231f8 100644
      // https://developer.apple.com/library/archive/documentation/GraphicsImaging/Conceptual/OpenGL-MacProgGuide/opengl_offscreen/opengl_offscreen.html
      CHK_GL(glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_width));
      max_height = max_width;
-@@ -90,7 +90,7 @@ void CRT::reset_end()
+@@ -59,6 +59,57 @@ void CRT::create(LPCSTR Name, u32 w, u32 h, D3DFORMAT f, u32 SampleCount /*= 1*/
+     else
+         CHK_GL(glTexStorage2D(GL_TEXTURE_2D, 1, glTextureUtils::ConvertTextureFormat(fmt), w, h));
+ 
++#ifdef XR_GL_ES
++    {
++        // iOS (ES 3.0): рендерить можно не во все форматы. Проверяем цель сразу;
++        // 32-битные float-цели, если не поддерживаются, заменяем на 16-битные.
++        const auto check = [&](GLenum glFmt, GLenum& texErr) -> GLenum
++        {
++            texErr = glGetError();
++            GLint prevFB = 0;
++            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFB);
++            GLuint fb = 0;
++            glGenFramebuffers(1, &fb);
++            glBindFramebuffer(GL_FRAMEBUFFER, fb);
++            const bool depth = glFmt == GL_DEPTH_COMPONENT16 || glFmt == GL_DEPTH_COMPONENT24
++                || glFmt == GL_DEPTH_COMPONENT32F || glFmt == GL_DEPTH24_STENCIL8 || glFmt == GL_DEPTH32F_STENCIL8;
++            const bool stencil = glFmt == GL_DEPTH24_STENCIL8 || glFmt == GL_DEPTH32F_STENCIL8;
++            glFramebufferTexture2D(GL_FRAMEBUFFER,
++                depth ? (stencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT) : GL_COLOR_ATTACHMENT0, target, pRT, 0);
++            const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++            glBindFramebuffer(GL_FRAMEBUFFER, prevFB);
++            glDeleteFramebuffers(1, &fb);
++            return status;
++        };
++        GLenum glFmt = glTextureUtils::ConvertTextureFormat(fmt);
++        GLenum texErr;
++        GLenum status = check(glFmt, texErr);
++        if (status != GL_FRAMEBUFFER_COMPLETE && SampleCount <= 1)
++        {
++            GLenum alt = GL_NONE;
++            switch (glFmt)
++            {
++            case GL_RGBA32F: alt = GL_RGBA16F; break;
++            case GL_RG32F: alt = GL_RG16F; break;
++            case GL_R32F: alt = GL_R16F; break;
++            default: break;
++            }
++            if (alt != GL_NONE)
++            {
++                Msg("! [iOSRay] RT %s: формат 0x%x не рендерится (0x%x), беру 0x%x", Name, glFmt, status, alt);
++                glDeleteTextures(1, &pRT);
++                glGenTextures(1, &pRT);
++                glBindTexture(target, pRT);
++                glTexStorage2D(GL_TEXTURE_2D, 1, alt, w, h);
++                glFmt = alt;
++                status = check(glFmt, texErr);
++            }
++        }
++        Msg("%s [iOSRay] RT %-24s %4ux%-4u d3dfmt=%u gl=0x%x tex=0x%x fbo=0x%x",
++            (texErr == GL_NO_ERROR && status == GL_FRAMEBUFFER_COMPLETE) ? "*" : "!", Name, w, h, u32(fmt), glFmt,
++            texErr, status);
++    }
++#endif
+     pTexture = RImplementation.Resources->_CreateTexture(Name);
+     pTexture->surface_set(target, pRT);
+     pTexture->size_set(w, h);
+@@ -90,7 +141,7 @@ void CRT::reset_end()
  void CRT::resolve_into(CRT& destination) const
  {
      glReadBuffer(GL_COLOR_ATTACHMENT0);
@@ -920,7 +978,7 @@ index f34a2fdb..d32231f8 100644
      glDrawBuffer(GL_COLOR_ATTACHMENT1);
  #endif
  
-@@ -98,7 +98,7 @@ void CRT::resolve_into(CRT& destination) const
+@@ -98,7 +149,7 @@ void CRT::resolve_into(CRT& destination) const
      RCache.set_RT(pRT, 0);
      RCache.set_RT(destination.pRT, 1);
  
@@ -929,7 +987,7 @@ index f34a2fdb..d32231f8 100644
      VERIFY(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
  #else
      [[maybe_unused]] GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-@@ -110,7 +110,7 @@ void CRT::resolve_into(CRT& destination) const
+@@ -110,7 +161,7 @@ void CRT::resolve_into(CRT& destination) const
          GL_COLOR_BUFFER_BIT, GL_NEAREST));
  }
  
@@ -1479,7 +1537,7 @@ index add453d0..c5d5c4b2 100644
  
      nNumChars = 0x100;
 diff --git a/src/xrEngine/defines.cpp b/src/xrEngine/defines.cpp
-index 6bb1d98e..d15c94de 100644
+index 6bb1d98e..a5227031 100644
 --- a/src/xrEngine/defines.cpp
 +++ b/src/xrEngine/defines.cpp
 @@ -1,4 +1,7 @@
@@ -1490,7 +1548,13 @@ index 6bb1d98e..d15c94de 100644
  
  #ifdef DEBUG
  ECORE_API bool bDebug = false;
-@@ -23,4 +26,8 @@ Flags32 psDeviceFlags =
+@@ -20,7 +23,14 @@ DeviceMode psDeviceMode =
+ Flags32 psDeviceFlags =
+ {
+    rsDrawStatic | rsDrawDynamic | rsDrawDetails | rsDrawParticles | mtSound | mtNetwork
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++   | rsShowFPS // iOS: счётчик кадров на время отладки
++#endif
  };
  
  // textures
@@ -1499,6 +1563,33 @@ index 6bb1d98e..d15c94de 100644
 +#else
  int psTextureLOD = 1;
 +#endif
+diff --git a/src/xrEngine/device.cpp b/src/xrEngine/device.cpp
+index 01a427c0..1c00302c 100644
+--- a/src/xrEngine/device.cpp
++++ b/src/xrEngine/device.cpp
+@@ -1,4 +1,7 @@
+ #include "stdafx.h"
++#ifdef __APPLE__
++#include <TargetConditionals.h>
++#endif
+ 
+ #include "Render.h"
+ 
+@@ -23,8 +26,14 @@ ENGINE_API bool g_bRendering = false;
+ ENGINE_API bool g_bBenchmark = false;
+ string512 g_sBenchmarkName;
+ 
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++// iOS: телефон не должен греться без толку — 30 кадров в игре и в меню
++int ps_fps_limit = 30;
++int ps_fps_limit_in_menu = 30;
++#else
+ int ps_fps_limit = 501;
+ int ps_fps_limit_in_menu = 60;
++#endif
+ 
+ bool g_bLoaded = false;
+ ref_light precache_light = 0;
 diff --git a/src/xrGame/MainMenu.cpp b/src/xrGame/MainMenu.cpp
 index 22028756..5dbab994 100644
 --- a/src/xrGame/MainMenu.cpp
@@ -1549,7 +1640,7 @@ index 3eb004d9..5f34ac1e 100644
  }
  
 diff --git a/src/xrGame/ui/UIGameTutorial.cpp b/src/xrGame/ui/UIGameTutorial.cpp
-index 091259f8..3cadc6eb 100644
+index 091259f8..2e590cac 100644
 --- a/src/xrGame/ui/UIGameTutorial.cpp
 +++ b/src/xrGame/ui/UIGameTutorial.cpp
 @@ -13,6 +13,9 @@
@@ -1562,13 +1653,14 @@ index 091259f8..3cadc6eb 100644
  
  extern ENGINE_API bool bShowPauseString;
  
-@@ -362,6 +365,14 @@ bool CUISequencer::GrabInput()
+@@ -362,6 +365,15 @@ bool CUISequencer::GrabInput()
  
  void CUISequencer::IR_OnMousePress(int btn)
  {
 +#if defined(__APPLE__) && TARGET_OS_IPHONE
-+    // iOS: тап по экрану пропускает заставочные ролики, как Esc на ПК
-+    if (!m_sequencer_items.empty() && smart_cast<CUISequenceVideoItem*>(m_sequencer_items.front()))
++    // iOS: тап по экрану пропускает заставки (ролики и картинки intro_*), как Esc на ПК
++    if (!m_sequencer_items.empty() && (smart_cast<CUISequenceVideoItem*>(m_sequencer_items.front())
++            || (m_name && 0 == strncmp(m_name, "intro_", 6))))
 +    {
 +        Stop();
 +        return;
@@ -1604,7 +1696,7 @@ index 2ea56a22..e38f6b61 100644
 +    )
 +endif()
 diff --git a/src/xr_3da/entry_point.cpp b/src/xr_3da/entry_point.cpp
-index 82d7da5d..1f1a7834 100644
+index 82d7da5d..0fd1fa17 100644
 --- a/src/xr_3da/entry_point.cpp
 +++ b/src/xr_3da/entry_point.cpp
 @@ -4,6 +4,16 @@
@@ -1647,6 +1739,19 @@ index 82d7da5d..1f1a7834 100644
  
              for(i = 1; i < argc; ++i)
              {
+@@ -126,6 +142,12 @@ int main(int argc, char *argv[])
+     // this executes if f() throws std::string or int or any other unrelated type
+     }
+ 
++#if defined(__APPLE__) && TARGET_OS_IOS
++    // На iOS возврат из SDL_main оставляет приложение висеть с чёрным экраном — закрываемся сами
++    fflush(stdout);
++    fflush(stderr);
++    exit(result);
++#endif
+     return result;
+ }
+ #endif
 diff --git a/src/xr_3da/ios_bootstrap.mm b/src/xr_3da/ios_bootstrap.mm
 new file mode 100644
 index 00000000..8a0bc01d
