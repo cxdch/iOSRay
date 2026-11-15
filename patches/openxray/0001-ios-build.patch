@@ -1737,10 +1737,10 @@ index 60fe082f..1d330873 100644
          glReadPixels(0, 0, Device.dwWidth, Device.dwHeight, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl.mm b/src/Layers/xrRenderGL/mtl/glmtl.mm
 new file mode 100644
-index 00000000..c69eabc7
+index 00000000..426686fd
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl.mm
-@@ -0,0 +1,537 @@
+@@ -0,0 +1,550 @@
 +// iOSRay: Metal-режим рендера.
 +//
 +// Рендер OpenXRay продолжает вызывать функции OpenGL ES (через указатели glad),
@@ -2245,6 +2245,19 @@ index 00000000..c69eabc7
 +}
 +
 +void BufferPoolTick(unsigned frame) { g_pool.Tick(frame); }
++
++void BufferStats(size_t& count, size_t& bytes, size_t& poolBytes)
++{
++    count = g.buffers.size();
++    bytes = 0;
++    for (const auto& [name, b] : g.buffers)
++        bytes += b.mtl ? b.mtl.length : 0;
++    poolBytes = 0;
++    for (const auto& [cls, list] : g_pool.free)
++        poolBytes += cls * list.size();
++    for (const auto& r : g_pool.retired)
++        poolBytes += r.buf.length;
++}
 +} // namespace xr_mtl
 +
 +extern "C" bool xr_mtl_init(void* metalLayer)
@@ -2280,10 +2293,10 @@ index 00000000..c69eabc7
 +extern "C" void xr_mtl_present() { xr_mtl::RenderPresent(); }
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_internal.h b/src/Layers/xrRenderGL/mtl/glmtl_internal.h
 new file mode 100644
-index 00000000..e1f4ad7e
+index 00000000..df101218
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_internal.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,39 @@
 +// iOSRay: Metal-режим — общее между glmtl.mm (база, буферы, шейдеры) и
 +// glmtl_render.mm (текстуры, кадровые буферы, состояние, рисование).
 +#pragma once
@@ -2306,7 +2319,8 @@ index 00000000..e1f4ad7e
 +
 +// glmtl.mm: буферные объекты GL → MTLBuffer
 +id<MTLBuffer> BufferObject(GLuint name);
-+void BufferPoolTick(unsigned frame); // начало кадра: вернуть в оборот дочитанные GPU буферы
++void BufferPoolTick(unsigned frame);
++void BufferStats(size_t& count, size_t& bytes, size_t& poolBytes); // для лога // начало кадра: вернуть в оборот дочитанные GPU буферы
 +
 +// glmtl_render.mm
 +struct ProcEntry
@@ -2324,10 +2338,10 @@ index 00000000..e1f4ad7e
 +} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_render.mm b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
 new file mode 100644
-index 00000000..446fcdfa
+index 00000000..14fafde4
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
-@@ -0,0 +1,2177 @@
+@@ -0,0 +1,2252 @@
 +// iOSRay: Metal-режим, этап 4b — рисование.
 +//
 +// Здесь GL-вызовы движка превращаются в работу Metal:
@@ -2439,6 +2453,10 @@ index 00000000..446fcdfa
 +    int w = 0, h = 0, d = 1, levels = 1;
 +    id<MTLTexture> mtl = nil;
 +    SamplerParams params;
++    // свойства MTLTexture, закэшированные, чтобы не слать сообщения ObjC на каждом рисовании
++    bool depth = false;
++    MTLTextureType type = MTLTextureType2D;
++    int mipCount = 1;
 +};
 +
 +struct Fbo
@@ -2784,6 +2802,9 @@ index 00000000..446fcdfa
 +    t.d = d;
 +    t.levels = levels;
 +    t.mtl = MakeTexture(TypeOf(target), t.format, w, h, d, levels);
++    t.depth = IsDepth(t.format);
++    t.type = TypeOf(target);
++    t.mipCount = std::max(1, int(levels));
 +    if (!t.mtl)
 +        LogOnce("tex" + std::to_string(w) + "x" + std::to_string(h) + "f" + std::to_string(internal),
 +            "! [iOSRay] Metal: не создать текстуру %dx%dx%d формат 0x%x\n", w, h, d, internal);
@@ -3076,12 +3097,32 @@ index 00000000..446fcdfa
 +    }
 +}
 +
++id<MTLSamplerState> SamplerStateOfSlow(const SamplerParams& key);
++
++// Небольшой кэш последних обращений (подряд идут одни и те же сэмплеры)
 +id<MTLSamplerState> SamplerStateOf(const SamplerParams& p, int textureLevels)
 +{
 +    SamplerParams key = p;
 +    // без мипов выборка из мипов бессмысленна (и в GL такая текстура «неполная»)
 +    if (textureLevels <= 1)
 +        key.maxLevel = 0;
++    struct Memo
++    {
++        SamplerParams key;
++        id<MTLSamplerState> state;
++    };
++    static Memo memo[8];
++    static unsigned next = 0;
++    for (const Memo& m : memo)
++        if (m.state && m.key == key)
++            return m.state;
++    id<MTLSamplerState> st = SamplerStateOfSlow(key);
++    memo[next++ & 7] = { key, st };
++    return st;
++}
++
++id<MTLSamplerState> SamplerStateOfSlow(const SamplerParams& key)
++{
 +    const auto it = s.samplerStates.find(key);
 +    if (it != s.samplerStates.end())
 +        return it->second;
@@ -3110,6 +3151,8 @@ index 00000000..446fcdfa
 +    s.samplerStates[key] = st;
 +    return st;
 +}
++
++const SamplerParams kDefaultSampler{};
 +
 +// --- кадровые буферы и рендербуферы -------------------------------------------------
 +void gl_BindFramebuffer(GLenum target, GLuint fb)
@@ -3197,6 +3240,14 @@ index 00000000..446fcdfa
 +std::mutex g_statsMutex;
 +
 +double NowMs() { return CACurrentMediaTime() * 1000.0; }
++
++// Время CPU внутри слоя Metal на вызовах рисования (за период лога)
++double g_shimMs = 0;
++struct ShimTimer
++{
++    double t0 = NowMs();
++    ~ShimTimer() { g_shimMs += NowMs() - t0; }
++};
 +
 +void BeginFrameIfNeeded()
 +{
@@ -3477,28 +3528,45 @@ index 00000000..446fcdfa
 +// --- VAO ----------------------------------------------------------------------------
 +GLuint g_arrayBuffer = 0;
 +
-+void gl_BindVertexArray(GLuint vao) { s.vao = vao; }
++Vao* g_curVao = nullptr; // текущий VAO (элементы unordered_map не переезжают)
++Vao& CurVao()
++{
++    if (!g_curVao)
++        g_curVao = &s.vaos[s.vao];
++    return *g_curVao;
++}
++
++void gl_BindVertexArray(GLuint vao)
++{
++    if (vao != s.vao)
++        g_curVao = nullptr;
++    s.vao = vao;
++}
 +void gl_DeleteVertexArrays(GLsizei n, const GLuint* ids)
 +{
 +    for (GLsizei i = 0; i < n; ++i)
 +        if (ids[i])
++        {
++            if (ids[i] == s.vao)
++                g_curVao = nullptr;
 +            s.vaos.erase(ids[i]);
++        }
 +}
 +void gl_EnableVertexAttribArray(GLuint i)
 +{
 +    if (i < kMaxAttribs)
-+        s.vaos[s.vao].attribs[i].enabled = true;
++        CurVao().attribs[i].enabled = true;
 +}
 +void gl_DisableVertexAttribArray(GLuint i)
 +{
 +    if (i < kMaxAttribs)
-+        s.vaos[s.vao].attribs[i].enabled = false;
++        CurVao().attribs[i].enabled = false;
 +}
 +void gl_VertexAttribPointer(GLuint i, GLint size, GLenum type, GLboolean norm, GLsizei stride, const void* ptr)
 +{
 +    if (i >= kMaxAttribs)
 +        return;
-+    Attrib& a = s.vaos[s.vao].attribs[i];
++    Attrib& a = CurVao().attribs[i];
 +    a.size = size;
 +    a.type = type;
 +    a.normalized = norm == GL_TRUE;
@@ -3767,7 +3835,7 @@ index 00000000..446fcdfa
 +
 +bool BuildVertexSetup(const Program& p, VertexSetup& vs)
 +{
-+    const Vao& vao = s.vaos[s.vao];
++    const Vao& vao = CurVao();
 +    struct Group
 +    {
 +        GLuint buffer;
@@ -4103,24 +4171,34 @@ index 00000000..446fcdfa
 +        const GLuint name = u.glType == GL_SAMPLER_3D ? s.unit3D[unit]
 +            : u.glType == GL_SAMPLER_CUBE             ? s.unitCube[unit]
 +                                                      : s.unit2D[unit];
-+        const auto it = s.textures.find(name);
++        const auto it = name ? s.textures.find(name) : s.textures.end();
 +        const Texture* tex = it == s.textures.end() ? nullptr : &it->second;
-+        id<MTLTexture> mt = tex ? tex->mtl : nil;
 +        const bool wantDepth = u.glType == GL_SAMPLER_2D_SHADOW;
-+        if (mt && wantDepth != IsDepth(mt.pixelFormat))
-+            mt = nil; // несовпадение типа текстуры и сэмплера в шейдере
-+        if (mt && (mt.textureType == MTLTextureTypeCube) != (u.glType == GL_SAMPLER_CUBE))
-+            mt = nil;
-+        if (mt && (mt.textureType == MTLTextureType3D) != (u.glType == GL_SAMPLER_3D))
-+            mt = nil;
-+        if (!mt)
++        const MTLTextureType wantType = u.glType == GL_SAMPLER_CUBE ? MTLTextureTypeCube
++            : u.glType == GL_SAMPLER_3D                              ? MTLTextureType3D
++                                                                     : MTLTextureType2D;
++        id<MTLTexture> mt = nil;
++        int mips = 1;
++        // тип текстуры должен совпасть с сэмплером в шейдере (2D-массивы не используются)
++        if (tex && tex->mtl && tex->depth == wantDepth && tex->type == wantType)
++        {
++            mt = tex->mtl;
++            mips = tex->mipCount;
++        }
++        else
 +            mt = DummyFor(u.glType);
-+        SamplerParams sp = tex ? tex->params : SamplerParams{};
-+        if (s.unitSampler[unit])
-+            sp = s.samplers[s.unitSampler[unit]];
-+        if (!wantDepth)
++        const SamplerParams& base = s.unitSampler[unit] ? s.samplers[s.unitSampler[unit]]
++            : tex                                       ? tex->params
++                                                        : kDefaultSampler;
++        id<MTLSamplerState> ss;
++        if (wantDepth || base.compareMode == GL_NONE)
++            ss = SamplerStateOf(base, mips);
++        else
++        {
++            SamplerParams sp = base;
 +            sp.compareMode = GL_NONE;
-+        id<MTLSamplerState> ss = SamplerStateOf(sp, mt ? int(mt.mipmapLevelCount) : 1);
++            ss = SamplerStateOf(sp, mips);
++        }
 +        for (int st = 0; st < 2; ++st)
 +        {
 +            if (!u.slot[st].present)
@@ -4153,6 +4231,7 @@ index 00000000..446fcdfa
 +
 +void gl_DrawArrays(GLenum mode, GLint first, GLsizei count)
 +{
++    ShimTimer timer;
 +    MTLPrimitiveType prim;
 +    if (count <= 0 || !PrepareDraw(prim, mode))
 +    {
@@ -4164,8 +4243,9 @@ index 00000000..446fcdfa
 +
 +void DrawIndexed(GLenum mode, GLsizei count, GLenum type, const void* indices, GLint baseVertex)
 +{
++    ShimTimer timer;
 +    MTLPrimitiveType prim;
-+    id<MTLBuffer> ib = BufferObject(s.vaos[s.vao].elementBuffer);
++    id<MTLBuffer> ib = BufferObject(CurVao().elementBuffer);
 +    if (count <= 0 || !ib || !PrepareDraw(prim, mode))
 +    {
 +        ++s.skipped;
@@ -4323,9 +4403,9 @@ index 00000000..446fcdfa
 +namespace xr_mtl
 +{
 +// --- внешний интерфейс -------------------------------------------------------------
-+GLuint ElementBufferBinding() { return s.vaos[s.vao].elementBuffer; }
++GLuint ElementBufferBinding() { return CurVao().elementBuffer; }
 +unsigned FrameIndex() { return s.frameIndex; }
-+void SetElementBufferBinding(GLuint buffer) { s.vaos[s.vao].elementBuffer = buffer; }
++void SetElementBufferBinding(GLuint buffer) { CurVao().elementBuffer = buffer; }
 +void SetArrayBufferBinding(GLuint buffer) { g_arrayBuffer = buffer; }
 +
 +void RenderInit()
@@ -4406,15 +4486,24 @@ index 00000000..446fcdfa
 +        s.pool = nullptr;
 +    }
 +    ++s.frameIndex;
++    static unsigned framesSinceLog = 0;
++    ++framesSinceLog;
 +    if ((s.frameIndex % 600) == 1)
 +    {
-+        printf("[iOSRay] Metal: кадр %u — рисований %u (пропущено %u), проходов %u, PSO %zu, свободно %zu МБ, "
-+               "источник %s\n",
-+            s.frameIndex, s.draws, s.skipped, s.passes, s.pipelines.size(), os_proc_available_memory() >> 20,
-+            s.presentSource ? [NSString stringWithFormat:@"%lux%lu", (unsigned long)s.presentSource.width,
-+                                                          (unsigned long)s.presentSource.height].UTF8String
-+                            : "нет");
++        size_t texBytes = 0;
++        for (const auto& [name, t] : s.textures)
++            if (t.mtl)
++                texBytes += t.mtl.allocatedSize;
++        size_t bufCount = 0, bufBytes = 0, poolBytes = 0;
++        BufferStats(bufCount, bufBytes, poolBytes);
++        printf("[iOSRay] Metal: кадр %u — рисований %u (пропущено %u), проходов %u, слой Metal %.1f мс/кадр, "
++               "свободно %zu МБ | текстур %zu (%zu МБ), буферов %zu (%zu МБ, пул %zu МБ), PSO %zu, сэмплеров %zu\n",
++            s.frameIndex, s.draws, s.skipped, s.passes, g_shimMs / std::max(1u, framesSinceLog),
++            os_proc_available_memory() >> 20, s.textures.size(), texBytes >> 20, bufCount, bufBytes >> 20,
++            poolBytes >> 20, s.pipelines.size(), s.samplerStates.size());
 +        fflush(stdout);
++        g_shimMs = 0;
++        framesSinceLog = 0;
 +    }
 +    s.draws = s.skipped = s.passes = 0;
 +    s.presentSource = nil;
@@ -5746,6 +5835,47 @@ index 091259f8..2e590cac 100644
      if (m_sequencer_items.size())
          m_sequencer_items.front()->OnMousePress(btn);
  
+diff --git a/src/xrGame/ui/UIHudStatesWnd.cpp b/src/xrGame/ui/UIHudStatesWnd.cpp
+index b2c8878e..42b920dd 100644
+--- a/src/xrGame/ui/UIHudStatesWnd.cpp
++++ b/src/xrGame/ui/UIHudStatesWnd.cpp
+@@ -330,6 +330,36 @@ void CUIHudStatesWnd::UpdateActiveItemInfo(CActor* actor)
+         II_BriefInfo item_info;
+         item->GetBriefInfo(item_info);
+ 
++#if defined(XR_PLATFORM_APPLE)
++        // iOSRay: диагностика пропавших патронов/значка в HUD — раз на каждый новый предмет
++        static const void* s_lastItem = nullptr;
++        if (s_lastItem != item)
++        {
++            s_lastItem = item;
++            auto dump = [](pcstr what, CUIWindow* w) {
++                if (!w)
++                {
++                    Msg("~ [iOSRay] HUD: %s — нет в xml", what);
++                    return;
++                }
++                Fvector2 abs;
++                w->GetAbsolutePos(abs);
++                bool shown = true;
++                for (CUIWindow* p = w; p; p = p->GetParent())
++                    shown = shown && p->IsShown();
++                Msg("~ [iOSRay] HUD: %s позиция %.0f,%.0f размер %.0fx%.0f видим %d", what, abs.x, abs.y,
++                    w->GetWidth(), w->GetHeight(), int(shown));
++            };
++            Msg("~ [iOSRay] HUD: предмет [%s], значок [%s], патроны [%s/%s], режим [%s]",
++                item->object().cNameSect().c_str(), item_info.icon.c_str(), item_info.cur_ammo.c_str(),
++                item_info.total_ammo.c_str(), item_info.fire_mode.c_str());
++            dump("static_weapon", m_static_weapon);
++            dump("static_wpn_icon", m_ui_weapon_icon);
++            dump("static_ammo", m_ui_weapon_sign_ammo);
++            dump("static_cur_ammo", m_ui_weapon_cur_ammo);
++        }
++#endif
++
+         if (m_fire_mode)
+             m_fire_mode->SetText(item_info.fire_mode.c_str());
+         SetAmmoIcon(item_info.icon.c_str());
 diff --git a/src/xrUICore/Windows/UIFrameWindow.cpp b/src/xrUICore/Windows/UIFrameWindow.cpp
 index 51f9d9c2..81a8b4b3 100644
 --- a/src/xrUICore/Windows/UIFrameWindow.cpp
