@@ -1709,10 +1709,10 @@ index 60fe082f..1d330873 100644
          glReadPixels(0, 0, Device.dwWidth, Device.dwHeight, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl.mm b/src/Layers/xrRenderGL/mtl/glmtl.mm
 new file mode 100644
-index 00000000..11147d8e
+index 00000000..c69eabc7
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl.mm
-@@ -0,0 +1,453 @@
+@@ -0,0 +1,537 @@
 +// iOSRay: Metal-режим рендера.
 +//
 +// Рендер OpenXRay продолжает вызывать функции OpenGL ES (через указатели glad),
@@ -1736,7 +1736,13 @@ index 00000000..11147d8e
 +{
 +    GLuint nextName = 1;
 +    std::unordered_map<GLenum, GLuint> boundBuffer; // цель → имя буфера
-+    std::unordered_map<GLuint, id<MTLBuffer>> buffers;
++    struct Buffer
++    {
++        id<MTLBuffer> mtl;
++        NSUInteger size = 0; // логический размер (MTLBuffer из пула может быть больше)
++        bool pooled = false;
++    };
++    std::unordered_map<GLuint, Buffer> buffers;
 +} g;
 +
 +using xr_mtl::core;
@@ -1958,61 +1964,137 @@ index 00000000..11147d8e
 +    return target == GL_ELEMENT_ARRAY_BUFFER ? xr_mtl::ElementBufferBinding() : g.boundBuffer[target];
 +}
 +
++// Пул MTLBuffer: динамические буферы движок «осиротевает» десятки раз за кадр
++// (glBufferData / glMapBufferRange с INVALIDATE). Новый MTLBuffer на каждый раз —
++// это работа ядра (выделение и обнуление страниц) и лишний нагрев. Старые буферы
++// откладываются и через kFramesInFlight кадров (GPU их уже дочитал) идут в оборот.
++struct BufferPool
++{
++    static constexpr NSUInteger kMin = 4096, kMax = 8u << 20;
++    static constexpr size_t kKeepPerClass = 8;
++    std::unordered_map<NSUInteger, std::vector<id<MTLBuffer>>> free;
++    struct Retired
++    {
++        id<MTLBuffer> buf;
++        unsigned frame;
++    };
++    std::vector<Retired> retired;
++
++    static NSUInteger ClassOf(NSUInteger size)
++    {
++        NSUInteger c = kMin;
++        while (c < size)
++            c <<= 1;
++        return c;
++    }
++    id<MTLBuffer> Acquire(NSUInteger size)
++    {
++        if (size > kMax)
++            return [core.device newBufferWithLength:size options:MTLResourceStorageModeShared];
++        auto& list = free[ClassOf(size)];
++        if (!list.empty())
++        {
++            id<MTLBuffer> b = list.back();
++            list.pop_back();
++            return b;
++        }
++        return [core.device newBufferWithLength:ClassOf(size) options:MTLResourceStorageModeShared];
++    }
++    void Retire(id<MTLBuffer> b)
++    {
++        if (b && b.length <= kMax && b.length == ClassOf(b.length))
++            retired.push_back({ b, xr_mtl::FrameIndex() });
++    }
++    void Tick(unsigned frame)
++    {
++        size_t keep = 0;
++        for (Retired& r : retired)
++        {
++            if (frame >= r.frame + 3)
++            {
++                auto& list = free[r.buf.length];
++                if (list.size() < kKeepPerClass)
++                    list.push_back(r.buf);
++            }
++            else
++                retired[keep++] = r;
++        }
++        retired.resize(keep);
++    }
++} g_pool;
++
 +void gl_DeleteBuffers(GLsizei n, const GLuint* ids)
 +{
 +    for (GLsizei i = 0; i < n; ++i)
-+        g.buffers.erase(ids[i]);
++    {
++        const auto it = g.buffers.find(ids[i]);
++        if (it == g.buffers.end())
++            continue;
++        if (it->second.pooled)
++            g_pool.Retire(it->second.mtl);
++        g.buffers.erase(it);
++    }
 +}
 +
-+id<MTLBuffer> BoundBuffer(GLenum target)
++MtlState::Buffer* BoundBuffer(GLenum target)
 +{
 +    const auto it = g.buffers.find(BoundName(target));
-+    return it == g.buffers.end() ? nil : it->second;
++    return it == g.buffers.end() ? nullptr : &it->second;
 +}
 +
-+void gl_BufferData(GLenum target, GLsizeiptr size, const void* data, GLenum)
++// Выдать буферу новое хранилище (старое GPU может ещё читать)
++void Orphan(MtlState::Buffer& b, NSUInteger size, bool dynamic)
++{
++    if (b.pooled)
++        g_pool.Retire(b.mtl);
++    b.pooled = dynamic && size <= BufferPool::kMax;
++    b.mtl = b.pooled ? g_pool.Acquire(size)
++                     : [core.device newBufferWithLength:size options:MTLResourceStorageModeShared];
++    b.size = size;
++}
++
++void gl_BufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage)
 +{
 +    const GLuint name = BoundName(target);
 +    if (!name || size <= 0)
 +        return;
-+    id<MTLBuffer> buf = data ? [core.device newBufferWithBytes:data length:NSUInteger(size) options:MTLResourceStorageModeShared]
-+                             : [core.device newBufferWithLength:NSUInteger(size) options:MTLResourceStorageModeShared];
-+    g.buffers[name] = buf;
++    MtlState::Buffer& b = g.buffers[name];
++    Orphan(b, NSUInteger(size), usage != GL_STATIC_DRAW);
++    if (data)
++        memcpy(b.mtl.contents, data, size_t(size));
 +}
 +
 +void gl_BufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data)
 +{
-+    id<MTLBuffer> buf = BoundBuffer(target);
-+    if (buf && data && NSUInteger(offset + size) <= buf.length)
-+        memcpy(static_cast<uint8_t*>(buf.contents) + offset, data, size_t(size));
++    MtlState::Buffer* b = BoundBuffer(target);
++    if (b && b->mtl && data && NSUInteger(offset + size) <= b->size)
++        memcpy(static_cast<uint8_t*>(b->mtl.contents) + offset, data, size_t(size));
 +}
 +
 +void* gl_MapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access)
 +{
-+    id<MTLBuffer> buf = BoundBuffer(target);
-+    if (buf && (access & GL_MAP_INVALIDATE_BUFFER_BIT))
-+    {
-+        // «осиротить» буфер: GPU может ещё читать старый — отдаём новый
-+        buf = [core.device newBufferWithLength:buf.length options:MTLResourceStorageModeShared];
-+        g.buffers[BoundName(target)] = buf;
-+    }
-+    if (!buf || NSUInteger(offset + length) > buf.length)
++    MtlState::Buffer* b = BoundBuffer(target);
++    if (!b || !b->mtl)
 +        return nullptr;
-+    return static_cast<uint8_t*>(buf.contents) + offset;
++    if (access & GL_MAP_INVALIDATE_BUFFER_BIT)
++        Orphan(*b, b->size, true);
++    if (NSUInteger(offset + length) > b->size)
++        return nullptr;
++    return static_cast<uint8_t*>(b->mtl.contents) + offset;
 +}
 +
 +void* gl_MapBuffer(GLenum target, GLenum)
 +{
-+    id<MTLBuffer> buf = BoundBuffer(target);
-+    return buf ? buf.contents : nullptr;
++    MtlState::Buffer* b = BoundBuffer(target);
++    return b && b->mtl ? b->mtl.contents : nullptr;
 +}
 +
 +GLboolean gl_UnmapBuffer(GLenum) { return GL_TRUE; }
 +
 +void gl_GetBufferParameteriv(GLenum target, GLenum pname, GLint* v)
 +{
-+    id<MTLBuffer> buf = BoundBuffer(target);
-+    *v = (pname == GL_BUFFER_SIZE && buf) ? GLint(buf.length) : 0;
++    MtlState::Buffer* b = BoundBuffer(target);
++    *v = (pname == GL_BUFFER_SIZE && b) ? GLint(b->size) : 0;
 +}
 +
 +struct Entry
@@ -2131,8 +2213,10 @@ index 00000000..11147d8e
 +id<MTLBuffer> BufferObject(GLuint name)
 +{
 +    const auto it = g.buffers.find(name);
-+    return it == g.buffers.end() ? nil : it->second;
++    return it == g.buffers.end() ? nil : it->second.mtl;
 +}
++
++void BufferPoolTick(unsigned frame) { g_pool.Tick(frame); }
 +} // namespace xr_mtl
 +
 +extern "C" bool xr_mtl_init(void* metalLayer)
@@ -2168,10 +2252,10 @@ index 00000000..11147d8e
 +extern "C" void xr_mtl_present() { xr_mtl::RenderPresent(); }
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_internal.h b/src/Layers/xrRenderGL/mtl/glmtl_internal.h
 new file mode 100644
-index 00000000..ad4d1581
+index 00000000..e1f4ad7e
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_internal.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,38 @@
 +// iOSRay: Metal-режим — общее между glmtl.mm (база, буферы, шейдеры) и
 +// glmtl_render.mm (текстуры, кадровые буферы, состояние, рисование).
 +#pragma once
@@ -2194,6 +2278,7 @@ index 00000000..ad4d1581
 +
 +// glmtl.mm: буферные объекты GL → MTLBuffer
 +id<MTLBuffer> BufferObject(GLuint name);
++void BufferPoolTick(unsigned frame); // начало кадра: вернуть в оборот дочитанные GPU буферы
 +
 +// glmtl_render.mm
 +struct ProcEntry
@@ -2204,16 +2289,17 @@ index 00000000..ad4d1581
 +void* RenderProc(const char* name); // nullptr, если такой функции там нет
 +void RenderInit();
 +void RenderPresent();
++unsigned FrameIndex();
 +GLuint ElementBufferBinding();               // привязка GL_ELEMENT_ARRAY_BUFFER (живёт в VAO)
 +void SetElementBufferBinding(GLuint buffer);
 +void SetArrayBufferBinding(GLuint buffer);   // для glVertexAttribPointer
 +} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_render.mm b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
 new file mode 100644
-index 00000000..67b9e285
+index 00000000..5a193993
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
-@@ -0,0 +1,2098 @@
+@@ -0,0 +1,2144 @@
 +// iOSRay: Metal-режим, этап 4b — рисование.
 +//
 +// Здесь GL-вызовы движка превращаются в работу Metal:
@@ -2407,6 +2493,9 @@ index 00000000..67b9e285
 +    dispatch_semaphore_t inFlight;
 +    unsigned frameIndex = 0;
 +    void* pool = nullptr;
++    id<MTLCommandBuffer> uploadCmd = nil; // загрузка Private-текстур (идёт раньше кадра)
++    id<MTLBlitCommandEncoder> uploadBlit = nil;
++    size_t uploadBytes = 0;
 +
 +    // временная память кадра (uniform-блоки, выровненные индексы)
 +    struct Ring
@@ -2597,7 +2686,9 @@ index 00000000..67b9e285
 +    td.usage = MTLTextureUsageShaderRead;
 +    if (!IsAstc(fmt) && type != MTLTextureType3D)
 +        td.usage |= MTLTextureUsageRenderTarget;
-+    td.storageMode = IsDepth(fmt) ? MTLStorageModePrivate : MTLStorageModeShared;
++    // Глубина и сжатые ASTC (основной объём текстур мира, только чтение) — в памяти
++    // GPU: оптимальная для GPU раскладка, меньше трафика памяти при выборке.
++    td.storageMode = (IsDepth(fmt) || IsAstc(fmt)) ? MTLStorageModePrivate : MTLStorageModeShared;
 +    return [core.device newTextureWithDescriptor:td];
 +}
 +
@@ -2681,10 +2772,42 @@ index 00000000..67b9e285
 +        Allocate(*t, target, levels, internal, w, h, d);
 +}
 +
++void CommitUploads()
++{
++    if (!s.uploadCmd)
++        return;
++    [s.uploadBlit endEncoding];
++    [s.uploadCmd commit];
++    s.uploadBlit = nil;
++    s.uploadCmd = nil;
++    s.uploadBytes = 0;
++}
++
++// Загрузка в Private-текстуру через промежуточный буфер и blit
++void UploadPrivate(id<MTLTexture> tex, NSUInteger level, NSUInteger slice, MTLRegion region, const void* data,
++    NSUInteger bytesPerRow, NSUInteger bytesPerImage, NSUInteger size)
++{
++    @autoreleasepool
++    {
++        id<MTLBuffer> staging = [core.device newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
++        if (!s.uploadCmd)
++        {
++            s.uploadCmd = [core.queue commandBuffer];
++            s.uploadBlit = [s.uploadCmd blitCommandEncoder];
++        }
++        [s.uploadBlit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:bytesPerRow
++                  sourceBytesPerImage:bytesPerImage sourceSize:region.size toTexture:tex destinationSlice:slice
++                     destinationLevel:level destinationOrigin:region.origin];
++    }
++    s.uploadBytes += size;
++    if (s.uploadBytes > (32u << 20))
++        CommitUploads(); // не держать сотни МБ промежуточных буферов при загрузке уровня
++}
++
 +void Upload(Texture& t, GLint level, GLint x, GLint y, GLint z, GLsizei w, GLsizei h, GLsizei d, NSUInteger slice,
 +    GLenum format, GLenum type, const void* data, bool compressed, GLsizei compressedSize)
 +{
-+    if (!t.mtl || !data || level >= t.levels || t.mtl.storageMode == MTLStorageModePrivate)
++    if (!t.mtl || !data || level >= t.levels || (t.mtl.storageMode == MTLStorageModePrivate && !compressed))
 +        return;
 +    const MTLRegion region = MTLRegionMake3D(NSUInteger(x), NSUInteger(y), NSUInteger(z), NSUInteger(w),
 +        NSUInteger(h), NSUInteger(std::max(d, 1)));
@@ -2696,6 +2819,12 @@ index 00000000..67b9e285
 +        const NSUInteger bpi = bpr * NSUInteger((h + 3) / 4);
 +        if (NSUInteger(compressedSize) < bpi * NSUInteger(std::max(d, 1)))
 +            return;
++        if (t.mtl.storageMode == MTLStorageModePrivate)
++        {
++            UploadPrivate(t.mtl, NSUInteger(level), slice, region, data, bpr,
++                t.mtl.textureType == MTLTextureType3D ? bpi : 0, bpi * NSUInteger(std::max(d, 1)));
++            return;
++        }
 +        [t.mtl replaceRegion:region mipmapLevel:NSUInteger(level) slice:slice withBytes:data bytesPerRow:bpr
 +               bytesPerImage:t.mtl.textureType == MTLTextureType3D ? bpi : 0];
 +        return;
@@ -3043,6 +3172,7 @@ index 00000000..67b9e285
 +    auto& ring = s.rings[s.frameIndex % kFramesInFlight];
 +    ring.chunk = 0;
 +    ring.offset = 0;
++    BufferPoolTick(s.frameIndex);
 +    s.cmd = [core.queue commandBuffer];
 +}
 +
@@ -4141,6 +4271,7 @@ index 00000000..67b9e285
 +
 +// --- внешний интерфейс -------------------------------------------------------------
 +GLuint ElementBufferBinding() { return s.vaos[s.vao].elementBuffer; }
++unsigned FrameIndex() { return s.frameIndex; }
 +void SetElementBufferBinding(GLuint buffer) { s.vaos[s.vao].elementBuffer = buffer; }
 +void SetArrayBufferBinding(GLuint buffer) { g_arrayBuffer = buffer; }
 +
@@ -4199,6 +4330,7 @@ index 00000000..67b9e285
 +            [s.cmd presentDrawable:drawable];
 +        }
 +        dispatch_semaphore_t sem = s.inFlight;
++        CommitUploads(); // текстуры, загруженные за кадр, должны попасть в GPU раньше него
 +        [s.cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
 +            if (cb.error)
 +                printf("! [iOSRay] Metal: ошибка GPU: %s\n", cb.error.localizedDescription.UTF8String);
@@ -5140,7 +5272,7 @@ index 6bb1d98e..d15c94de 100644
  int psTextureLOD = 1;
 +#endif
 diff --git a/src/xrEngine/device.cpp b/src/xrEngine/device.cpp
-index 01a427c0..1c00302c 100644
+index 01a427c0..8984c40b 100644
 --- a/src/xrEngine/device.cpp
 +++ b/src/xrEngine/device.cpp
 @@ -1,4 +1,7 @@
@@ -5157,8 +5289,8 @@ index 01a427c0..1c00302c 100644
  
 +#if defined(__APPLE__) && TARGET_OS_IPHONE
 +// iOS: телефон не должен греться без толку — 30 кадров в игре и в меню
-+int ps_fps_limit = 30;
-+int ps_fps_limit_in_menu = 30;
++int ps_fps_limit = 60;
++int ps_fps_limit_in_menu = 60;
 +#else
  int ps_fps_limit = 501;
  int ps_fps_limit_in_menu = 60;
@@ -5192,7 +5324,7 @@ index 20d2e576..d4d6cdc0 100644
  
  constexpr pcstr FRAME_MARK_APPLICATION_STARTUP = "Application startup";
 diff --git a/src/xrEngine/xr_input.cpp b/src/xrEngine/xr_input.cpp
-index b8caddd9..3fcef037 100644
+index b8caddd9..819cf9d8 100644
 --- a/src/xrEngine/xr_input.cpp
 +++ b/src/xrEngine/xr_input.cpp
 @@ -1,4 +1,7 @@
@@ -5220,7 +5352,7 @@ index b8caddd9..3fcef037 100644
  
      if (AltF4Pressed)
          return;
-@@ -832,3 +842,106 @@ void CInput::Feedback(FeedbackType type, float s1, float s2, float duration)
+@@ -832,3 +842,107 @@ void CInput::Feedback(FeedbackType type, float s1, float s2, float duration)
      default: NODEFAULT;
      }
  }
@@ -5264,6 +5396,7 @@ index b8caddd9..3fcef037 100644
 +        kWPN_FIRE, kWPN_ZOOM, kJUMP, kCROUCH,        // 4..7
 +        kUSE, kWPN_RELOAD, kINVENTORY, kQUIT,        // 8..11
 +        kWPN_NEXT, kACTIVE_JOBS, kSPRINT_TOGGLE, kACCEL, // 12..15
++        kWPN_1, kWPN_2, kWPN_3, kWPN_4, kWPN_5, kWPN_6,  // 16..21 слоты оружия
 +    };
 +    if (iosAction < 0 || iosAction >= int(std::size(map)))
 +        return;
@@ -5559,10 +5692,10 @@ index 82d7da5d..0fd1fa17 100644
  #endif
 diff --git a/src/xr_3da/ios_bootstrap.mm b/src/xr_3da/ios_bootstrap.mm
 new file mode 100644
-index 00000000..b730b55c
+index 00000000..32c51455
 --- /dev/null
 +++ b/src/xr_3da/ios_bootstrap.mm
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,238 @@
 +// iOSRay: подготовка окружения движка на iOS перед entry_point().
 +//
 +// Что делает:
@@ -5757,6 +5890,30 @@ index 00000000..b730b55c
 +            [fm copyItemAtPath:[res stringByAppendingPathComponent:@"iosray.ltx"] toPath:perf error:nil];
 +            printf("[iOSRay] iosray.ltx (настройки графики) скопирован из бандла\n");
 +        }
++        else
++        {
++            // Новые строки бандла, которых нет в файле пользователя, дописываем в конец
++            // (его собственные правки не трогаем)
++            NSString* mine = [NSString stringWithContentsOfFile:perf encoding:NSUTF8StringEncoding error:nil] ?: @"";
++            NSString* fresh = [NSString stringWithContentsOfFile:[res stringByAppendingPathComponent:@"iosray.ltx"]
++                                                        encoding:NSUTF8StringEncoding error:nil] ?: @"";
++            NSMutableString* add = [NSMutableString string];
++            for (NSString* line in [fresh componentsSeparatedByString:@"\n"])
++            {
++                NSString* t = [line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
++                if (t.length == 0 || [t hasPrefix:@";"])
++                    continue;
++                NSString* cmd = [t componentsSeparatedByString:@" "].firstObject;
++                if ([mine rangeOfString:[cmd stringByAppendingString:@" "]].location == NSNotFound)
++                    [add appendFormat:@"%@\n", t];
++            }
++            if (add.length)
++            {
++                NSString* merged = [NSString stringWithFormat:@"%@\n; добавлено iOSRay\n%@", mine, add];
++                [merged writeToFile:perf atomically:YES encoding:NSUTF8StringEncoding error:nil];
++                printf("[iOSRay] iosray.ltx: дописаны новые настройки\n%s", add.UTF8String);
++            }
++        }
 +        EnsureLink([gameDir stringByAppendingPathComponent:@"gamedata/shaders/gl"],
 +                   [res stringByAppendingPathComponent:@"gamedata/shaders/gl"]);
 +
@@ -5779,19 +5936,19 @@ index 00000000..b730b55c
 +}
 diff --git a/src/xr_3da/ios_touch.mm b/src/xr_3da/ios_touch.mm
 new file mode 100644
-index 00000000..1548752f
+index 00000000..c85e4d8b
 --- /dev/null
 +++ b/src/xr_3da/ios_touch.mm
-@@ -0,0 +1,359 @@
-+// iOSRay: экранное управление поверх окна SDL (минимальный набор).
+@@ -0,0 +1,416 @@
++// iOSRay: экранное управление поверх окна SDL.
 +//
-+//  * В игре (движок захватил ввод) слой ловит все касания:
-+//      левая часть экрана — плавающий стик (W/A/S/D через привязки действий),
-+//      правая часть — обзор (относительное движение мыши),
-+//      кнопки — действия: огонь, прицел, прыжок, присед, использовать,
-+//      перезарядка, смена оружия, бег (X), шаг (Shift), инвентарь, PDA.
-+//  * В меню слой пропускает касания к SDL (там они работают как мышь),
-+//    видна только кнопка «Меню» (Esc) в правом верхнем углу.
++// Хват на 4 пальца: большие — снизу (левый — плавающий стик, правый — обзор и
++// кнопки действий), указательные — сверху (правый — огонь, левый — прицел).
++// Любое касание, начатое на кнопке, держит кнопку И одновременно ведёт камеру
++// при движении пальца — можно стрелять и целиться одним пальцем.
++//
++// В меню слой пропускает касания к SDL (там они работают как мышь), видна только
++// кнопка Esc.
 +//
 +// Кнопки не знают клавиш: движок сам ищет, на что назначено действие
 +// (xr_ios_action в xrEngine/xr_input.cpp).
@@ -5811,19 +5968,33 @@ index 00000000..1548752f
 +    actFire, actAim, actJump, actCrouch,
 +    actUse, actReload, actInventory, actMenu,
 +    actWeaponNext, actPda, actSprint, actWalk,
++    actWpn1, actWpn2, actWpn3, actWpn4, actWpn5, actWpn6,
 +};
 +
 +constexpr CGFloat kStickZone = 0.40;      // доля ширины экрана слева под стик
 +constexpr CGFloat kStickDeadZone = 14.0;  // пт
 +constexpr CGFloat kLookScale = 2.2;       // пикселей «мыши» на пункт касания
++constexpr CGFloat kHitSlop = 6.0;         // запас вокруг кнопки при попадании
 +} // namespace
 +
-+@interface XRTouchButton : UIButton
++@interface XRTouchButton : UILabel
 +@property(nonatomic) int action;
 +@property(nonatomic) BOOL alwaysVisible;
++@property(nonatomic) int pressCount;
 +@end
 +
 +@implementation XRTouchButton
++@end
++
++// Что делает конкретный палец
++@interface XRFinger : NSObject
++@property(nonatomic, weak) XRTouchButton* button; // nil — не на кнопке
++@property(nonatomic) BOOL stick;
++@property(nonatomic) CGPoint last;
++@property(nonatomic) float remX, remY;
++@end
++
++@implementation XRFinger
 +@end
 +
 +@interface XRTouchOverlay : UIView
@@ -5832,11 +6003,9 @@ index 00000000..1548752f
 +
 +@implementation XRTouchOverlay
 +{
++    NSMapTable<UITouch*, XRFinger*>* _fingers;
 +    UITouch* _stickTouch;
-+    UITouch* _lookTouch;
 +    CGPoint _stickOrigin;
-+    CGPoint _lookLast;
-+    float _lookRemX, _lookRemY;
 +    bool _dir[4];
 +    UIView* _stickBase;
 +    UIView* _stickKnob;
@@ -5851,23 +6020,25 @@ index 00000000..1548752f
 +        self.multipleTouchEnabled = YES;
 +        self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
 +        _buttons = [NSMutableArray array];
++        _fingers = [NSMapTable strongToStrongObjectsMapTable];
 +
 +        _stickBase = [self circleWithSize:120 alpha:0.18];
 +        _stickKnob = [self circleWithSize:54 alpha:0.35];
 +        _stickBase.hidden = _stickKnob.hidden = YES;
 +
-+        [self addButton:@"ЛКМ" action:actFire size:86];
-+        [self addButton:@"ПКМ" action:actAim size:62];
-+        [self addButton:@"Space" action:actJump size:58];
-+        [self addButton:@"Ctrl" action:actCrouch size:58];
-+        [self addButton:@"F" action:actUse size:54];
-+        [self addButton:@"R" action:actReload size:54];
-+        [self addButton:@"⇄" action:actWeaponNext size:52];
-+        [self addButton:@"X" action:actSprint size:52];
-+        [self addButton:@"Shift" action:actWalk size:52];
-+        [self addButton:@"I" action:actInventory size:46];
-+        [self addButton:@"PDA" action:actPda size:46];
-+        XRTouchButton* menu = [self addButton:@"Esc" action:actMenu size:46];
++        [self addButton:@"ЛКМ" action:actFire size:80];
++        [self addButton:@"ПКМ" action:actAim size:72];
++        [self addButton:@"Space" action:actJump size:54];
++        [self addButton:@"Ctrl" action:actCrouch size:54];
++        [self addButton:@"F" action:actUse size:50];
++        [self addButton:@"R" action:actReload size:50];
++        [self addButton:@"X" action:actSprint size:50];
++        [self addButton:@"Shift" action:actWalk size:50];
++        for (int i = 0; i < 6; ++i)
++            [self addButton:[NSString stringWithFormat:@"%d", i + 1] action:actWpn1 + i size:38];
++        [self addButton:@"I" action:actInventory size:40];
++        [self addButton:@"PDA" action:actPda size:40];
++        XRTouchButton* menu = [self addButton:@"Esc" action:actMenu size:40];
 +        menu.alwaysVisible = YES;
 +        _gameplay = YES;
 +        self.gameplay = NO;
@@ -5887,70 +6058,65 @@ index 00000000..1548752f
 +
 +- (XRTouchButton*)addButton:(NSString*)title action:(int)action size:(CGFloat)size
 +{
-+    XRTouchButton* b = [XRTouchButton buttonWithType:UIButtonTypeCustom];
++    XRTouchButton* b = [[XRTouchButton alloc] initWithFrame:CGRectMake(0, 0, size, size)];
 +    b.action = action;
-+    b.frame = CGRectMake(0, 0, size, size);
++    b.userInteractionEnabled = NO; // касания разбирает сам слой
 +    b.layer.cornerRadius = size / 2;
 +    b.layer.borderWidth = 1.5;
 +    b.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.45].CGColor;
-+    b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.28];
-+    [b setTitle:title forState:UIControlStateNormal];
-+    [b setTitleColor:[UIColor colorWithWhite:1.0 alpha:0.85] forState:UIControlStateNormal];
-+    b.titleLabel.font = [UIFont boldSystemFontOfSize:size > 70 ? 17 : 14];
-+    b.titleLabel.adjustsFontSizeToFitWidth = YES;
-+    b.exclusiveTouch = NO;
-+    [b addTarget:self action:@selector(buttonDown:) forControlEvents:UIControlEventTouchDown];
-+    [b addTarget:self action:@selector(buttonUp:)
-+        forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
++    b.layer.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.28].CGColor;
++    b.clipsToBounds = YES;
++    b.text = title;
++    b.textAlignment = NSTextAlignmentCenter;
++    b.textColor = [UIColor colorWithWhite:1.0 alpha:0.85];
++    b.font = [UIFont boldSystemFontOfSize:size > 70 ? 17 : size < 42 ? 13 : 14];
++    b.adjustsFontSizeToFitWidth = YES;
 +    [self addSubview:b];
 +    [_buttons addObject:b];
 +    return b;
 +}
 +
-+- (void)buttonDown:(XRTouchButton*)b
++- (void)press:(XRTouchButton*)b down:(BOOL)down
 +{
-+    b.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.30];
-+    xr_ios_action(b.action, 1);
-+}
-+
-+- (void)buttonUp:(XRTouchButton*)b
-+{
-+    b.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.28];
-+    xr_ios_action(b.action, 0);
++    const int before = b.pressCount;
++    b.pressCount = MAX(0, before + (down ? 1 : -1));
++    if ((before == 0) == (b.pressCount == 0))
++        return; // кнопку держит ещё один палец — состояние не меняется
++    b.layer.backgroundColor = [UIColor colorWithWhite:down ? 1.0 : 0.0 alpha:down ? 0.30 : 0.28].CGColor;
++    xr_ios_action(b.action, down ? 1 : 0);
 +}
 +
 +- (void)layoutSubviews
 +{
 +    [super layoutSubviews];
-+    UIEdgeInsets safe = self.safeAreaInsets;
++    const UIEdgeInsets safe = self.safeAreaInsets;
++    const CGFloat L = safe.left, T = safe.top;
 +    const CGFloat W = self.bounds.size.width - safe.right;
 +    const CGFloat H = self.bounds.size.height - safe.bottom;
-+    const CGFloat top = safe.top;
-+    // Под правый большой палец: ЛКМ в углу, остальное — двумя дугами вокруг неё
-+    // (угол 180° — влево от ЛКМ, 90° — вверх). Редкие кнопки — полоской сверху.
-+    const CGPoint fire = CGPointMake(W - 62, H - 64);
-+    auto arc = [&](CGFloat radius, CGFloat deg) {
-+        const CGFloat a = deg * M_PI / 180.0;
-+        return CGPointMake(fire.x + radius * cos(a), fire.y - radius * sin(a));
-+    };
++    const CGFloat wpnCenter = L + (W - L) * 0.62, wpnStep = 44;
 +    for (XRTouchButton* b in _buttons)
 +    {
 +        CGPoint c{};
 +        switch (b.action)
 +        {
-+        case actFire:       c = fire; break;
-+        case actSprint:     c = arc(118, 180); break;
-+        case actCrouch:     c = arc(118, 135); break;
-+        case actAim:        c = arc(118, 90);  break;
-+        case actReload:     c = arc(215, 180); break;
-+        case actJump:       c = arc(215, 155); break;
-+        case actWalk:       c = arc(215, 130); break;
-+        case actUse:        c = arc(215, 105); break;
-+        case actWeaponNext: c = arc(215, 82);  break;
-+        case actMenu:       c = CGPointMake(W - 36,  top + 30); break;
-+        case actInventory:  c = CGPointMake(W - 94,  top + 30); break;
-+        case actPda:        c = CGPointMake(W - 152, top + 30); break;
-+        default: break;
++        // указательные пальцы — верхние углы
++        case actFire:      c = CGPointMake(W - 50, T + 50); break;
++        case actAim:       c = CGPointMake(L + 46, T + 46); break;
++        // верхняя полоса: меню слева, оружие справа от центра
++        case actMenu:      c = CGPointMake(L + 112, T + 26); break;
++        case actInventory: c = CGPointMake(L + 160, T + 26); break;
++        case actPda:       c = CGPointMake(L + 208, T + 26); break;
++        // правый большой палец: кнопки по краю, середина свободна для обзора
++        case actWalk:      c = CGPointMake(W - 44,  H - 200); break;
++        case actUse:       c = CGPointMake(W - 120, H - 212); break;
++        case actJump:      c = CGPointMake(W - 186, H - 146); break;
++        case actReload:    c = CGPointMake(W - 42,  H - 124); break;
++        case actCrouch:    c = CGPointMake(W - 118, H - 112); break;
++        case actSprint:    c = CGPointMake(W - 80,  H - 40);  break;
++        default:
++            if (b.action >= actWpn1 && b.action <= actWpn6)
++                c = CGPointMake(wpnCenter + (b.action - actWpn1 - 2.5) * wpnStep, T + 26);
++            break;
 +        }
 +        b.center = c;
 +    }
@@ -5963,18 +6129,36 @@ index 00000000..1548752f
 +    _gameplay = gameplay;
 +    for (XRTouchButton* b in _buttons)
 +        b.hidden = !(gameplay || b.alwaysVisible);
-+    if (!gameplay)
-+        [self releaseStick];
-+    _lookTouch = nil;
++    [self releaseAll];
 +}
 +
-+// В меню касания мимо кнопки «Меню» уходят в SDL (под нами)
++- (XRTouchButton*)buttonAt:(CGPoint)p
++{
++    XRTouchButton* best = nil;
++    CGFloat bestDist = CGFLOAT_MAX;
++    for (XRTouchButton* b in _buttons)
++    {
++        if (b.hidden)
++            continue;
++        const CGFloat dx = p.x - b.center.x, dy = p.y - b.center.y;
++        const CGFloat d = sqrt(dx * dx + dy * dy);
++        if (d <= b.bounds.size.width / 2 + kHitSlop && d < bestDist)
++        {
++            best = b;
++            bestDist = d;
++        }
++    }
++    return best;
++}
++
++// В меню касания мимо видимой кнопки уходят в SDL (под нами)
 +- (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event
 +{
-+    UIView* hit = [super hitTest:point withEvent:event];
++    if (self.hidden || !self.userInteractionEnabled)
++        return nil;
 +    if (_gameplay)
-+        return hit;
-+    return (hit && hit != self && !hit.hidden) ? hit : nil;
++        return [self pointInside:point withEvent:event] ? self : nil;
++    return [self buttonAt:point] ? self : nil;
 +}
 +
 +- (void)setDir:(int)i pressed:(bool)pressed
@@ -5993,33 +6177,56 @@ index 00000000..1548752f
 +    _stickBase.hidden = _stickKnob.hidden = YES;
 +}
 +
++- (void)releaseAll
++{
++    for (UITouch* t in _fingers.keyEnumerator.allObjects)
++    {
++        XRFinger* f = [_fingers objectForKey:t];
++        if (f.button)
++            [self press:f.button down:NO];
++    }
++    [_fingers removeAllObjects];
++    [self releaseStick];
++}
++
 +- (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
 +{
 +    for (UITouch* t in touches)
 +    {
 +        const CGPoint p = [t locationInView:self];
-+        if (!_stickTouch && p.x < self.bounds.size.width * kStickZone)
++        XRFinger* f = [XRFinger new];
++        f.last = p;
++        XRTouchButton* b = [self buttonAt:p];
++        if (b)
 +        {
++            f.button = b;
++            [self press:b down:YES];
++        }
++        else if (!_gameplay)
++            continue;
++        else if (!_stickTouch && p.x < self.bounds.size.width * kStickZone)
++        {
++            f.stick = YES;
 +            _stickTouch = t;
 +            _stickOrigin = p;
 +            _stickBase.center = _stickKnob.center = p;
 +            _stickBase.hidden = _stickKnob.hidden = NO;
 +        }
-+        else if (!_lookTouch)
-+        {
-+            _lookTouch = t;
-+            _lookLast = p;
-+            _lookRemX = _lookRemY = 0;
-+        }
++        [_fingers setObject:f forKey:t];
 +    }
 +}
 +
 +- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
 +{
++    // Обзор: сумма движений всех «не стиковых» пальцев (кнопки тоже ведут камеру)
++    float lookX = 0, lookY = 0;
 +    for (UITouch* t in touches)
 +    {
++        XRFinger* f = [_fingers objectForKey:t];
++        if (!f)
++            continue;
 +        const CGPoint p = [t locationInView:self];
-+        if (t == _stickTouch)
++        if (f.stick)
 +        {
 +            CGFloat dx = p.x - _stickOrigin.x, dy = p.y - _stickOrigin.y;
 +            const CGFloat len = sqrt(dx * dx + dy * dy), maxLen = 50;
@@ -6034,27 +6241,34 @@ index 00000000..1548752f
 +            [self setDir:2 pressed:active && dx < -0.38 * len];
 +            [self setDir:3 pressed:active && dx > 0.38 * len];
 +        }
-+        else if (t == _lookTouch)
++        else if (_gameplay)
 +        {
-+            _lookRemX += (p.x - _lookLast.x) * kLookScale;
-+            _lookRemY += (p.y - _lookLast.y) * kLookScale;
-+            _lookLast = p;
-+            const int ix = int(_lookRemX), iy = int(_lookRemY);
-+            _lookRemX -= ix;
-+            _lookRemY -= iy;
-+            xr_ios_look(ix, iy);
++            f.remX += (p.x - f.last.x) * kLookScale;
++            f.remY += (p.y - f.last.y) * kLookScale;
++            const int ix = int(f.remX), iy = int(f.remY);
++            f.remX -= ix;
++            f.remY -= iy;
++            lookX += ix;
++            lookY += iy;
 +        }
++        f.last = p;
 +    }
++    if (lookX || lookY)
++        xr_ios_look(int(lookX), int(lookY));
 +}
 +
 +- (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
 +{
 +    for (UITouch* t in touches)
 +    {
-+        if (t == _stickTouch)
++        XRFinger* f = [_fingers objectForKey:t];
++        if (!f)
++            continue;
++        if (f.button)
++            [self press:f.button down:NO];
++        if (f.stick)
 +            [self releaseStick];
-+        else if (t == _lookTouch)
-+            _lookTouch = nil;
++        [_fingers removeObjectForKey:t];
 +    }
 +}
 +
