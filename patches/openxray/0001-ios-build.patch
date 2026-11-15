@@ -2210,10 +2210,10 @@ index 00000000..ad4d1581
 +} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_render.mm b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
 new file mode 100644
-index 00000000..6b71f282
+index 00000000..de157f71
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
-@@ -0,0 +1,1877 @@
+@@ -0,0 +1,1909 @@
 +// iOSRay: Metal-режим, этап 4b — рисование.
 +//
 +// Здесь GL-вызовы движка превращаются в работу Metal:
@@ -2232,6 +2232,8 @@ index 00000000..6b71f282
 +#include "glmtl_internal.h"
 +#include "glmtl_shaders.h"
 +
++#include <os/proc.h>
++
 +#include <algorithm>
 +#include <cstdarg>
 +#include <initializer_list>
@@ -2242,6 +2244,13 @@ index 00000000..6b71f282
 +#include <unordered_map>
 +#include <unordered_set>
 +#include <vector>
++
++// Игровой цикл SDL крутится внутри одного вызова из runloop и никогда не
++// возвращается — главный autorelease-пул не опустошается. Без своего пула на
++// кадр все временные объекты Metal (командные буферы со всеми ресурсами, которые
++// они держат, дескрипторы, энкодеры) копились бы до вылета по памяти.
++extern "C" void* objc_autoreleasePoolPush(void);
++extern "C" void objc_autoreleasePoolPop(void* pool);
 +
 +namespace xr_mtl
 +{
@@ -2382,6 +2391,7 @@ index 00000000..6b71f282
 +    id<MTLTexture> presentSource = nil;
 +    dispatch_semaphore_t inFlight;
 +    unsigned frameIndex = 0;
++    void* pool = nullptr;
 +
 +    // временная память кадра (uniform-блоки, выровненные индексы)
 +    struct Ring
@@ -3004,6 +3014,8 @@ index 00000000..6b71f282
 +// --- кадр и проходы -------------------------------------------------------------------
 +void BeginFrameIfNeeded()
 +{
++    if (!s.pool)
++        s.pool = objc_autoreleasePoolPush();
 +    if (s.cmd)
 +        return;
 +    dispatch_semaphore_wait(s.inFlight, DISPATCH_TIME_FOREVER);
@@ -3427,7 +3439,19 @@ index 00000000..6b71f282
 +// --- рисование ---------------------------------------------------------------------
 +struct VertexSetup
 +{
-+    MTLVertexDescriptor* desc = nil;
++    struct AttrSpec
++    {
++        uint32_t location;
++        MTLVertexFormat format;
++        NSUInteger offset, bufferIndex;
++    };
++    struct LayoutSpec
++    {
++        NSUInteger index, stride;
++        bool constant;
++    };
++    std::vector<AttrSpec> attrs;
++    std::vector<LayoutSpec> layouts;
 +    std::string key;
 +    struct Bind
 +    {
@@ -3441,7 +3465,6 @@ index 00000000..6b71f282
 +
 +bool BuildVertexSetup(const Program& p, VertexSetup& vs)
 +{
-+    vs.desc = [MTLVertexDescriptor vertexDescriptor];
 +    const Vao& vao = s.vaos[s.vao];
 +    struct Group
 +    {
@@ -3457,12 +3480,10 @@ index 00000000..6b71f282
 +            continue;
 +        const Attrib& a = vao.attribs[in.location];
 +        id<MTLBuffer> mb = a.enabled ? BufferObject(a.buffer) : nil;
-+        MTLVertexAttributeDescriptor* ad = vs.desc.attributes[in.location];
 +        if (!mb)
 +        {
-+            ad.format = in.isInt ? MTLVertexFormatInt4 : MTLVertexFormatFloat4;
-+            ad.offset = 0;
-+            ad.bufferIndex = kDummyVertexBufferIndex;
++            vs.attrs.push_back({ in.location, in.isInt ? MTLVertexFormatInt4 : MTLVertexFormatFloat4, 0,
++                kDummyVertexBufferIndex });
 +            vs.needDummy = true;
 +            snprintf(buf, sizeof(buf), "a%u:d|", in.location);
 +            vs.key += buf;
@@ -3490,10 +3511,9 @@ index 00000000..6b71f282
 +        for (size_t g = 0; g < groups.size(); ++g)
 +            if (groups[g].buffer == a.buffer && groups[g].stride == stride)
 +            {
-+                MTLVertexAttributeDescriptor* ad = vs.desc.attributes[in.location];
-+                ad.format = VertexFormatOf(a);
-+                ad.offset = NSUInteger(a.offset - groups[g].base);
-+                ad.bufferIndex = kFirstVertexBufferIndex + g;
++                const VertexSetup::AttrSpec ad{ in.location, VertexFormatOf(a), NSUInteger(a.offset - groups[g].base),
++                    kFirstVertexBufferIndex + g };
++                vs.attrs.push_back(ad);
 +                snprintf(buf, sizeof(buf), "a%u:%d:%lu:%lu|", in.location, int(ad.format), (unsigned long)ad.offset,
 +                    (unsigned long)g);
 +                vs.key += buf;
@@ -3504,20 +3524,13 @@ index 00000000..6b71f282
 +    {
 +        if (kFirstVertexBufferIndex + g >= kDummyVertexBufferIndex)
 +            return false;
-+        MTLVertexBufferLayoutDescriptor* ld = vs.desc.layouts[kFirstVertexBufferIndex + g];
-+        ld.stride = NSUInteger(groups[g].stride);
-+        ld.stepFunction = MTLVertexStepFunctionPerVertex;
++        vs.layouts.push_back({ kFirstVertexBufferIndex + g, NSUInteger(groups[g].stride), false });
 +        vs.binds.push_back({ BufferObject(groups[g].buffer), NSUInteger(groups[g].base), kFirstVertexBufferIndex + g });
 +        snprintf(buf, sizeof(buf), "L%lu:%d|", (unsigned long)g, int(groups[g].stride));
 +        vs.key += buf;
 +    }
 +    if (vs.needDummy)
-+    {
-+        MTLVertexBufferLayoutDescriptor* ld = vs.desc.layouts[kDummyVertexBufferIndex];
-+        ld.stride = 16;
-+        ld.stepFunction = MTLVertexStepFunctionConstant;
-+        ld.stepRate = 0;
-+    }
++        vs.layouts.push_back({ kDummyVertexBufferIndex, 16, true });
 +    return true;
 +}
 +
@@ -3546,7 +3559,20 @@ index 00000000..6b71f282
 +    MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
 +    d.vertexFunction = lib.fn[0];
 +    d.fragmentFunction = lib.fn[1];
-+    d.vertexDescriptor = vs.desc;
++    MTLVertexDescriptor* vd = [MTLVertexDescriptor vertexDescriptor];
++    for (const VertexSetup::AttrSpec& a : vs.attrs)
++    {
++        vd.attributes[a.location].format = a.format;
++        vd.attributes[a.location].offset = a.offset;
++        vd.attributes[a.location].bufferIndex = a.bufferIndex;
++    }
++    for (const VertexSetup::LayoutSpec& l : vs.layouts)
++    {
++        vd.layouts[l.index].stride = l.stride;
++        vd.layouts[l.index].stepFunction = l.constant ? MTLVertexStepFunctionConstant : MTLVertexStepFunctionPerVertex;
++        vd.layouts[l.index].stepRate = l.constant ? 0 : 1;
++    }
++    d.vertexDescriptor = vd;
 +    MTLColorWriteMask mask = MTLColorWriteMaskNone;
 +    if (s.colorMask[0]) mask |= MTLColorWriteMaskRed;
 +    if (s.colorMask[1]) mask |= MTLColorWriteMaskGreen;
@@ -3992,11 +4018,17 @@ index 00000000..6b71f282
 +        [s.cmd commit];
 +        s.cmd = nil;
 +    }
++    if (s.pool)
++    {
++        objc_autoreleasePoolPop(s.pool);
++        s.pool = nullptr;
++    }
 +    ++s.frameIndex;
 +    if ((s.frameIndex % 600) == 1)
 +    {
-+        printf("[iOSRay] Metal: кадр %u — рисований %u (пропущено %u), проходов %u, PSO %zu, источник %s\n",
-+            s.frameIndex, s.draws, s.skipped, s.passes, s.pipelines.size(),
++        printf("[iOSRay] Metal: кадр %u — рисований %u (пропущено %u), проходов %u, PSO %zu, свободно %zu МБ, "
++               "источник %s\n",
++            s.frameIndex, s.draws, s.skipped, s.passes, s.pipelines.size(), os_proc_available_memory() >> 20,
 +            s.presentSource ? [NSString stringWithFormat:@"%lux%lu", (unsigned long)s.presentSource.width,
 +                                                          (unsigned long)s.presentSource.height].UTF8String
 +                            : "нет");
