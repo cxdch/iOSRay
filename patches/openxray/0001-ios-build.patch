@@ -5363,16 +5363,69 @@ index 55ae8027..a6713bba 100644
          rt_Forward.create("$user$forward", w, h, D3DFMT_A8R8G8B8, 1);
  #endif
  
+diff --git a/src/xrEngine/CMakeLists.txt b/src/xrEngine/CMakeLists.txt
+index 7a2eb22c..16c91f24 100644
+--- a/src/xrEngine/CMakeLists.txt
++++ b/src/xrEngine/CMakeLists.txt
+@@ -356,6 +356,8 @@ target_sources_grouped(
+     FILES
+     GameFont.cpp
+     GameFont.h
++    ios_fontgen.cpp
++    ios_fontgen.h
+     IGameFont.hpp
+ )
+ 
 diff --git a/src/xrEngine/GameFont.cpp b/src/xrEngine/GameFont.cpp
-index add453d0..c5d5c4b2 100644
+index add453d0..434eb125 100644
 --- a/src/xrEngine/GameFont.cpp
 +++ b/src/xrEngine/GameFont.cpp
-@@ -68,7 +68,37 @@ void CGameFont::Initialize(pcstr cShader, pcstr cTextureName)
+@@ -2,6 +2,7 @@
+ #pragma hdrstop
+ 
+ #include "GameFont.h"
++#include "ios_fontgen.h"
+ #include "xr_level_controller.h"
+ #include "xrCore/Text/StringConversion.hpp"
+ #include "Render.h"
+@@ -68,7 +69,69 @@ void CGameFont::Initialize(pcstr cShader, pcstr cTextureName)
      xr_strcpy(buf, cTexture);
      if (strext(buf))
          *strext(buf) = 0;
 -    R_ASSERT2(FS.exist(fn, "$game_textures$", buf, ".ini"), fn);
-+    if (!FS.exist(fn, "$game_textures$", buf, ".ini"))
++    bool haveIni = FS.exist(fn, "$game_textures$", buf, ".ini");
++#if defined(XR_PLATFORM_APPLE)
++    // iOSRay: нет оригинальных метрик — берём (или один раз создаём) запасной шрифт CoreText.
++    // Оригинальный .ini из gamedata, если он появится, всегда в приоритете.
++    if (!haveIni)
++    {
++        string_path genRel;
++        strconcat(genRel, "iosray_fonts_v1\\", buf);
++        haveIni = FS.exist(fn, "$game_saves$", genRel, ".ini");
++        if (!haveIni)
++        {
++            u32 texH = 256;
++            string_path dds;
++            if (FS.exist(dds, "$game_textures$", buf, ".dds"))
++            {
++                if (IReader* r = FS.r_open(dds))
++                {
++                    if (r->length() >= 20 && r->r_u32() == 0x20534444)
++                    {
++                        r->seek(12);
++                        texH = r->r_u32();
++                    }
++                    FS.r_close(r);
++                }
++            }
++            if (XrIosMakeFallbackFont(buf, texH, genRel))
++                haveIni = FS.exist(fn, "$game_saves$", genRel, ".ini");
++        }
++        if (haveIni)
++            xr_strcpy(cTexture, genRel);
++    }
++#endif
++    if (!haveIni)
 +    {
 +        // Временная заглушка (iOSRay): нет файла метрик шрифта — режем текстуру
 +        // равной сеткой 16x16. Размер клетки берём из заголовка DDS.
@@ -5428,7 +5481,7 @@ index 6bb1d98e..d15c94de 100644
  int psTextureLOD = 1;
 +#endif
 diff --git a/src/xrEngine/device.cpp b/src/xrEngine/device.cpp
-index 01a427c0..48d772da 100644
+index 01a427c0..99b7b1b4 100644
 --- a/src/xrEngine/device.cpp
 +++ b/src/xrEngine/device.cpp
 @@ -1,5 +1,10 @@
@@ -5457,7 +5510,7 @@ index 01a427c0..48d772da 100644
  
  bool g_bLoaded = false;
  ref_light precache_light = 0;
-@@ -258,6 +269,50 @@ void CRenderDevice::DoRender()
+@@ -258,6 +269,61 @@ void CRenderDevice::DoRender()
      stats.RenderTotal.accum = renderTotalReal.accum;
  }
  
@@ -5465,6 +5518,9 @@ index 01a427c0..48d772da 100644
 +// iOSRay: на что уходит время кадра. Раз в 10 с — строка в лог.
 +// Время ожидания GPU и время работы GPU отдаёт Metal-слой (в GL-режиме — нули).
 +extern "C" void xr_mtl_frame_stats(double* gpuMs, double* waitMs) __attribute__((weak));
++#include <malloc/malloc.h>
++#include <os/proc.h>
++#include "xrScriptEngine/script_engine.hpp"
 +namespace IosFrameStats
 +{
 +struct Mark
@@ -5496,6 +5552,14 @@ index 01a427c0..48d772da 100644
 +    Msg("* [iOSRay] кадр: %.1f к/с | логика %.1f мс | рендер %.1f мс (ожидание GPU %.1f) | потоки %.1f | сон %.1f | "
 +        "занято %.1f, худший %.1f | GPU %.1f мс",
 +        n / secs, sum[0] / n, sum[1] / n, wait, sum[2] / n, sum[3] / n, sum[4] / n, worst, gpu);
++    // Память: свободно для процесса, занято malloc (движок + драйвер), скрипты Lua
++    malloc_statistics_t ms{};
++    malloc_zone_statistics(nullptr, &ms);
++    size_t luaKb = 0;
++    if (GEnv.ScriptEngine && GEnv.ScriptEngine->lua())
++        luaKb = size_t(lua_gc(GEnv.ScriptEngine->lua(), LUA_GCCOUNT, 0));
++    Msg("* [iOSRay] память: свободно %zu МБ | malloc %zu МБ | Lua %zu МБ", size_t(os_proc_available_memory() >> 20),
++        ms.size_in_use >> 20, luaKb >> 10);
 +    for (double& v : sum)
 +        v = 0;
 +    worst = 0;
@@ -5508,7 +5572,7 @@ index 01a427c0..48d772da 100644
  void CRenderDevice::ProcessFrame()
  {
      ZoneScoped;
-@@ -266,10 +321,16 @@ void CRenderDevice::ProcessFrame()
+@@ -266,10 +332,16 @@ void CRenderDevice::ProcessFrame()
          return;
  
      const u64 frameStartTime = TimerGlobal.GetElapsed_ms();
@@ -5525,7 +5589,7 @@ index 01a427c0..48d772da 100644
  
      const auto& processSeqParallel = TaskScheduler->AddTask([this]
      {
-@@ -281,8 +342,14 @@ void CRenderDevice::ProcessFrame()
+@@ -281,8 +353,14 @@ void CRenderDevice::ProcessFrame()
      });
  
      DoRender();
@@ -5540,7 +5604,7 @@ index 01a427c0..48d772da 100644
  
      const u64 frameEndTime = TimerGlobal.GetElapsed_ms();
      const u64 frameTime = frameEndTime - frameStartTime;
-@@ -300,6 +367,10 @@ void CRenderDevice::ProcessFrame()
+@@ -300,6 +378,10 @@ void CRenderDevice::ProcessFrame()
  
      if (!b_is_Active)
          Sleep(1);
@@ -5551,6 +5615,205 @@ index 01a427c0..48d772da 100644
  }
  
  void CRenderDevice::ProcessEvent(const SDL_Event& event)
+diff --git a/src/xrEngine/ios_fontgen.cpp b/src/xrEngine/ios_fontgen.cpp
+new file mode 100644
+index 00000000..98c4f658
+--- /dev/null
++++ b/src/xrEngine/ios_fontgen.cpp
+@@ -0,0 +1,182 @@
++// iOSRay: запасной шрифт, когда в gamedata нет файла метрик (ui_font_*.ini).
++// Рисуем 256 символов кодировки CP1251 системным шрифтом iOS (CoreText) в текстуру
++// и пишем рядом метрики в формате оригинального [symbol_coords].
++// Файлы кладутся в $game_saves$/iosray_fonts_v1/ и при следующих запусках берутся готовыми.
++// Оригинальные .ini из gamedata всегда в приоритете — сюда попадаем только без них.
++#include "stdafx.h"
++
++#if defined(XR_PLATFORM_APPLE)
++#include <CoreText/CoreText.h>
++#include <CoreGraphics/CoreGraphics.h>
++#include <cmath>
++#include <cstring>
++
++#include "ios_fontgen.h"
++
++namespace
++{
++// Размер строки шрифта: число из имени (graff_22 -> 22), иначе по размеру текстуры
++float PickHeight(pcstr name, u32 texH)
++{
++    pcstr base = strrchr(name, '\\');
++    base = base ? base + 1 : name;
++    for (pcstr p = base; *p; ++p)
++    {
++        if (*p == '_' && p[1] >= '1' && p[1] <= '9')
++        {
++            int v = atoi(p + 1);
++            pcstr e = p + 1;
++            while (*e >= '0' && *e <= '9')
++                ++e;
++            if (*e == '_' && v >= 8 && v <= 64)
++                return float(v);
++        }
++    }
++    return std::max(12.f, float(texH) / 16.f);
++}
++
++CFStringRef PickFace(pcstr name)
++{
++    if (strstr(name, "console"))
++        return CFSTR("Menlo-Bold");
++    if (strstr(name, "graff"))
++        return CFSTR("AvenirNextCondensed-DemiBold");
++    if (strstr(name, "letter"))
++        return CFSTR("AvenirNext-Medium");
++    if (strstr(name, "hud"))
++        return CFSTR("AvenirNextCondensed-Medium");
++    return CFSTR("Helvetica");
++}
++
++u32 NextPow2(u32 v)
++{
++    u32 p = 1;
++    while (p < v)
++        p <<= 1;
++    return p;
++}
++} // namespace
++
++bool XrIosMakeFallbackFont(pcstr texName, u32 texH, pcstr outRel)
++{
++    const float lineH = PickHeight(texName, texH);
++
++    // Подбираем кегль так, чтобы высота строки (подъём + спуск) была равна lineH
++    CTFontRef probe = CTFontCreateWithName(PickFace(texName), lineH, nullptr);
++    if (!probe)
++        return false;
++    const float k = float(CTFontGetAscent(probe) + CTFontGetDescent(probe)) / lineH;
++    CFRelease(probe);
++    CTFontRef font = CTFontCreateWithName(PickFace(texName), lineH / std::max(k, 0.5f), nullptr);
++    const float ascent = float(CTFontGetAscent(font));
++
++    // Символы CP1251 -> UTF-16
++    UniChar chars[256]{};
++    for (int i = 0x20; i < 0x80; ++i)
++        chars[i] = UniChar(i);
++    {
++        u8 hi[128];
++        for (int i = 0; i < 128; ++i)
++            hi[i] = u8(0x80 + i);
++        CFStringRef s = CFStringCreateWithBytes(nullptr, hi, 128, kCFStringEncodingWindowsCyrillic, false);
++        if (s && CFStringGetLength(s) == 128)
++            CFStringGetCharacters(s, CFRangeMake(0, 128), chars + 0x80);
++        if (s)
++            CFRelease(s);
++    }
++    chars[0x7F] = 0;
++
++    CGGlyph glyphs[256]{};
++    CTFontGetGlyphsForCharacters(font, chars, glyphs, 256);
++    CGSize adv[256]{};
++    CTFontGetAdvancesForGlyphs(font, kCTFontOrientationHorizontal, glyphs, adv, 256);
++
++    // Раскладка: ряды по ширине 512, клетка = ширина символа + зазор
++    constexpr u32 W = 512;
++    constexpr int gap = 2;
++    const int rowH = int(std::ceil(lineH)) + gap;
++    struct Cell { int x, y, w; } cell[256]{};
++    int x = gap, y = gap;
++    for (int i = 0; i < 256; ++i)
++    {
++        const bool has = chars[i] && (glyphs[i] || chars[i] == ' ');
++        const int w = has ? int(std::ceil(adv[i].width)) : 0;
++        if (x + w + gap > int(W))
++        {
++            x = gap;
++            y += rowH;
++        }
++        cell[i] = { x, y, w };
++        x += w + gap;
++    }
++    const u32 H = NextPow2(u32(y + rowH + gap));
++
++    // Рисуем белым по прозрачному
++    xr_vector<u8> px(size_t(W) * H * 4, 0);
++    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
++    CGContextRef ctx = CGBitmapContextCreate(px.data(), W, H, 8, W * 4, cs, kCGImageAlphaPremultipliedLast);
++    CGColorSpaceRelease(cs);
++    if (!ctx)
++    {
++        CFRelease(font);
++        return false;
++    }
++    CGContextSetShouldAntialias(ctx, true);
++    CGContextSetShouldSmoothFonts(ctx, false);
++    CGContextSetRGBFillColor(ctx, 1, 1, 1, 1);
++    for (int i = 0; i < 256; ++i)
++    {
++        if (!cell[i].w || !glyphs[i])
++            continue;
++        // CG: начало координат снизу. Буфер памяти при этом идёт сверху вниз.
++        const CGPoint pos = CGPointMake(cell[i].x, CGFloat(H) - (cell[i].y + ascent));
++        CTFontDrawGlyphs(font, &glyphs[i], &pos, 1, ctx);
++    }
++    CGContextRelease(ctx);
++    CFRelease(font);
++    for (size_t i = 0; i < px.size(); i += 4) // белый цвет, альфа = покрытие
++        px[i] = px[i + 1] = px[i + 2] = 255;
++
++    // DDS без сжатия (A8B8G8R8)
++    u32 hdr[32]{};
++    hdr[0] = 0x20534444; // "DDS "
++    hdr[1] = 124;
++    hdr[2] = 0x1 | 0x2 | 0x4 | 0x8 | 0x1000; // caps|height|width|pitch|pixelformat
++    hdr[3] = H;
++    hdr[4] = W;
++    hdr[5] = W * 4;
++    hdr[19] = 32;        // ddspf.size
++    hdr[20] = 0x41;      // RGB | ALPHAPIXELS
++    hdr[22] = 32;        // bits
++    hdr[23] = 0x000000ff;
++    hdr[24] = 0x0000ff00;
++    hdr[25] = 0x00ff0000;
++    hdr[26] = 0xff000000;
++    hdr[27] = 0x1000;    // caps: texture
++
++    string_path rel;
++    strconcat(rel, outRel, ".dds");
++    IWriter* w = FS.w_open("$game_saves$", rel);
++    if (!w)
++        return false;
++    w->w(hdr, sizeof(hdr));
++    w->w(px.data(), px.size());
++    FS.w_close(w);
++
++    strconcat(rel, outRel, ".ini");
++    w = FS.w_open("$game_saves$", rel);
++    if (!w)
++        return false;
++    string256 line;
++    xr_sprintf(line, "[symbol_coords]\r\nheight = %.0f\r\n", lineH);
++    w->w(line, xr_strlen(line));
++    for (int i = 0; i < 256; ++i)
++    {
++        xr_sprintf(line, "%03d = %d, %d, %d\r\n", i, cell[i].x, cell[i].y, cell[i].x + cell[i].w);
++        w->w(line, xr_strlen(line));
++    }
++    FS.w_close(w);
++    Msg("* [iOSRay] запасной шрифт для '%s': высота %.0f, текстура %ux%u", texName, lineH, W, H);
++    return true;
++}
++#endif
+diff --git a/src/xrEngine/ios_fontgen.h b/src/xrEngine/ios_fontgen.h
+new file mode 100644
+index 00000000..0c3fe20e
+--- /dev/null
++++ b/src/xrEngine/ios_fontgen.h
+@@ -0,0 +1,5 @@
++#pragma once
++#if defined(XR_PLATFORM_APPLE)
++// iOSRay: создаёт в $game_saves$ текстуру (outRel.dds) и метрики (outRel.ini) запасного шрифта.
++bool XrIosMakeFallbackFont(pcstr texName, u32 texH, pcstr outRel);
++#endif
 diff --git a/src/xrEngine/x_ray.cpp b/src/xrEngine/x_ray.cpp
 index 20d2e576..d4d6cdc0 100644
 --- a/src/xrEngine/x_ray.cpp
@@ -5876,6 +6139,39 @@ index b2c8878e..42b920dd 100644
          if (m_fire_mode)
              m_fire_mode->SetText(item_info.fire_mode.c_str());
          SetAmmoIcon(item_info.icon.c_str());
+diff --git a/src/xrUICore/TrackBar/UITrackBar.cpp b/src/xrUICore/TrackBar/UITrackBar.cpp
+index 1cef69ab..d8cfa81c 100644
+--- a/src/xrUICore/TrackBar/UITrackBar.cpp
++++ b/src/xrUICore/TrackBar/UITrackBar.cpp
+@@ -170,9 +170,27 @@ void CUITrackBar::InitTrackBar(Fvector2 pos, Fvector2 size)
+     m_pSlider->InitButton(
+         Fvector2().set(0.0f, 0.0f) /*(size.y - item_height)/2.0f)*/, Fvector2().set(item_width, item_height)); // size
+ 
+-    if (!m_pSlider->InitTexture(SLIDER_BOX_TEXTURE, false))
++    const bool boxOk = m_pSlider->InitTexture(SLIDER_BOX_TEXTURE, false);
++    if (!boxOk)
+        m_pSlider->InitTexture(SLIDER_BUTTON_TEXTURE, false);
+ 
++#if defined(XR_PLATFORM_APPLE)
++    // iOSRay: диагностика «размазанных» ползунков в настройках — один раз
++    static bool s_logged = false;
++    if (!s_logged)
++    {
++        s_logged = true;
++        float bw = 0, bh = 0;
++        const bool cop = CUITextureMaster::GetTextureWidth(UI_SLIDER_BAR, bw);
++        if (!cop)
++            CUITextureMaster::GetTextureWidth(UI_SLIDER_ENABLED, bw);
++        CUITextureMaster::GetTextureHeight(cop ? UI_SLIDER_BAR : UI_SLIDER_ENABLED, bh);
++        Msg("~ [iOSRay] ползунок: полоса '%s' %.0fx%.0f, бегунок '%s' %.0fx%.0f, окно %.0fx%.0f, kx %.3f",
++            cop ? UI_SLIDER_BAR : UI_SLIDER_ENABLED, bw, bh, boxOk ? SLIDER_BOX_TEXTURE : SLIDER_BUTTON_TEXTURE,
++            item_width, item_height, size.x, size.y, UI().get_current_kx());
++    }
++#endif
++
+     SetCurrentState(S_Enabled);
+ }
+ 
 diff --git a/src/xrUICore/Windows/UIFrameWindow.cpp b/src/xrUICore/Windows/UIFrameWindow.cpp
 index 51f9d9c2..81a8b4b3 100644
 --- a/src/xrUICore/Windows/UIFrameWindow.cpp
@@ -5902,7 +6198,7 @@ index 51f9d9c2..81a8b4b3 100644
      u32 cnt = 0;
      if (back_len.x > 0.0f) // top+bottom
 diff --git a/src/xr_3da/CMakeLists.txt b/src/xr_3da/CMakeLists.txt
-index 2ea56a22..7a2fd57f 100644
+index 2ea56a22..6041fc95 100644
 --- a/src/xr_3da/CMakeLists.txt
 +++ b/src/xr_3da/CMakeLists.txt
 @@ -37,6 +37,18 @@ set_target_properties(xr_3da PROPERTIES
@@ -5919,7 +6215,7 @@ index 2ea56a22..7a2fd57f 100644
 +        COMPILE_OPTIONS "-fobjc-arc"
 +        SKIP_PRECOMPILE_HEADERS ON
 +        SKIP_UNITY_BUILD_INCLUSION ON)
-+    target_link_libraries(xr_3da PRIVATE SDL2::SDL2main "-framework Foundation" "-framework UIKit")
++    target_link_libraries(xr_3da PRIVATE SDL2::SDL2main "-framework Foundation" "-framework UIKit" "-framework CoreText" "-framework CoreGraphics")
 +    # На iOS исполняемый файл — это .app-бандл; пакет собирает проект iOSRay.
 +    install(TARGETS xr_3da BUNDLE DESTINATION "${CMAKE_INSTALL_BINDIR}")
 +else()
@@ -6230,7 +6526,7 @@ index 00000000..32c51455
 +}
 diff --git a/src/xr_3da/ios_touch.mm b/src/xr_3da/ios_touch.mm
 new file mode 100644
-index 00000000..c85e4d8b
+index 00000000..0cfa62ae
 --- /dev/null
 +++ b/src/xr_3da/ios_touch.mm
 @@ -0,0 +1,416 @@
@@ -6406,7 +6702,7 @@ index 00000000..c85e4d8b
 +        case actJump:      c = CGPointMake(W - 186, H - 146); break;
 +        case actReload:    c = CGPointMake(W - 42,  H - 124); break;
 +        case actCrouch:    c = CGPointMake(W - 118, H - 112); break;
-+        case actSprint:    c = CGPointMake(W - 80,  H - 40);  break;
++        case actSprint:    c = CGPointMake(W - 170, H - 40);  break;
 +        default:
 +            if (b.action >= actWpn1 && b.action <= actWpn6)
 +                c = CGPointMake(wpnCenter + (b.action - actWpn1 - 2.5) * wpnStep, T + 26);
