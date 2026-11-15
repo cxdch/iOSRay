@@ -1293,15 +1293,18 @@ index 30519005..ecb595f1 100644
  #else
          return (GLint)GL_CLAMP_TO_BORDER;
 diff --git a/src/Layers/xrRenderGL/glTexture.cpp b/src/Layers/xrRenderGL/glTexture.cpp
-index 1cee8526..ef552b94 100644
+index 1cee8526..82fd6187 100644
 --- a/src/Layers/xrRenderGL/glTexture.cpp
 +++ b/src/Layers/xrRenderGL/glTexture.cpp
-@@ -5,6 +5,16 @@
+@@ -5,6 +5,19 @@
  #include "stdafx.h"
  
  #include <gli/gli.hpp>
 +#ifdef XR_GL_ES
 +#include "glBCDecode.h"
++#ifdef XR_USE_TEXCODEC
++#include <xr_texcodec.h> // iOSRay: распаковка на Rust (rust/texcodec)
++#endif
 +#endif
 +#ifdef XR_USE_ASTC
 +#include <astcenc.h>
@@ -1313,7 +1316,7 @@ index 1cee8526..ef552b94 100644
  
  namespace xray::render::RENDER_NAMESPACE
  {
-@@ -42,6 +52,229 @@ int get_texture_load_lod(LPCSTR fn)
+@@ -42,6 +55,254 @@ int get_texture_load_lod(LPCSTR fn)
      return 2;
  }
  
@@ -1354,7 +1357,16 @@ index 1cee8526..ef552b94 100644
 +                const size_t srcSlice = size_t((e.x + 3) / 4) * size_t((e.y + 3) / 4) * blockSize;
 +                const size_t dstSlice = size_t(e.x) * size_t(e.y) * 4;
 +                for (int z = 0; z < e.z; ++z)
++                {
++#ifdef XR_USE_TEXCODEC
++                    // Rust проверяет длины обоих буферов: битый DDS не запишет за край
++                    if (!xr_bc_decode_level(u32(k), src + z * srcSlice, srcSlice, u32(e.x), u32(e.y),
++                            dst + z * dstSlice, dstSlice))
++                        Msg("! texcodec: не распакован уровень %zu (%dx%d): %s", level, e.x, e.y, name);
++#else
 +                    bc::decode_level(k, src + z * srcSlice, u32(e.x), u32(e.y), dst + z * dstSlice);
++#endif
++                }
 +            }
 +    static size_t decodedBytes = 0;
 +    static u32 decodedCount = 0;
@@ -1419,6 +1431,9 @@ index 1cee8526..ef552b94 100644
 +            *c = '/';
 +    mkdir(g_astc.dir, 0755);
 +    Msg("* ASTC: включено, кэш: %s", g_astc.dir);
++#ifdef XR_USE_TEXCODEC
++    Msg("* %s: распаковка DXT и проверка кэша", xr_texcodec_version());
++#endif
 +    g_astc.usable = true;
 +    return true;
 +}
@@ -1447,6 +1462,19 @@ index 1cee8526..ef552b94 100644
 +        return false;
 +    XraHeader hd{};
 +    bool ok = fread(&hd, sizeof(hd), 1, f) == 1 && hd.magic == XRA_MAGIC;
++#ifdef XR_USE_TEXCODEC
++    // Числа из файла проверяет Rust до того, как по ним выделится память
++    static_assert(sizeof(XraHeader) == sizeof(XrXraHeader));
++    if (ok)
++    {
++        fseek(f, 0, SEEK_END);
++        const long len = ftell(f);
++        fseek(f, long(sizeof(hd)), SEEK_SET);
++        ok = len > 0 && xr_xra_validate(reinterpret_cast<const XrXraHeader*>(&hd), u64(len));
++        if (!ok)
++            Msg("! ASTC: битый файл кэша, пересжимаю: %s", path);
++    }
++#endif
 +    if (ok)
 +    {
 +        gli::texture t(gli::target(hd.target), gli::format(hd.format), gli::extent3d(hd.w, hd.h, hd.d), hd.layers,
@@ -1543,7 +1571,7 @@ index 1cee8526..ef552b94 100644
  u32 calc_texture_size(int lod, u32 mip_cnt, size_t orig_size)
  {
      if (1 == mip_cnt)
-@@ -110,10 +343,33 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
+@@ -110,10 +371,33 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
  #endif // DEBUG
      gli::texture texture = gli::load((char*)S->pointer(), img_size);
      R_ASSERT2(!texture.empty(), fn);
@@ -1578,7 +1606,7 @@ index 1cee8526..ef552b94 100644
      gli::gl GL(gli::gl::PROFILE_ES30);
  #else
      gli::gl GL(gli::gl::PROFILE_GL33);
-@@ -130,7 +386,7 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
+@@ -130,7 +414,7 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
      glTexParameteri(target, GL_TEXTURE_BASE_LEVEL, 0);
      glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, static_cast<GLint>(texture.levels() - 1));
  
@@ -2296,10 +2324,10 @@ index 00000000..e1f4ad7e
 +} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_render.mm b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
 new file mode 100644
-index 00000000..5a193993
+index 00000000..446fcdfa
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
-@@ -0,0 +1,2144 @@
+@@ -0,0 +1,2177 @@
 +// iOSRay: Metal-режим, этап 4b — рисование.
 +//
 +// Здесь GL-вызовы движка превращаются в работу Metal:
@@ -2322,6 +2350,7 @@ index 00000000..5a193993
 +
 +#include <algorithm>
 +#include <cstdarg>
++#include <mutex>
 +#include <initializer_list>
 +#include <cmath>
 +#include <cstdio>
@@ -3162,13 +3191,23 @@ index 00000000..5a193993
 +}
 +
 +// --- кадр и проходы -------------------------------------------------------------------
++// Статистика кадра для лога движка (xr_mtl_frame_stats)
++double g_waitMs = 0, g_gpuMs = 0;
++unsigned g_waitFrames = 0, g_gpuFrames = 0;
++std::mutex g_statsMutex;
++
++double NowMs() { return CACurrentMediaTime() * 1000.0; }
++
 +void BeginFrameIfNeeded()
 +{
 +    if (!s.pool)
 +        s.pool = objc_autoreleasePoolPush();
 +    if (s.cmd)
 +        return;
++    const double w0 = NowMs();
 +    dispatch_semaphore_wait(s.inFlight, DISPATCH_TIME_FOREVER);
++    g_waitMs += NowMs() - w0;
++    ++g_waitFrames;
 +    auto& ring = s.rings[s.frameIndex % kFramesInFlight];
 +    ring.chunk = 0;
 +    ring.offset = 0;
@@ -4268,7 +4307,21 @@ index 00000000..5a193993
 +    return t;
 +}
 +} // namespace
++} // namespace xr_mtl
 +
++// Средние за период: время работы GPU на кадр и время ожидания GPU/экрана на CPU
++extern "C" void xr_mtl_frame_stats(double* gpuMs, double* waitMs)
++{
++    using namespace xr_mtl;
++    std::lock_guard<std::mutex> lock(g_statsMutex);
++    *gpuMs = g_gpuFrames ? g_gpuMs / g_gpuFrames : 0;
++    *waitMs = g_waitFrames ? g_waitMs / g_waitFrames : 0;
++    g_gpuMs = g_waitMs = 0;
++    g_gpuFrames = g_waitFrames = 0;
++}
++
++namespace xr_mtl
++{
 +// --- внешний интерфейс -------------------------------------------------------------
 +GLuint ElementBufferBinding() { return s.vaos[s.vao].elementBuffer; }
 +unsigned FrameIndex() { return s.frameIndex; }
@@ -4310,7 +4363,9 @@ index 00000000..5a193993
 +    EndAll();
 +    @autoreleasepool
 +    {
++        const double d0 = NowMs();
 +        id<CAMetalDrawable> drawable = [core.layer nextDrawable];
++        g_waitMs += NowMs() - d0;
 +        if (drawable)
 +        {
 +            MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -4334,6 +4389,12 @@ index 00000000..5a193993
 +        [s.cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
 +            if (cb.error)
 +                printf("! [iOSRay] Metal: ошибка GPU: %s\n", cb.error.localizedDescription.UTF8String);
++            else if (cb.GPUEndTime > cb.GPUStartTime)
++            {
++                std::lock_guard<std::mutex> lock(g_statsMutex);
++                g_gpuMs += (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
++                ++g_gpuFrames;
++            }
 +            dispatch_semaphore_signal(sem);
 +        }];
 +        [s.cmd commit];
@@ -5007,10 +5068,10 @@ index 00000000..fb0a9fdb
 +    bool transpose);
 +} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderPC_GL/CMakeLists.txt b/src/Layers/xrRenderPC_GL/CMakeLists.txt
-index 9018d8bb..45648ac4 100644
+index 9018d8bb..b513019a 100644
 --- a/src/Layers/xrRenderPC_GL/CMakeLists.txt
 +++ b/src/Layers/xrRenderPC_GL/CMakeLists.txt
-@@ -423,6 +423,38 @@ target_compile_definitions(xrRender_GL
+@@ -423,6 +423,44 @@ target_compile_definitions(xrRender_GL
      PURE_DYNAMIC_CAST
  )
  
@@ -5023,6 +5084,12 @@ index 9018d8bb..45648ac4 100644
 +    target_include_directories(xrRender_GL PRIVATE "${XR_ASTCENC_INCLUDE_DIR}")
 +    target_link_libraries(xrRender_GL PRIVATE "${XR_ASTCENC_LIBRARY}")
 +    target_compile_definitions(xrRender_GL PRIVATE XR_USE_ASTC)
++    # Распаковка BC1–BC5 и проверка кэша .xra — на Rust (iOSRay rust/texcodec)
++    find_library(XR_TEXCODEC_LIBRARY NAMES xr_texcodec REQUIRED)
++    find_path(XR_TEXCODEC_INCLUDE_DIR xr_texcodec.h REQUIRED)
++    target_include_directories(xrRender_GL PRIVATE "${XR_TEXCODEC_INCLUDE_DIR}")
++    target_link_libraries(xrRender_GL PRIVATE "${XR_TEXCODEC_LIBRARY}")
++    target_compile_definitions(xrRender_GL PRIVATE XR_USE_TEXCODEC)
 +    # Экспериментальный Metal-режим (iOSRay): GL-вызовы рендера → Metal
 +    enable_language(OBJCXX)
 +    target_sources(xrRender_GL PRIVATE ../xrRenderGL/mtl/glmtl.mm ../xrRenderGL/mtl/glmtl_render.mm)
@@ -5272,18 +5339,21 @@ index 6bb1d98e..d15c94de 100644
  int psTextureLOD = 1;
 +#endif
 diff --git a/src/xrEngine/device.cpp b/src/xrEngine/device.cpp
-index 01a427c0..8984c40b 100644
+index 01a427c0..48d772da 100644
 --- a/src/xrEngine/device.cpp
 +++ b/src/xrEngine/device.cpp
-@@ -1,4 +1,7 @@
+@@ -1,5 +1,10 @@
  #include "stdafx.h"
+ 
++#include <chrono>
 +#ifdef __APPLE__
 +#include <TargetConditionals.h>
 +#endif
- 
++
  #include "Render.h"
  
-@@ -23,8 +26,14 @@ ENGINE_API bool g_bRendering = false;
+ #include "xrCore/FS_impl.h"
+@@ -23,8 +28,14 @@ ENGINE_API bool g_bRendering = false;
  ENGINE_API bool g_bBenchmark = false;
  string512 g_sBenchmarkName;
  
@@ -5298,6 +5368,100 @@ index 01a427c0..8984c40b 100644
  
  bool g_bLoaded = false;
  ref_light precache_light = 0;
+@@ -258,6 +269,50 @@ void CRenderDevice::DoRender()
+     stats.RenderTotal.accum = renderTotalReal.accum;
+ }
+ 
++#ifdef XR_PLATFORM_APPLE
++// iOSRay: на что уходит время кадра. Раз в 10 с — строка в лог.
++// Время ожидания GPU и время работы GPU отдаёт Metal-слой (в GL-режиме — нули).
++extern "C" void xr_mtl_frame_stats(double* gpuMs, double* waitMs) __attribute__((weak));
++namespace IosFrameStats
++{
++struct Mark
++{
++    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
++};
++double sum[5]{}, worst = 0;
++unsigned frames = 0;
++std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
++
++inline double Ms(const Mark& a, const Mark& b) { return std::chrono::duration<double, std::milli>(b.t - a.t).count(); }
++
++void Add(const Mark& t0, const Mark& t1, const Mark& t2, const Mark& t3, const Mark& t4)
++{
++    const double parts[] = { Ms(t0, t1), Ms(t1, t2), Ms(t2, t3), Ms(t3, t4) };
++    for (int i = 0; i < 4; ++i)
++        sum[i] += parts[i];
++    const double busy = parts[0] + parts[1] + parts[2];
++    sum[4] += busy;
++    worst = std::max(worst, busy);
++    ++frames;
++    const double secs = std::chrono::duration<double>(t4.t - since).count();
++    if (secs < 10.0)
++        return;
++    double gpu = 0, wait = 0;
++    if (xr_mtl_frame_stats)
++        xr_mtl_frame_stats(&gpu, &wait);
++    const double n = double(frames);
++    Msg("* [iOSRay] кадр: %.1f к/с | логика %.1f мс | рендер %.1f мс (ожидание GPU %.1f) | потоки %.1f | сон %.1f | "
++        "занято %.1f, худший %.1f | GPU %.1f мс",
++        n / secs, sum[0] / n, sum[1] / n, wait, sum[2] / n, sum[3] / n, sum[4] / n, worst, gpu);
++    for (double& v : sum)
++        v = 0;
++    worst = 0;
++    frames = 0;
++    since = t4.t;
++}
++} // namespace IosFrameStats
++#endif
++
+ void CRenderDevice::ProcessFrame()
+ {
+     ZoneScoped;
+@@ -266,10 +321,16 @@ void CRenderDevice::ProcessFrame()
+         return;
+ 
+     const u64 frameStartTime = TimerGlobal.GetElapsed_ms();
++#ifdef XR_PLATFORM_APPLE
++    IosFrameStats::Mark t0;
++#endif
+ 
+     FrameMove();
+ 
+     OnCameraUpdated();
++#ifdef XR_PLATFORM_APPLE
++    IosFrameStats::Mark t1;
++#endif
+ 
+     const auto& processSeqParallel = TaskScheduler->AddTask([this]
+     {
+@@ -281,8 +342,14 @@ void CRenderDevice::ProcessFrame()
+     });
+ 
+     DoRender();
++#ifdef XR_PLATFORM_APPLE
++    IosFrameStats::Mark t2;
++#endif
+ 
+     TaskScheduler->Wait(processSeqParallel);
++#ifdef XR_PLATFORM_APPLE
++    IosFrameStats::Mark t3;
++#endif
+ 
+     const u64 frameEndTime = TimerGlobal.GetElapsed_ms();
+     const u64 frameTime = frameEndTime - frameStartTime;
+@@ -300,6 +367,10 @@ void CRenderDevice::ProcessFrame()
+ 
+     if (!b_is_Active)
+         Sleep(1);
++#ifdef XR_PLATFORM_APPLE
++    IosFrameStats::Mark t4;
++    IosFrameStats::Add(t0, t1, t2, t3, t4);
++#endif
+ }
+ 
+ void CRenderDevice::ProcessEvent(const SDL_Event& event)
 diff --git a/src/xrEngine/x_ray.cpp b/src/xrEngine/x_ray.cpp
 index 20d2e576..d4d6cdc0 100644
 --- a/src/xrEngine/x_ray.cpp

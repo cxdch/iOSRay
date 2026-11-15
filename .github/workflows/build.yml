@@ -93,6 +93,9 @@ jobs:
         if: steps.deps-cache.outputs.cache-hit != 'true'
         run: bash scripts/build_deps_ios.sh
 
+      - name: Rust (распаковка текстур, rust/texcodec)
+        run: bash scripts/build_rust_ios.sh
+
       - name: Исходники OpenXRay + патчи
         run: bash scripts/fetch_openxray.sh
 
