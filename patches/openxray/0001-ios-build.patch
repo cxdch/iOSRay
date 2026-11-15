@@ -2210,10 +2210,10 @@ index 00000000..ad4d1581
 +} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_render.mm b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
 new file mode 100644
-index 00000000..de157f71
+index 00000000..67b9e285
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
-@@ -0,0 +1,1909 @@
+@@ -0,0 +1,2098 @@
 +// iOSRay: Metal-режим, этап 4b — рисование.
 +//
 +// Здесь GL-вызовы движка превращаются в работу Metal:
@@ -2276,6 +2276,20 @@ index 00000000..de157f71
 +    va_end(args);
 +    fflush(stdout);
 +}
++
++// FNV-1a: ключи кэшей без строк (их сборка на каждый вызов рисования дорога)
++struct Hasher
++{
++    uint64_t h = 1469598103934665603ull;
++    template <typename T>
++    Hasher& operator<<(const T& v)
++    {
++        const auto* b = reinterpret_cast<const uint8_t*>(&v);
++        for (size_t i = 0; i < sizeof(T); ++i)
++            h = (h ^ b[i]) * 1099511628211ull;
++        return *this;
++    }
++};
 +
 +// --- параметры выборки (у текстуры по умолчанию и у объектов-сэмплеров) ----------
 +struct SamplerParams
@@ -2385,7 +2399,8 @@ index 00000000..de157f71
 +    // кадр
 +    id<MTLCommandBuffer> cmd = nil;
 +    id<MTLRenderCommandEncoder> enc = nil;
-+    std::string encKey;
++    uint64_t encKey = 0;
++    bool targetsDirty = true;
 +    id<MTLTexture> encColor[kMaxColor] = {};
 +    id<MTLTexture> encDepth = nil;
 +    id<MTLTexture> presentSource = nil;
@@ -2402,8 +2417,8 @@ index 00000000..de157f71
 +
 +    // кэши
 +    std::unordered_map<SamplerParams, id<MTLSamplerState>, SamplerParamsHash> samplerStates;
-+    std::unordered_map<std::string, id<MTLRenderPipelineState>> pipelines;
-+    std::unordered_map<std::string, id<MTLDepthStencilState>> depthStates;
++    std::unordered_map<uint64_t, id<MTLRenderPipelineState>> pipelines;
++    std::unordered_map<uint64_t, id<MTLDepthStencilState>> depthStates;
 +    struct Lib
 +    {
 +        uint32_t generation = 0;
@@ -2622,6 +2637,7 @@ index 00000000..de157f71
 +
 +void gl_DeleteTextures(GLsizei n, const GLuint* names)
 +{
++    s.targetsDirty = true;
 +    for (GLsizei i = 0; i < n; ++i)
 +        s.textures.erase(names[i]);
 +}
@@ -2639,6 +2655,7 @@ index 00000000..de157f71
 +
 +void Allocate(Texture& t, GLenum target, GLsizei levels, GLenum internal, GLsizei w, GLsizei h, GLsizei d)
 +{
++    s.targetsDirty = true;
 +    t.target = target;
 +    t.internal = internal;
 +    t.format = PixelFormatOf(internal);
@@ -2939,6 +2956,7 @@ index 00000000..de157f71
 +// --- кадровые буферы и рендербуферы -------------------------------------------------
 +void gl_BindFramebuffer(GLenum target, GLuint fb)
 +{
++    s.targetsDirty = true;
 +    if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER)
 +        s.drawFbo = fb;
 +    if (target == GL_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER)
@@ -2947,6 +2965,7 @@ index 00000000..de157f71
 +
 +void gl_DeleteFramebuffers(GLsizei n, const GLuint* ids)
 +{
++    s.targetsDirty = true;
 +    for (GLsizei i = 0; i < n; ++i)
 +        s.fbos.erase(ids[i]);
 +}
@@ -2959,6 +2978,7 @@ index 00000000..de157f71
 +
 +void Attach(GLenum target, GLenum attachment, GLuint tex, GLint level)
 +{
++    s.targetsDirty = true;
 +    Fbo* f = TargetFbo(target);
 +    if (!f)
 +        return;
@@ -2998,6 +3018,7 @@ index 00000000..de157f71
 +
 +void gl_DrawBuffers(GLsizei n, const GLenum* bufs)
 +{
++    s.targetsDirty = true;
 +    Fbo* f = TargetFbo(GL_DRAW_FRAMEBUFFER);
 +    if (!f)
 +        return;
@@ -3060,7 +3081,7 @@ index 00000000..de157f71
 +    {
 +        [s.enc endEncoding];
 +        s.enc = nil;
-+        s.encKey.clear();
++        s.encKey = 0;
 +    }
 +}
 +
@@ -3070,15 +3091,20 @@ index 00000000..de157f71
 +    NSUInteger colorLevel[kMaxColor] = {};
 +    id<MTLTexture> depth = nil;
 +    id<MTLTexture> stencil = nil;
-+    std::string key;
++    uint64_t key = 0;
 +    bool empty = true;
 +    int width = 0, height = 0;
 +};
 +
-+PassTargets CurrentTargets()
++PassTargets g_targets; // кэш: пересчитывается только при смене FBO/вложений
++
++const PassTargets& CurrentTargets()
 +{
-+    PassTargets t;
-+    char buf[64];
++    if (!s.targetsDirty)
++        return g_targets;
++    s.targetsDirty = false;
++    PassTargets& t = g_targets;
++    t = PassTargets{};
 +    if (!s.drawFbo)
 +        return t;
 +    const Fbo& f = s.fbos[s.drawFbo];
@@ -3102,10 +3128,10 @@ index 00000000..de157f71
 +        if (st && HasStencil(st.pixelFormat))
 +            t.stencil = st;
 +    }
++    Hasher h;
 +    for (int i = 0; i < kMaxColor; ++i)
 +    {
-+        snprintf(buf, sizeof(buf), "%p:%u|", (__bridge void*)t.color[i], unsigned(t.colorLevel[i]));
-+        t.key += buf;
++        h << (__bridge void*)t.color[i] << t.colorLevel[i];
 +        if (t.color[i] && t.empty)
 +        {
 +            t.empty = false;
@@ -3113,8 +3139,8 @@ index 00000000..de157f71
 +            t.height = int(std::max<NSUInteger>(1, t.color[i].height >> t.colorLevel[i]));
 +        }
 +    }
-+    snprintf(buf, sizeof(buf), "%p|%p", (__bridge void*)t.depth, (__bridge void*)t.stencil);
-+    t.key += buf;
++    h << (__bridge void*)t.depth << (__bridge void*)t.stencil;
++    t.key = h.h | 1; // 0 — «прохода нет»
 +    if (t.empty && (t.depth || t.stencil))
 +    {
 +        t.empty = false;
@@ -3125,11 +3151,59 @@ index 00000000..de157f71
 +    return t;
 +}
 +
-+// Начать проход: clearMask — какие вложения очистить (иначе загрузить)
-+void BeginPass(const PassTargets& t, GLbitfield clearMask)
++// Отложенный проход: энкодер открывается только при первом рисовании.
++// Очистки копятся в нём как действия загрузки; проход без рисований и без
++// очисток не создаётся вовсе (меньше лишних загрузок/выгрузок кадра в память —
++// на мобильном GPU это основная трата энергии).
++struct PendingPass
++{
++    bool valid = false;
++    PassTargets t;
++    GLbitfield clear = 0;
++    float color[4] = {};
++    float depth = 1.f;
++    uint32_t stencil = 0;
++} g_pending;
++
++// То, что уже выставлено в текущем энкодере: повторно не выставляем
++struct EncoderCache
++{
++    id<MTLRenderPipelineState> pso;
++    id<MTLDepthStencilState> ds;
++    int cull = -1, winding = -1;
++    float bias[2] = { -1.f, -1.f };
++    uint32_t stencilRef[2] = { 0xFFFFFFFF, 0xFFFFFFFF };
++    float blendColor[4] = { -1.f, -1.f, -1.f, -1.f };
++    MTLViewport viewport = { -1, -1, -1, -1, -1, -1 };
++    MTLScissorRect scissor = { NSUIntegerMax, 0, 0, 0 };
++    __unsafe_unretained id<MTLBuffer> vbuf[2][31] = {};
++    NSUInteger voff[2][31] = {};
++    __unsafe_unretained id<MTLTexture> tex[2][16] = {};
++    __unsafe_unretained id<MTLSamplerState> smp[2][16] = {};
++} g_ec;
++
++void ResetEncoderCache() { g_ec = EncoderCache{}; }
++
++// буфер стадии (0 — вершинная, 1 — фрагментная)
++void SetBuffer(int st, id<MTLBuffer> b, NSUInteger off, NSUInteger idx)
++{
++    if (idx < 31 && g_ec.vbuf[st][idx] == b && g_ec.voff[st][idx] == off)
++        return;
++    if (idx < 31)
++    {
++        g_ec.vbuf[st][idx] = b;
++        g_ec.voff[st][idx] = off;
++    }
++    if (st == 0)
++        [s.enc setVertexBuffer:b offset:off atIndex:idx];
++    else
++        [s.enc setFragmentBuffer:b offset:off atIndex:idx];
++}
++
++void OpenEncoder(const PassTargets& t, GLbitfield clearMask, const float* clearColor, float clearDepth,
++    uint32_t clearStencil)
 +{
 +    BeginFrameIfNeeded();
-+    EndEncoder();
 +    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
 +    for (int i = 0; i < kMaxColor; ++i)
 +    {
@@ -3139,38 +3213,89 @@ index 00000000..de157f71
 +        rp.colorAttachments[i].level = t.colorLevel[i];
 +        rp.colorAttachments[i].loadAction = (clearMask & GL_COLOR_BUFFER_BIT) ? MTLLoadActionClear : MTLLoadActionLoad;
 +        rp.colorAttachments[i].storeAction = MTLStoreActionStore;
-+        rp.colorAttachments[i].clearColor = MTLClearColorMake(s.clearColor[0], s.clearColor[1], s.clearColor[2],
-+            s.clearColor[3]);
++        rp.colorAttachments[i].clearColor = MTLClearColorMake(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
 +    }
 +    if (t.depth)
 +    {
 +        rp.depthAttachment.texture = t.depth;
 +        rp.depthAttachment.loadAction = (clearMask & GL_DEPTH_BUFFER_BIT) ? MTLLoadActionClear : MTLLoadActionLoad;
 +        rp.depthAttachment.storeAction = MTLStoreActionStore;
-+        rp.depthAttachment.clearDepth = s.clearDepth;
++        rp.depthAttachment.clearDepth = clearDepth;
 +    }
 +    if (t.stencil)
 +    {
 +        rp.stencilAttachment.texture = t.stencil;
 +        rp.stencilAttachment.loadAction = (clearMask & GL_STENCIL_BUFFER_BIT) ? MTLLoadActionClear : MTLLoadActionLoad;
 +        rp.stencilAttachment.storeAction = MTLStoreActionStore;
-+        rp.stencilAttachment.clearStencil = uint32_t(s.clearStencil);
++        rp.stencilAttachment.clearStencil = clearStencil;
 +    }
 +    s.enc = [s.cmd renderCommandEncoderWithDescriptor:rp];
 +    s.encKey = t.key;
 +    for (int i = 0; i < kMaxColor; ++i)
 +        s.encColor[i] = t.color[i];
 +    s.encDepth = t.depth;
++    ResetEncoderCache();
 +    ++s.passes;
++}
++
++void FlushPending()
++{
++    if (!g_pending.valid)
++        return;
++    g_pending.valid = false;
++    if (!g_pending.clear)
++        return;
++    OpenEncoder(g_pending.t, g_pending.clear, g_pending.color, g_pending.depth, g_pending.stencil);
++    EndEncoder();
++}
++
++// Закрыть всё (перед blit/выводом кадра)
++void EndAll()
++{
++    EndEncoder();
++    FlushPending();
++}
++
++// Проход для рисования в текущие цели
++void EnsureEncoder(const PassTargets& t)
++{
++    if (s.enc && s.encKey == t.key)
++        return;
++    EndEncoder();
++    if (g_pending.valid && g_pending.t.key == t.key)
++    {
++        g_pending.valid = false;
++        OpenEncoder(t, g_pending.clear, g_pending.color, g_pending.depth, g_pending.stencil);
++        return;
++    }
++    FlushPending();
++    const float none[4] = {};
++    OpenEncoder(t, 0, none, 1.f, 0);
 +}
 +
 +void gl_Clear(GLbitfield mask)
 +{
-+    const PassTargets t = CurrentTargets();
++    const PassTargets& t = CurrentTargets();
 +    if (t.empty)
 +        return;
-+    // Очищаем загрузкой прохода. Scissor при этом не учитывается (пока).
-+    BeginPass(t, mask);
++    // Scissor/маски цвета при очистке не учитываются (пока)
++    if (s.enc && s.encKey == t.key)
++        EndEncoder(); // в открытом проходе уже рисовали — очистка начинает новый
++    if (!(g_pending.valid && g_pending.t.key == t.key))
++    {
++        EndEncoder();
++        FlushPending();
++        g_pending = PendingPass{};
++        g_pending.valid = true;
++        g_pending.t = t;
++    }
++    g_pending.clear |= mask;
++    if (mask & GL_COLOR_BUFFER_BIT)
++        memcpy(g_pending.color, s.clearColor, sizeof(g_pending.color));
++    if (mask & GL_DEPTH_BUFFER_BIT)
++        g_pending.depth = s.clearDepth;
++    if (mask & GL_STENCIL_BUFFER_BIT)
++        g_pending.stencil = uint32_t(s.clearStencil);
 +}
 +
 +void gl_ClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a)
@@ -3452,7 +3577,7 @@ index 00000000..de157f71
 +    };
 +    std::vector<AttrSpec> attrs;
 +    std::vector<LayoutSpec> layouts;
-+    std::string key;
++    Hasher key;
 +    struct Bind
 +    {
 +        id<MTLBuffer> buffer;
@@ -3461,6 +3586,14 @@ index 00000000..de157f71
 +    };
 +    std::vector<Bind> binds;
 +    bool needDummy = false;
++    void clear() // вместимость векторов сохраняется — без выделений памяти на каждый вызов
++    {
++        attrs.clear();
++        layouts.clear();
++        binds.clear();
++        key = Hasher{};
++        needDummy = false;
++    }
 +};
 +
 +bool BuildVertexSetup(const Program& p, VertexSetup& vs)
@@ -3472,8 +3605,9 @@ index 00000000..de157f71
 +        GLsizei stride;
 +        uintptr_t base;
 +    };
-+    std::vector<Group> groups;
-+    char buf[96];
++    static std::vector<Group> groups;
++    groups.clear();
++    vs.clear();
 +    for (const VertexInput& in : p.vsInputs)
 +    {
 +        if (in.location >= kMaxAttribs)
@@ -3485,8 +3619,7 @@ index 00000000..de157f71
 +            vs.attrs.push_back({ in.location, in.isInt ? MTLVertexFormatInt4 : MTLVertexFormatFloat4, 0,
 +                kDummyVertexBufferIndex });
 +            vs.needDummy = true;
-+            snprintf(buf, sizeof(buf), "a%u:d|", in.location);
-+            vs.key += buf;
++            vs.key << in.location << uint32_t(0xFFFF);
 +            continue;
 +        }
 +        const GLsizei stride = a.stride ? a.stride : GLsizei(VertexFormatSize(a));
@@ -3514,9 +3647,7 @@ index 00000000..de157f71
 +                const VertexSetup::AttrSpec ad{ in.location, VertexFormatOf(a), NSUInteger(a.offset - groups[g].base),
 +                    kFirstVertexBufferIndex + g };
 +                vs.attrs.push_back(ad);
-+                snprintf(buf, sizeof(buf), "a%u:%d:%lu:%lu|", in.location, int(ad.format), (unsigned long)ad.offset,
-+                    (unsigned long)g);
-+                vs.key += buf;
++                vs.key << in.location << ad.format << ad.offset << g;
 +                break;
 +            }
 +    }
@@ -3526,8 +3657,7 @@ index 00000000..de157f71
 +            return false;
 +        vs.layouts.push_back({ kFirstVertexBufferIndex + g, NSUInteger(groups[g].stride), false });
 +        vs.binds.push_back({ BufferObject(groups[g].buffer), NSUInteger(groups[g].base), kFirstVertexBufferIndex + g });
-+        snprintf(buf, sizeof(buf), "L%lu:%d|", (unsigned long)g, int(groups[g].stride));
-+        vs.key += buf;
++        vs.key << g << groups[g].stride;
 +    }
 +    if (vs.needDummy)
 +        vs.layouts.push_back({ kDummyVertexBufferIndex, 16, true });
@@ -3537,21 +3667,11 @@ index 00000000..de157f71
 +id<MTLRenderPipelineState> PipelineOf(GLuint program, const Program& p, const State::Lib& lib, const VertexSetup& vs,
 +    const PassTargets& t)
 +{
-+    std::string key;
-+    key.reserve(256);
-+    char buf[160];
-+    snprintf(buf, sizeof(buf), "%u:%u|", program, p.generation);
-+    key += buf;
-+    key += vs.key;
-+    for (int i = 0; i < kMaxColor; ++i)
-+    {
-+        snprintf(buf, sizeof(buf), "c%d|", t.color[i] ? int(t.color[i].pixelFormat) : 0);
-+        key += buf;
-+    }
-+    snprintf(buf, sizeof(buf), "d%d s%d b%d %x %x %x %x %x %x m%d%d%d%d", t.depth ? int(t.depth.pixelFormat) : 0,
-+        t.stencil ? int(t.stencil.pixelFormat) : 0, int(s.blend), s.blendSrcRGB, s.blendDstRGB, s.blendSrcA,
-+        s.blendDstA, s.blendEqRGB, s.blendEqA, s.colorMask[0], s.colorMask[1], s.colorMask[2], s.colorMask[3]);
-+    key += buf;
++    Hasher h = vs.key;
++    // форматы вложений однозначно задаются самими текстурами (t.key)
++    h << program << p.generation << t.key << s.blend << s.blendSrcRGB << s.blendDstRGB << s.blendSrcA << s.blendDstA
++      << s.blendEqRGB << s.blendEqA << s.colorMask;
++    const uint64_t key = h.h;
 +    const auto it = s.pipelines.find(key);
 +    if (it != s.pipelines.end())
 +        return it->second;
@@ -3610,11 +3730,12 @@ index 00000000..de157f71
 +{
 +    const bool depth = t.depth && s.depthTest;
 +    const bool stencil = t.stencil && s.stencilTest;
-+    char buf[160];
-+    snprintf(buf, sizeof(buf), "%d%d%x%d|%x%x%x%x%x%x|%x%x%x%x%x%x", depth, stencil, s.depthFunc, s.depthMask,
-+        s.stFront.func, s.stFront.readMask, s.stFront.writeMask, s.stFront.sfail, s.stFront.dpfail, s.stFront.dppass,
-+        s.stBack.func, s.stBack.readMask, s.stBack.writeMask, s.stBack.sfail, s.stBack.dpfail, s.stBack.dppass);
-+    const std::string key = buf;
++    Hasher h;
++    h << depth << stencil << s.depthFunc << s.depthMask;
++    if (stencil)
++        for (const StencilFace* f : { &s.stFront, &s.stBack })
++            h << f->func << f->readMask << f->writeMask << f->sfail << f->dpfail << f->dppass;
++    const uint64_t key = h.h;
 +    const auto it = s.depthStates.find(key);
 +    if (it != s.depthStates.end())
 +        return it->second;
@@ -3678,42 +3799,17 @@ index 00000000..de157f71
 +    if (!lib || lib->failed)
 +        return false;
 +
-+    const PassTargets t = CurrentTargets();
++    const PassTargets& t = CurrentTargets();
 +    if (t.empty)
 +        return false;
 +
-+    VertexSetup vs;
++    static VertexSetup vs;
 +    if (!BuildVertexSetup(*p, vs))
 +        return false;
 +    id<MTLRenderPipelineState> pso = PipelineOf(program, *p, *lib, vs, t);
 +    if (!pso)
 +        return false;
 +
-+    if (!s.enc || s.encKey != t.key)
-+        BeginPass(t, 0);
-+    id<MTLRenderCommandEncoder> e = s.enc;
-+    [e setRenderPipelineState:pso];
-+    [e setDepthStencilState:DepthStateOf(t)];
-+    [e setStencilFrontReferenceValue:uint32_t(s.stFront.ref) & 0xFF backReferenceValue:uint32_t(s.stBack.ref) & 0xFF];
-+    [e setCullMode:s.cull ? (s.cullFace == GL_FRONT ? MTLCullModeFront : s.cullFace == GL_BACK ? MTLCullModeBack
-+                                                                                              : MTLCullModeNone)
-+                          : MTLCullModeNone];
-+    // Y перевёрнут в шейдере → обход граней в Metal противоположный GL
-+    [e setFrontFacingWinding:s.frontFace == GL_CCW ? MTLWindingClockwise : MTLWindingCounterClockwise];
-+    if (s.polygonOffsetFill)
-+        [e setDepthBias:s.polyUnits slopeScale:s.polyFactor clamp:0];
-+    else
-+        [e setDepthBias:0 slopeScale:0 clamp:0];
-+    [e setBlendColorRed:s.blendColor[0] green:s.blendColor[1] blue:s.blendColor[2] alpha:s.blendColor[3]];
-+
-+    MTLViewport vp;
-+    vp.originX = s.viewport[0];
-+    vp.originY = s.viewport[1];
-+    vp.width = s.viewport[2];
-+    vp.height = s.viewport[3];
-+    vp.znear = s.depthNear;
-+    vp.zfar = s.depthFar;
-+    [e setViewport:vp];
 +    MTLScissorRect sc = { 0, 0, NSUInteger(t.width), NSUInteger(t.height) };
 +    if (s.scissorTest)
 +    {
@@ -3724,25 +3820,109 @@ index 00000000..de157f71
 +        if (sc.width == 0 || sc.height == 0)
 +            return false;
 +    }
-+    [e setScissorRect:sc];
++
++    EnsureEncoder(t);
++    id<MTLRenderCommandEncoder> e = s.enc;
++    if (g_ec.pso != pso)
++    {
++        g_ec.pso = pso;
++        [e setRenderPipelineState:pso];
++    }
++    id<MTLDepthStencilState> ds = DepthStateOf(t);
++    if (g_ec.ds != ds)
++    {
++        g_ec.ds = ds;
++        [e setDepthStencilState:ds];
++    }
++    const uint32_t refF = uint32_t(s.stFront.ref) & 0xFF, refB = uint32_t(s.stBack.ref) & 0xFF;
++    if (g_ec.stencilRef[0] != refF || g_ec.stencilRef[1] != refB)
++    {
++        g_ec.stencilRef[0] = refF;
++        g_ec.stencilRef[1] = refB;
++        [e setStencilFrontReferenceValue:refF backReferenceValue:refB];
++    }
++    const int cull = !s.cull ? int(MTLCullModeNone)
++        : s.cullFace == GL_FRONT ? int(MTLCullModeFront)
++        : s.cullFace == GL_BACK  ? int(MTLCullModeBack)
++                                 : int(MTLCullModeNone);
++    if (g_ec.cull != cull)
++    {
++        g_ec.cull = cull;
++        [e setCullMode:MTLCullMode(cull)];
++    }
++    // Y перевёрнут в шейдере → обход граней в Metal противоположный GL
++    const int winding = s.frontFace == GL_CCW ? int(MTLWindingClockwise) : int(MTLWindingCounterClockwise);
++    if (g_ec.winding != winding)
++    {
++        g_ec.winding = winding;
++        [e setFrontFacingWinding:MTLWinding(winding)];
++    }
++    const float bu = s.polygonOffsetFill ? s.polyUnits : 0.f, bf = s.polygonOffsetFill ? s.polyFactor : 0.f;
++    if (g_ec.bias[0] != bu || g_ec.bias[1] != bf)
++    {
++        g_ec.bias[0] = bu;
++        g_ec.bias[1] = bf;
++        [e setDepthBias:bu slopeScale:bf clamp:0];
++    }
++    if (memcmp(g_ec.blendColor, s.blendColor, sizeof(s.blendColor)))
++    {
++        memcpy(g_ec.blendColor, s.blendColor, sizeof(s.blendColor));
++        [e setBlendColorRed:s.blendColor[0] green:s.blendColor[1] blue:s.blendColor[2] alpha:s.blendColor[3]];
++    }
++    MTLViewport vp;
++    vp.originX = s.viewport[0];
++    vp.originY = s.viewport[1];
++    vp.width = s.viewport[2];
++    vp.height = s.viewport[3];
++    vp.znear = s.depthNear;
++    vp.zfar = s.depthFar;
++    if (memcmp(&g_ec.viewport, &vp, sizeof(vp)))
++    {
++        g_ec.viewport = vp;
++        [e setViewport:vp];
++    }
++    if (memcmp(&g_ec.scissor, &sc, sizeof(sc)))
++    {
++        g_ec.scissor = sc;
++        [e setScissorRect:sc];
++    }
 +
 +    for (const VertexSetup::Bind& b : vs.binds)
-+        [e setVertexBuffer:b.buffer offset:b.offset atIndex:b.index];
++        SetBuffer(0, b.buffer, b.offset, b.index);
 +    if (vs.needDummy)
-+        [e setVertexBuffer:s.dummyVertex offset:0 atIndex:kDummyVertexBufferIndex];
++        SetBuffer(0, s.dummyVertex, 0, kDummyVertexBufferIndex);
 +
-+    // uniform-блоки стадий
++    // uniform-блоки стадий: в GPU уходят только изменившиеся (в пределах кадра
++    // неизменный блок переиспользуется)
++    struct Upload
++    {
++        uint32_t generation = 0;
++        unsigned frame = ~0u;
++        id<MTLBuffer> buf[2];
++        NSUInteger off[2] = {};
++    };
++    static std::unordered_map<GLuint, Upload> uploads;
++    Upload& up = uploads[program];
++    if (up.generation != p->generation || up.frame != s.frameIndex)
++    {
++        up.generation = p->generation;
++        up.frame = s.frameIndex;
++        p->blockDirty[0] = p->blockDirty[1] = true;
++    }
 +    for (int st = 0; st < 2; ++st)
 +    {
 +        const std::vector<uint8_t>& block = p->block[st];
 +        if (block.empty())
 +            continue;
-+        const Alloc a = Transient(block.size());
-+        memcpy(a.ptr, block.data(), block.size());
-+        if (st == 0)
-+            [e setVertexBuffer:a.buffer offset:a.offset atIndex:kUniformBufferIndex];
-+        else
-+            [e setFragmentBuffer:a.buffer offset:a.offset atIndex:kUniformBufferIndex];
++        if (p->blockDirty[st] || !up.buf[st])
++        {
++            const Alloc a = Transient(block.size());
++            memcpy(a.ptr, block.data(), block.size());
++            up.buf[st] = a.buffer;
++            up.off[st] = a.offset;
++            p->blockDirty[st] = false;
++        }
++        SetBuffer(st, up.buf[st], up.off[st], kUniformBufferIndex);
 +    }
 +
 +    // текстуры и сэмплеры
@@ -3777,15 +3957,24 @@ index 00000000..de157f71
 +            if (!u.slot[st].present)
 +                continue;
 +            const NSUInteger idx = u.slot[st].textureIndex;
-+            if (st == 0)
++            const bool cached = idx < 16;
++            if (!cached || g_ec.tex[st][idx] != mt)
 +            {
-+                [e setVertexTexture:mt atIndex:idx];
-+                [e setVertexSamplerState:ss atIndex:idx];
++                if (cached)
++                    g_ec.tex[st][idx] = mt;
++                if (st == 0)
++                    [e setVertexTexture:mt atIndex:idx];
++                else
++                    [e setFragmentTexture:mt atIndex:idx];
 +            }
-+            else
++            if (!cached || g_ec.smp[st][idx] != ss)
 +            {
-+                [e setFragmentTexture:mt atIndex:idx];
-+                [e setFragmentSamplerState:ss atIndex:idx];
++                if (cached)
++                    g_ec.smp[st][idx] = ss;
++                if (st == 0)
++                    [e setVertexSamplerState:ss atIndex:idx];
++                else
++                    [e setFragmentSamplerState:ss atIndex:idx];
 +            }
 +        }
 +    }
@@ -3878,7 +4067,7 @@ index 00000000..de157f71
 +        return;
 +    }
 +    BeginFrameIfNeeded();
-+    EndEncoder();
++    EndAll();
 +    id<MTLBlitCommandEncoder> b = [s.cmd blitCommandEncoder];
 +    [b copyFromTexture:src sourceSlice:0 sourceLevel:0
 +          sourceOrigin:MTLOriginMake(NSUInteger(sx0), NSUInteger(sy0), 0)
@@ -3895,7 +4084,7 @@ index 00000000..de157f71
 +    if (!t || !t->mtl || !src || src.pixelFormat != t->mtl.pixelFormat)
 +        return;
 +    BeginFrameIfNeeded();
-+    EndEncoder();
++    EndAll();
 +    id<MTLBlitCommandEncoder> b = [s.cmd blitCommandEncoder];
 +    [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(NSUInteger(x), NSUInteger(y), 0)
 +            sourceSize:MTLSizeMake(NSUInteger(w), NSUInteger(h), 1)
@@ -3910,7 +4099,7 @@ index 00000000..de157f71
 +    if (!t || !t->mtl || t->levels <= 1 || IsAstc(t->format) || IsDepth(t->format))
 +        return;
 +    BeginFrameIfNeeded();
-+    EndEncoder();
++    EndAll();
 +    id<MTLBlitCommandEncoder> b = [s.cmd blitCommandEncoder];
 +    [b generateMipmapsForTexture:t->mtl];
 +    [b endEncoding];
@@ -3987,7 +4176,7 @@ index 00000000..de157f71
 +void RenderPresent()
 +{
 +    BeginFrameIfNeeded();
-+    EndEncoder();
++    EndAll();
 +    @autoreleasepool
 +    {
 +        id<CAMetalDrawable> drawable = [core.layer nextDrawable];
@@ -4125,10 +4314,10 @@ index 00000000..de157f71
 +} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_shaders.cpp b/src/Layers/xrRenderGL/mtl/glmtl_shaders.cpp
 new file mode 100644
-index 00000000..5f3f6a9e
+index 00000000..ecdef2aa
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_shaders.cpp
-@@ -0,0 +1,467 @@
+@@ -0,0 +1,472 @@
 +// iOSRay: Metal-режим, этап 4 — шейдеры.
 +//
 +// Движок отдаёт GLSL ES 3.00 через glShaderSource/glLinkProgram. Здесь при
@@ -4317,6 +4506,7 @@ index 00000000..5f3f6a9e
 +
 +    p.uniforms.clear();
 +    p.vsInputs.clear();
++    p.blockDirty[0] = p.blockDirty[1] = true;
 +    p.log.clear();
 +    ++p.generation;
 +    for (int s = 0; s < 2; ++s)
@@ -4429,7 +4619,11 @@ index 00000000..5f3f6a9e
 +                    uint32_t v = transpose ? el[r * cols + c] : el[c * rows + r];
 +                    if (sl.isBool)
 +                        v = v != 0;
-+                    dst[r] = v;
++                    if (dst[r] != v)
++                    {
++                        dst[r] = v;
++                        p->blockDirty[s] = true;
++                    }
 +                }
 +            }
 +        }
@@ -4598,10 +4792,10 @@ index 00000000..5f3f6a9e
 +} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_shaders.h b/src/Layers/xrRenderGL/mtl/glmtl_shaders.h
 new file mode 100644
-index 00000000..db2ec5c4
+index 00000000..fb0a9fdb
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_shaders.h
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,78 @@
 +// iOSRay: Metal-режим — шейдеры GLSL → SPIR-V → MSL и их рефлексия.
 +#pragma once
 +
@@ -4653,6 +4847,7 @@ index 00000000..db2ec5c4
 +    std::string log;
 +    std::string msl[2];
 +    std::vector<uint8_t> block[2]; // теневой gl_DefaultUniformBlock стадии
++    mutable bool blockDirty[2] = { true, true }; // менялся после последней выгрузки в GPU
 +    uint32_t blockBinding[2] = { 0, 0 };
 +    std::vector<Uniform> uniforms;
 +};
@@ -4997,7 +5192,7 @@ index 20d2e576..d4d6cdc0 100644
  
  constexpr pcstr FRAME_MARK_APPLICATION_STARTUP = "Application startup";
 diff --git a/src/xrEngine/xr_input.cpp b/src/xrEngine/xr_input.cpp
-index b8caddd9..d0dfc953 100644
+index b8caddd9..3fcef037 100644
 --- a/src/xrEngine/xr_input.cpp
 +++ b/src/xrEngine/xr_input.cpp
 @@ -1,4 +1,7 @@
@@ -5025,7 +5220,7 @@ index b8caddd9..d0dfc953 100644
  
      if (AltF4Pressed)
          return;
-@@ -832,3 +842,90 @@ void CInput::Feedback(FeedbackType type, float s1, float s2, float duration)
+@@ -832,3 +842,106 @@ void CInput::Feedback(FeedbackType type, float s1, float s2, float duration)
      default: NODEFAULT;
      }
  }
@@ -5068,9 +5263,26 @@ index b8caddd9..d0dfc953 100644
 +        kFWD, kBACK, kL_STRAFE, kR_STRAFE,           // 0..3  движение
 +        kWPN_FIRE, kWPN_ZOOM, kJUMP, kCROUCH,        // 4..7
 +        kUSE, kWPN_RELOAD, kINVENTORY, kQUIT,        // 8..11
++        kWPN_NEXT, kACTIVE_JOBS, kSPRINT_TOGGLE, kACCEL, // 12..15
 +    };
 +    if (iosAction < 0 || iosAction >= int(std::size(map)))
 +        return;
++
++    const Uint32 wnd = Device.m_sdlWnd ? SDL_GetWindowID(Device.m_sdlWnd) : 0;
++    // Смена оружия в ТЧ — колесо мыши (вверх = следующий слот), клавиши у неё нет
++    if (map[iosAction] == kWPN_NEXT && xr_ios_bound_dik(kWPN_NEXT) == SDL_SCANCODE_UNKNOWN)
++    {
++        if (!down)
++            return;
++        SDL_Event w{};
++        w.type = SDL_MOUSEWHEEL;
++        w.wheel.windowID = wnd;
++        w.wheel.y = 1;
++        w.wheel.preciseY = 1.f;
++        w.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
++        SDL_PushEvent(&w);
++        return;
++    }
 +
 +    int dik = xr_ios_bound_dik(map[iosAction]);
 +    if (map[iosAction] == kQUIT && dik == SDL_SCANCODE_UNKNOWN)
@@ -5079,7 +5291,6 @@ index b8caddd9..d0dfc953 100644
 +        return;
 +
 +    SDL_Event e{};
-+    const Uint32 wnd = Device.m_sdlWnd ? SDL_GetWindowID(Device.m_sdlWnd) : 0;
 +    if (dik < SDL_NUM_SCANCODES)
 +    {
 +        e.type = down ? SDL_KEYDOWN : SDL_KEYUP;
@@ -5348,10 +5559,10 @@ index 82d7da5d..0fd1fa17 100644
  #endif
 diff --git a/src/xr_3da/ios_bootstrap.mm b/src/xr_3da/ios_bootstrap.mm
 new file mode 100644
-index 00000000..b7244065
+index 00000000..b730b55c
 --- /dev/null
 +++ b/src/xr_3da/ios_bootstrap.mm
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,214 @@
 +// iOSRay: подготовка окружения движка на iOS перед entry_point().
 +//
 +// Что делает:
@@ -5423,7 +5634,8 @@ index 00000000..b7244065
 +static bool ChooseMetalRenderer()
 +{
 +    NSUserDefaults* ud = NSUserDefaults.standardUserDefaults;
-+    __block bool metal = [[ud stringForKey:@"iosray_renderer"] isEqualToString:@"metal"];
++    // По умолчанию — Metal (быстрее GL); OpenGL ES — только если выбран явно
++    __block bool metal = ![[ud stringForKey:@"iosray_renderer"] isEqualToString:@"gles"];
 +    __block bool done = false;
 +
 +    UIWindow* window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
@@ -5431,7 +5643,7 @@ index 00000000..b7244065
 +    window.rootViewController.view.backgroundColor = UIColor.blackColor;
 +    [window makeKeyAndVisible];
 +
-+    auto title = [](bool m) { return m ? @"Metal (эксперимент)" : @"OpenGL ES"; };
++    auto title = [](bool m) { return m ? @"Metal" : @"OpenGL ES"; };
 +    __block int left = 4;
 +    UIAlertController* alert = [UIAlertController
 +        alertControllerWithTitle:@"iOSRay: рендер"
@@ -5442,10 +5654,10 @@ index 00000000..b7244065
 +        done = true;
 +        [ud setObject:(m ? @"metal" : @"gles") forKey:@"iosray_renderer"];
 +    };
++    [alert addAction:[UIAlertAction actionWithTitle:@"Metal" style:UIAlertActionStyleDefault
++                                            handler:^(UIAlertAction*) { pick(true); }]];
 +    [alert addAction:[UIAlertAction actionWithTitle:@"OpenGL ES" style:UIAlertActionStyleDefault
 +                                            handler:^(UIAlertAction*) { pick(false); }]];
-+    [alert addAction:[UIAlertAction actionWithTitle:@"Metal (эксперимент)" style:UIAlertActionStyleDefault
-+                                            handler:^(UIAlertAction*) { pick(true); }]];
 +    [window.rootViewController presentViewController:alert animated:YES completion:nil];
 +
 +    NSTimer* timer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer*) {
@@ -5567,17 +5779,17 @@ index 00000000..b7244065
 +}
 diff --git a/src/xr_3da/ios_touch.mm b/src/xr_3da/ios_touch.mm
 new file mode 100644
-index 00000000..c873e5d7
+index 00000000..1548752f
 --- /dev/null
 +++ b/src/xr_3da/ios_touch.mm
-@@ -0,0 +1,343 @@
+@@ -0,0 +1,359 @@
 +// iOSRay: экранное управление поверх окна SDL (минимальный набор).
 +//
 +//  * В игре (движок захватил ввод) слой ловит все касания:
 +//      левая часть экрана — плавающий стик (W/A/S/D через привязки действий),
 +//      правая часть — обзор (относительное движение мыши),
 +//      кнопки — действия: огонь, прицел, прыжок, присед, использовать,
-+//      перезарядка, инвентарь.
++//      перезарядка, смена оружия, бег (X), шаг (Shift), инвентарь, PDA.
 +//  * В меню слой пропускает касания к SDL (там они работают как мышь),
 +//    видна только кнопка «Меню» (Esc) в правом верхнем углу.
 +//
@@ -5598,6 +5810,7 @@ index 00000000..c873e5d7
 +    actFwd = 0, actBack, actLeft, actRight,
 +    actFire, actAim, actJump, actCrouch,
 +    actUse, actReload, actInventory, actMenu,
++    actWeaponNext, actPda, actSprint, actWalk,
 +};
 +
 +constexpr CGFloat kStickZone = 0.40;      // доля ширины экрана слева под стик
@@ -5649,7 +5862,11 @@ index 00000000..c873e5d7
 +        [self addButton:@"Ctrl" action:actCrouch size:58];
 +        [self addButton:@"F" action:actUse size:54];
 +        [self addButton:@"R" action:actReload size:54];
-+        [self addButton:@"I" action:actInventory size:50];
++        [self addButton:@"⇄" action:actWeaponNext size:52];
++        [self addButton:@"X" action:actSprint size:52];
++        [self addButton:@"Shift" action:actWalk size:52];
++        [self addButton:@"I" action:actInventory size:46];
++        [self addButton:@"PDA" action:actPda size:46];
 +        XRTouchButton* menu = [self addButton:@"Esc" action:actMenu size:46];
 +        menu.alwaysVisible = YES;
 +        _gameplay = YES;
@@ -5709,19 +5926,30 @@ index 00000000..c873e5d7
 +    const CGFloat W = self.bounds.size.width - safe.right;
 +    const CGFloat H = self.bounds.size.height - safe.bottom;
 +    const CGFloat top = safe.top;
++    // Под правый большой палец: ЛКМ в углу, остальное — двумя дугами вокруг неё
++    // (угол 180° — влево от ЛКМ, 90° — вверх). Редкие кнопки — полоской сверху.
++    const CGPoint fire = CGPointMake(W - 62, H - 64);
++    auto arc = [&](CGFloat radius, CGFloat deg) {
++        const CGFloat a = deg * M_PI / 180.0;
++        return CGPointMake(fire.x + radius * cos(a), fire.y - radius * sin(a));
++    };
 +    for (XRTouchButton* b in _buttons)
 +    {
 +        CGPoint c{};
 +        switch (b.action)
 +        {
-+        case actFire:      c = CGPointMake(W - 75,  H - 85);  break;
-+        case actAim:       c = CGPointMake(W - 170, H - 60);  break;
-+        case actJump:      c = CGPointMake(W - 60,  H - 180); break;
-+        case actCrouch:    c = CGPointMake(W - 150, H - 150); break;
-+        case actReload:    c = CGPointMake(W - 250, H - 50);  break;
-+        case actUse:       c = CGPointMake(W - 60,  H - 260); break;
-+        case actInventory: c = CGPointMake(W - 100, top + 34); break;
-+        case actMenu:      c = CGPointMake(W - 36,  top + 30); break;
++        case actFire:       c = fire; break;
++        case actSprint:     c = arc(118, 180); break;
++        case actCrouch:     c = arc(118, 135); break;
++        case actAim:        c = arc(118, 90);  break;
++        case actReload:     c = arc(215, 180); break;
++        case actJump:       c = arc(215, 155); break;
++        case actWalk:       c = arc(215, 130); break;
++        case actUse:        c = arc(215, 105); break;
++        case actWeaponNext: c = arc(215, 82);  break;
++        case actMenu:       c = CGPointMake(W - 36,  top + 30); break;
++        case actInventory:  c = CGPointMake(W - 94,  top + 30); break;
++        case actPda:        c = CGPointMake(W - 152, top + 30); break;
 +        default: break;
 +        }
 +        b.center = c;
