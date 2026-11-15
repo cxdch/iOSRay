@@ -8,11 +8,16 @@ PREFIX="${PREFIX:-$ROOT/build/ios-prefix}"
 BUILD="${ENGINE_BUILD:-$ROOT/build/engine}"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN)}"
 export XR_IOS_PREFIX="$PREFIX"
+# Код под ядра A10 (iPhone 7/7 Plus); на более новых чипах тоже работает.
+# Отключить: XR_CPU_FLAGS="" scripts/build_engine_ios.sh
+CPU_FLAGS="${XR_CPU_FLAGS--mcpu=apple-a10}"
 
 cmake -S "$XRAY" -B "$BUILD" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/ios.toolchain.cmake" -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_PREFIX_PATH="$PREFIX" -DXR_IOS_PREFIX="$PREFIX" -DBUILD_SHARED_LIBS=OFF \
-    -DOPENAL_INCLUDE_DIR="$PREFIX/include/AL" -DOPENAL_LIBRARY="$PREFIX/lib/libopenal.a"
+    -DOPENAL_INCLUDE_DIR="$PREFIX/include/AL" -DOPENAL_LIBRARY="$PREFIX/lib/libopenal.a" \
+    -DCMAKE_C_FLAGS="$CPU_FLAGS" -DCMAKE_CXX_FLAGS="$CPU_FLAGS" \
+    -DCMAKE_OBJC_FLAGS="$CPU_FLAGS" -DCMAKE_OBJCXX_FLAGS="$CPU_FLAGS"
 
 set +e
 cmake --build "$BUILD" -j "$JOBS" -- -k 0 2>&1 | tee "$BUILD/build.log" | grep -E "^\[[0-9]+/|error:|FAILED" | grep -vE "^\[" 
