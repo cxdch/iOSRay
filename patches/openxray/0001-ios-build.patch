@@ -1293,7 +1293,7 @@ index 30519005..ecb595f1 100644
  #else
          return (GLint)GL_CLAMP_TO_BORDER;
 diff --git a/src/Layers/xrRenderGL/glTexture.cpp b/src/Layers/xrRenderGL/glTexture.cpp
-index 1cee8526..82fd6187 100644
+index 1cee8526..c30aace8 100644
 --- a/src/Layers/xrRenderGL/glTexture.cpp
 +++ b/src/Layers/xrRenderGL/glTexture.cpp
 @@ -5,6 +5,19 @@
@@ -1571,21 +1571,19 @@ index 1cee8526..82fd6187 100644
  u32 calc_texture_size(int lod, u32 mip_cnt, size_t orig_size)
  {
      if (1 == mip_cnt)
-@@ -110,10 +371,33 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
+@@ -110,10 +371,31 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
  #endif // DEBUG
      gli::texture texture = gli::load((char*)S->pointer(), img_size);
      R_ASSERT2(!texture.empty(), fn);
 +#ifdef XR_GL_ES
 +    // Экономия памяти на iOS (пока текстуры распаковываются в RGBA8): пропускаем верхние мипы.
-+    // Сколько — решает texture_lod (как в DX-рендерах), плюс потолок 1024 по большей стороне.
++    // Сколько — решает texture_lod (как в DX-рендерах). Потолка по размеру больше нет.
 +    // Интерфейс не трогаем: UI считает координаты от размера текстуры.
 +    if (texture.target() == gli::TARGET_2D && texture.levels() > 1 && !strstr(fn, "textures\\ui\\")
 +        && !strstr(fn, "textures/ui/") && !strstr(fn, "\\intro\\"))
 +    {
 +        size_t skip = size_t(get_texture_load_lod(fn));
 +        const auto fits = [&](size_t lvl) { const auto e = texture.extent(lvl); return e.x >= 4 && e.y >= 4; };
-+        while (skip + 1 < texture.levels() && std::max(texture.extent(skip).x, texture.extent(skip).y) > 1024)
-+            ++skip;
 +        while (skip > 0 && (skip >= texture.levels() || !fits(skip)))
 +            --skip;
 +        if (skip > 0)
@@ -1606,7 +1604,7 @@ index 1cee8526..82fd6187 100644
      gli::gl GL(gli::gl::PROFILE_ES30);
  #else
      gli::gl GL(gli::gl::PROFILE_GL33);
-@@ -130,7 +414,7 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
+@@ -130,7 +412,7 @@ GLuint CRender::texture_load(pcstr fRName, u32& ret_msize, GLenum& ret_desc, u32
      glTexParameteri(target, GL_TEXTURE_BASE_LEVEL, 0);
      glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, static_cast<GLint>(texture.levels() - 1));
  
@@ -1737,10 +1735,10 @@ index 60fe082f..1d330873 100644
          glReadPixels(0, 0, Device.dwWidth, Device.dwHeight, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl.mm b/src/Layers/xrRenderGL/mtl/glmtl.mm
 new file mode 100644
-index 00000000..426686fd
+index 00000000..f0442477
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl.mm
-@@ -0,0 +1,550 @@
+@@ -0,0 +1,551 @@
 +// iOSRay: Metal-режим рендера.
 +//
 +// Рендер OpenXRay продолжает вызывать функции OpenGL ES (через указатели glad),
@@ -1757,6 +1755,7 @@ index 00000000..426686fd
 +#include <mutex>
 +#include <string>
 +#include <unordered_map>
++#include "glmtl_namemap.h"
 +
 +namespace
 +{
@@ -1770,7 +1769,7 @@ index 00000000..426686fd
 +        NSUInteger size = 0; // логический размер (MTLBuffer из пула может быть больше)
 +        bool pooled = false;
 +    };
-+    std::unordered_map<GLuint, Buffer> buffers;
++    xr_mtl::NameMap<GLuint, Buffer> buffers;
 +} g;
 +
 +using xr_mtl::core;
@@ -2240,8 +2239,8 @@ index 00000000..426686fd
 +
 +id<MTLBuffer> BufferObject(GLuint name)
 +{
-+    const auto it = g.buffers.find(name);
-+    return it == g.buffers.end() ? nil : it->second.mtl;
++    const MtlState::Buffer* b = g.buffers.get(name);
++    return b ? b->mtl : nil;
 +}
 +
 +void BufferPoolTick(unsigned frame) { g_pool.Tick(frame); }
@@ -2336,12 +2335,121 @@ index 00000000..df101218
 +void SetElementBufferBinding(GLuint buffer);
 +void SetArrayBufferBinding(GLuint buffer);   // для glVertexAttribPointer
 +} // namespace xr_mtl
+diff --git a/src/Layers/xrRenderGL/mtl/glmtl_namemap.h b/src/Layers/xrRenderGL/mtl/glmtl_namemap.h
+new file mode 100644
+index 00000000..e75e912c
+--- /dev/null
++++ b/src/Layers/xrRenderGL/mtl/glmtl_namemap.h
+@@ -0,0 +1,103 @@
++#pragma once
++// iOSRay: хранилище объектов по GL-имени без хеширования.
++// Имена в слое выдаются подряд (1, 2, 3…), поэтому имя — это просто индекс в массиве.
++// Интерфейс повторяет нужную часть std::unordered_map: find/end/operator[]/erase/size/обход.
++// Элементы лежат в отдельных блоках памяти, так что указатели на них не меняются.
++#include <cstddef>
++#include <memory>
++#include <utility>
++#include <vector>
++
++namespace xr_mtl
++{
++template <typename K, typename T>
++class NameMap
++{
++public:
++    using value_type = std::pair<const K, T>;
++
++private:
++    std::vector<std::unique_ptr<value_type>> slots;
++    size_t count = 0;
++
++public:
++    class iterator
++    {
++        const NameMap* m;
++        size_t i;
++        void skip()
++        {
++            while (i < m->slots.size() && !m->slots[i])
++                ++i;
++        }
++
++    public:
++        iterator(const NameMap* map, size_t idx, bool seek) : m(map), i(idx)
++        {
++            if (seek)
++                skip();
++        }
++        value_type& operator*() const { return *m->slots[i]; }
++        value_type* operator->() const { return m->slots[i].get(); }
++        iterator& operator++()
++        {
++            ++i;
++            skip();
++            return *this;
++        }
++        bool operator==(const iterator& o) const { return i == o.i; }
++        bool operator!=(const iterator& o) const { return i != o.i; }
++        size_t index() const { return i; }
++    };
++
++    iterator begin() const { return iterator(this, 0, true); }
++    iterator end() const { return iterator(this, slots.size(), false); }
++
++    // Быстрый доступ: nullptr, если объекта нет
++    T* get(K k) const
++    {
++        const size_t i = size_t(k);
++        return i < slots.size() && slots[i] ? &slots[i]->second : nullptr;
++    }
++
++    iterator find(K k) const
++    {
++        const size_t i = size_t(k);
++        return i < slots.size() && slots[i] ? iterator(this, i, false) : end();
++    }
++
++    T& operator[](K k)
++    {
++        const size_t i = size_t(k);
++        if (i >= slots.size())
++            slots.resize(std::max(i + 1, slots.size() * 3 / 2 + 16));
++        if (!slots[i])
++        {
++            slots[i] = std::make_unique<value_type>(k, T{});
++            ++count;
++        }
++        return slots[i]->second;
++    }
++
++    size_t erase(K k)
++    {
++        const size_t i = size_t(k);
++        if (i < slots.size() && slots[i])
++        {
++            slots[i].reset();
++            --count;
++            return 1;
++        }
++        return 0;
++    }
++    void erase(const iterator& it) { erase(K(it.index())); }
++
++    size_t size() const { return count; }
++    bool empty() const { return count == 0; }
++    void clear()
++    {
++        slots.clear();
++        count = 0;
++    }
++};
++} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_render.mm b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
 new file mode 100644
-index 00000000..6e2ffccf
+index 00000000..0f929894
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
-@@ -0,0 +1,2327 @@
+@@ -0,0 +1,2477 @@
 +// iOSRay: Metal-режим, этап 4b — рисование.
 +//
 +// Здесь GL-вызовы движка превращаются в работу Metal:
@@ -2358,6 +2466,7 @@ index 00000000..6e2ffccf
 +// а при выводе на экран кадр переворачивается обратно.
 +
 +#include "glmtl_internal.h"
++#include "glmtl_namemap.h"
 +#include "glmtl_shaders.h"
 +
 +#include <os/proc.h>
@@ -2497,11 +2606,11 @@ index 00000000..6e2ffccf
 +struct State
 +{
 +    // объекты
-+    std::unordered_map<GLuint, Texture> textures;
-+    std::unordered_map<GLuint, SamplerParams> samplers;
-+    std::unordered_map<GLuint, Fbo> fbos;
-+    std::unordered_map<GLuint, Vao> vaos;
-+    std::unordered_map<GLuint, Texture> renderbuffers;
++    NameMap<GLuint, Texture> textures;
++    NameMap<GLuint, SamplerParams> samplers;
++    NameMap<GLuint, Fbo> fbos;
++    NameMap<GLuint, Vao> vaos;
++    NameMap<GLuint, Texture> renderbuffers;
 +
 +    // привязки
 +    GLuint activeUnit = 0;
@@ -2563,7 +2672,7 @@ index 00000000..6e2ffccf
 +        id<MTLFunction> fn[2] = { nil, nil };
 +        bool failed = false;
 +    };
-+    std::unordered_map<GLuint, Lib> libraries;
++    NameMap<GLuint, Lib> libraries;
 +    id<MTLTexture> dummy2D, dummy3D, dummyCube, dummyDepth, dummyArray;
 +    id<MTLBuffer> dummyVertex;
 +    id<MTLRenderPipelineState> blitPipeline;
@@ -2572,6 +2681,17 @@ index 00000000..6e2ffccf
 +    // статистика
 +    unsigned draws = 0, skipped = 0, passes = 0;
 +} s;
++
++// экономия на сохранении вложений (реализация ниже, у OpenEncoder)
++enum : uint8_t
++{
++    kAspColor = 1,
++    kAspDepth = 2,
++    kAspStencil = 4,
++    kAspAll = 7
++};
++void StoreNoteRead(id<MTLTexture> tex, uint8_t aspects);
++void StoreForget(id<MTLTexture> tex);
 +
 +// --- форматы ------------------------------------------------------------------
 +MTLPixelFormat PixelFormatOf(GLenum internal)
@@ -2758,8 +2878,7 @@ index 00000000..6e2ffccf
 +    if (target >= GL_TEXTURE_CUBE_MAP_POSITIVE_X && target <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z)
 +        target = GL_TEXTURE_CUBE_MAP;
 +    const GLuint name = UnitSlot(target, s.activeUnit);
-+    const auto it = s.textures.find(name);
-+    return it == s.textures.end() ? nullptr : &it->second;
++    return s.textures.get(name);
 +}
 +
 +void gl_ActiveTexture(GLenum unit) { s.activeUnit = std::min<GLuint>(unit - GL_TEXTURE0, kMaxUnits - 1); }
@@ -2779,7 +2898,11 @@ index 00000000..6e2ffccf
 +{
 +    s.targetsDirty = true;
 +    for (GLsizei i = 0; i < n; ++i)
++    {
++        if (const Texture* t = s.textures.get(names[i]))
++            StoreForget(t->mtl);
 +        s.textures.erase(names[i]);
++    }
 +}
 +
 +MTLTextureType TypeOf(GLenum target)
@@ -2803,6 +2926,7 @@ index 00000000..6e2ffccf
 +    t.h = h;
 +    t.d = d;
 +    t.levels = levels;
++    StoreForget(t.mtl);
 +    t.mtl = MakeTexture(TypeOf(target), t.format, w, h, d, levels);
 +    t.depth = IsDepth(t.format);
 +    t.type = TypeOf(target);
@@ -2861,6 +2985,7 @@ index 00000000..6e2ffccf
 +{
 +    if (!t.mtl || !data || level >= t.levels || (t.mtl.storageMode == MTLStorageModePrivate && !compressed))
 +        return;
++    StoreNoteRead(t.mtl, kAspAll);
 +    const MTLRegion region = MTLRegionMake3D(NSUInteger(x), NSUInteger(y), NSUInteger(z), NSUInteger(w),
 +        NSUInteger(h), NSUInteger(std::max(d, 1)));
 +    if (compressed)
@@ -3231,8 +3356,8 @@ index 00000000..6e2ffccf
 +
 +id<MTLTexture> TexOf(GLuint name)
 +{
-+    const auto it = s.textures.find(name);
-+    return it == s.textures.end() ? nil : it->second.mtl;
++    const Texture* t = s.textures.get(name);
++    return t ? t->mtl : nil;
 +}
 +
 +// --- кадр и проходы -------------------------------------------------------------------
@@ -3422,9 +3547,131 @@ index 00000000..6e2ffccf
 +        [s.enc setFragmentBuffer:b offset:off atIndex:idx];
 +}
 +
++// ---- Экономия на сохранении вложений (TBDR) ----
++// Сохранять вложение из тайловой памяти в RAM нужно, только если его потом кто-то прочитает.
++// Учимся по кадрам: если сохранённое вложение много кадров подряд никто не читал до следующей
++// очистки, в этом же месте кадра дальше его не сохраняем (MTLStoreActionDontCare).
++// Если прочтение всё же случилось — один кадр может быть неточным, и это место больше не трогаем.
++constexpr uint8_t kStoreSkipAfter = 8; // кадров подряд без чтения
++
++struct StoreDecision
++{
++    uint8_t streak = 0;
++    bool never = false;
++};
++struct PendingStore
++{
++    uint8_t aspect;
++    NSUInteger level;
++    uint64_t key;
++    bool skipped;
++};
++std::unordered_map<const void*, std::vector<PendingStore>> g_storePending;
++std::unordered_map<uint64_t, StoreDecision> g_storeDecisions;
++std::unordered_map<uint64_t, uint32_t> g_passOccurrence; // сколько раз этот набор целей открывался в кадре
++struct
++{
++    unsigned skipped = 0, stored = 0, mispredicts = 0, neverKeys = 0;
++} g_storeStats;
++
++// Текстуру прочитали (сэмплинг, копия, частичная запись, загрузка в проход, вывод на экран)
++void StoreNoteRead(id<MTLTexture> tex, uint8_t aspects)
++{
++    if (!tex || g_storePending.empty())
++        return;
++    auto it = g_storePending.find((__bridge const void*)tex);
++    if (it == g_storePending.end())
++        return;
++    auto& v = it->second;
++    for (size_t i = 0; i < v.size();)
++    {
++        if (v[i].aspect & aspects)
++        {
++            StoreDecision& d = g_storeDecisions[v[i].key];
++            d.streak = 0;
++            if (v[i].skipped && !d.never)
++            {
++                d.never = true;
++                ++g_storeStats.mispredicts;
++                ++g_storeStats.neverKeys;
++            }
++            v[i] = v.back();
++            v.pop_back();
++        }
++        else
++            ++i;
++    }
++    if (v.empty())
++        g_storePending.erase(it);
++}
++
++// Вложение полностью перезаписывается (очистка при открытии прохода)
++void StoreNoteOverwrite(id<MTLTexture> tex, uint8_t aspect, NSUInteger level)
++{
++    auto it = g_storePending.find((__bridge const void*)tex);
++    if (it == g_storePending.end())
++        return;
++    auto& v = it->second;
++    for (size_t i = 0; i < v.size(); ++i)
++        if (v[i].aspect == aspect && v[i].level == level)
++        {
++            if (!v[i].skipped)
++            {
++                StoreDecision& d = g_storeDecisions[v[i].key];
++                if (d.streak < 255)
++                    ++d.streak;
++            }
++            v[i] = v.back();
++            v.pop_back();
++            break;
++        }
++    if (v.empty())
++        g_storePending.erase(it);
++}
++
++void StoreForget(id<MTLTexture> tex)
++{
++    if (tex)
++        g_storePending.erase((__bridge const void*)tex);
++}
++
++// Решение для одного вложения прохода; возвращает storeAction
++MTLStoreAction StoreDecide(id<MTLTexture> tex, uint8_t aspect, NSUInteger level, bool cleared, uint64_t passKey,
++    uint32_t occurrence, int slot)
++{
++    if (cleared)
++        StoreNoteOverwrite(tex, aspect, level);
++    else
++        StoreNoteRead(tex, aspect);
++    Hasher h;
++    h << passKey << occurrence << slot << aspect << level << reinterpret_cast<uintptr_t>((__bridge const void*)tex);
++    if (g_storeDecisions.size() > 32768)
++        g_storeDecisions.clear();
++    const StoreDecision& d = g_storeDecisions[h.h];
++    const bool skip = !d.never && d.streak >= kStoreSkipAfter;
++    auto& v = g_storePending[(__bridge const void*)tex];
++    // прежнее несохранённое/сохранённое состояние этого же уровня заменяется новым
++    for (size_t i = 0; i < v.size(); ++i)
++        if (v[i].aspect == aspect && v[i].level == level)
++        {
++            v[i] = v.back();
++            v.pop_back();
++            break;
++        }
++    v.push_back({ aspect, level, h.h, skip });
++    if (skip)
++        ++g_storeStats.skipped;
++    else
++        ++g_storeStats.stored;
++    return skip ? MTLStoreActionDontCare : MTLStoreActionStore;
++}
++
++void StoreFrameEnd() { g_passOccurrence.clear(); }
++
 +void OpenEncoder(const PassTargets& t, GLbitfield clearMask, const float* clearColor, float clearDepth,
 +    uint32_t clearStencil)
 +{
++    const uint32_t occurrence = g_passOccurrence[t.key]++;
 +    BeginFrameIfNeeded();
 +    MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
 +    for (int i = 0; i < kMaxColor; ++i)
@@ -3434,21 +3681,24 @@ index 00000000..6e2ffccf
 +        rp.colorAttachments[i].texture = t.color[i];
 +        rp.colorAttachments[i].level = t.colorLevel[i];
 +        rp.colorAttachments[i].loadAction = (clearMask & GL_COLOR_BUFFER_BIT) ? MTLLoadActionClear : MTLLoadActionLoad;
-+        rp.colorAttachments[i].storeAction = MTLStoreActionStore;
++        rp.colorAttachments[i].storeAction = StoreDecide(t.color[i], kAspColor, t.colorLevel[i],
++            (clearMask & GL_COLOR_BUFFER_BIT) != 0, t.key, occurrence, i);
 +        rp.colorAttachments[i].clearColor = MTLClearColorMake(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
 +    }
 +    if (t.depth)
 +    {
 +        rp.depthAttachment.texture = t.depth;
 +        rp.depthAttachment.loadAction = (clearMask & GL_DEPTH_BUFFER_BIT) ? MTLLoadActionClear : MTLLoadActionLoad;
-+        rp.depthAttachment.storeAction = MTLStoreActionStore;
++        rp.depthAttachment.storeAction = StoreDecide(t.depth, kAspDepth, 0, (clearMask & GL_DEPTH_BUFFER_BIT) != 0,
++            t.key, occurrence, 8);
 +        rp.depthAttachment.clearDepth = clearDepth;
 +    }
 +    if (t.stencil)
 +    {
 +        rp.stencilAttachment.texture = t.stencil;
 +        rp.stencilAttachment.loadAction = (clearMask & GL_STENCIL_BUFFER_BIT) ? MTLLoadActionClear : MTLLoadActionLoad;
-+        rp.stencilAttachment.storeAction = MTLStoreActionStore;
++        rp.stencilAttachment.storeAction = StoreDecide(t.stencil, kAspStencil, 0,
++            (clearMask & GL_STENCIL_BUFFER_BIT) != 0, t.key, occurrence, 9);
 +        rp.stencilAttachment.clearStencil = clearStencil;
 +    }
 +    s.enc = [s.cmd renderCommandEncoderWithDescriptor:rp];
@@ -4199,7 +4449,7 @@ index 00000000..6e2ffccf
 +        id<MTLBuffer> buf[2];
 +        NSUInteger off[2] = {};
 +    };
-+    static std::unordered_map<GLuint, Upload> uploads;
++    static NameMap<GLuint, Upload> uploads;
 +    Upload& up = uploads[program];
 +    if (up.generation != p->generation || up.frame != s.frameIndex)
 +    {
@@ -4229,7 +4479,7 @@ index 00000000..6e2ffccf
 +        uint32_t generation = ~0u;
 +        std::vector<uint16_t> idx;
 +    };
-+    static std::unordered_map<GLuint, SamplerList> samplerLists;
++    static NameMap<GLuint, SamplerList> samplerLists;
 +    SamplerList& sl = samplerLists[program];
 +    if (sl.generation != p->generation)
 +    {
@@ -4246,8 +4496,7 @@ index 00000000..6e2ffccf
 +        const GLuint name = u.glType == GL_SAMPLER_3D ? s.unit3D[unit]
 +            : u.glType == GL_SAMPLER_CUBE             ? s.unitCube[unit]
 +                                                      : s.unit2D[unit];
-+        const auto it = name ? s.textures.find(name) : s.textures.end();
-+        const Texture* tex = it == s.textures.end() ? nullptr : &it->second;
++        const Texture* tex = s.textures.get(name);
 +        const bool wantDepth = u.glType == GL_SAMPLER_2D_SHADOW;
 +        const MTLTextureType wantType = u.glType == GL_SAMPLER_CUBE ? MTLTextureTypeCube
 +            : u.glType == GL_SAMPLER_3D                              ? MTLTextureType3D
@@ -4282,6 +4531,7 @@ index 00000000..6e2ffccf
 +            const bool cached = idx < 16;
 +            if (!cached || g_ec.tex[st][idx] != mt)
 +            {
++                StoreNoteRead(mt, kAspAll);
 +                if (cached)
 +                    g_ec.tex[st][idx] = mt;
 +                if (st == 0)
@@ -4378,6 +4628,7 @@ index 00000000..6e2ffccf
 +    if (!(mask & GL_COLOR_BUFFER_BIT))
 +        return;
 +    id<MTLTexture> src = ReadColor0();
++    StoreNoteRead(src, kAspAll);
 +    if (!s.drawFbo)
 +    {
 +        s.presentSource = src; // вывод на экран — в RenderPresent
@@ -4390,6 +4641,7 @@ index 00000000..6e2ffccf
 +        LogOnce("blit", "! [iOSRay] Metal: glBlitFramebuffer с масштабом/форматом пока пропускается\n");
 +        return;
 +    }
++    StoreNoteRead(dst, kAspAll); // частичная запись: остальное содержимое должно сохраниться
 +    BeginFrameIfNeeded();
 +    EndAll();
 +    id<MTLBlitCommandEncoder> b = [s.cmd blitCommandEncoder];
@@ -4407,6 +4659,8 @@ index 00000000..6e2ffccf
 +    id<MTLTexture> src = ReadColor0();
 +    if (!t || !t->mtl || !src || src.pixelFormat != t->mtl.pixelFormat)
 +        return;
++    StoreNoteRead(src, kAspAll);
++    StoreNoteRead(t->mtl, kAspAll);
 +    BeginFrameIfNeeded();
 +    EndAll();
 +    id<MTLBlitCommandEncoder> b = [s.cmd blitCommandEncoder];
@@ -4425,6 +4679,7 @@ index 00000000..6e2ffccf
 +    BeginFrameIfNeeded();
 +    EndAll();
 +    id<MTLBlitCommandEncoder> b = [s.cmd blitCommandEncoder];
++    StoreNoteRead(t->mtl, kAspAll);
 +    [b generateMipmapsForTexture:t->mtl];
 +    [b endEncoding];
 +}
@@ -4561,6 +4816,7 @@ index 00000000..6e2ffccf
 +        s.pool = nullptr;
 +    }
 +    ++s.frameIndex;
++    StoreFrameEnd();
 +    static unsigned framesSinceLog = 0;
 +    ++framesSinceLog;
 +    if ((s.frameIndex % 600) == 1)
@@ -4572,12 +4828,14 @@ index 00000000..6e2ffccf
 +        size_t bufCount = 0, bufBytes = 0, poolBytes = 0;
 +        BufferStats(bufCount, bufBytes, poolBytes);
 +        printf("[iOSRay] Metal: кадр %u — рисований %u (пропущено %u), проходов %u, слой Metal %.1f мс/кадр, "
-+               "свободно %zu МБ | текстур %zu (%zu МБ), буферов %zu (%zu МБ, пул %zu МБ), PSO %zu, сэмплеров %zu\n",
++               "сохранений вложений %u, пропущено %u (ошибок %u) | свободно %zu МБ | текстур %zu (%zu МБ), буферов %zu (%zu МБ, пул %zu МБ), PSO %zu, сэмплеров %zu\n",
 +            s.frameIndex, s.draws, s.skipped, s.passes, g_shimMs / std::max(1u, framesSinceLog),
-+            os_proc_available_memory() >> 20, s.textures.size(), texBytes >> 20, bufCount, bufBytes >> 20,
++            g_storeStats.stored / std::max(1u, framesSinceLog), g_storeStats.skipped / std::max(1u, framesSinceLog),
++            g_storeStats.mispredicts, os_proc_available_memory() >> 20, s.textures.size(), texBytes >> 20, bufCount, bufBytes >> 20,
 +            poolBytes >> 20, s.pipelines.size(), s.samplerStates.size());
 +        fflush(stdout);
 +        g_shimMs = 0;
++        g_storeStats.stored = g_storeStats.skipped = 0;
 +        framesSinceLog = 0;
 +    }
 +    s.draws = s.skipped = s.passes = 0;
@@ -4671,10 +4929,10 @@ index 00000000..6e2ffccf
 +} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_shaders.cpp b/src/Layers/xrRenderGL/mtl/glmtl_shaders.cpp
 new file mode 100644
-index 00000000..ecdef2aa
+index 00000000..a3386a6f
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_shaders.cpp
-@@ -0,0 +1,472 @@
+@@ -0,0 +1,703 @@
 +// iOSRay: Metal-режим, этап 4 — шейдеры.
 +//
 +// Движок отдаёт GLSL ES 3.00 через glShaderSource/glLinkProgram. Здесь при
@@ -4694,17 +4952,19 @@ index 00000000..ecdef2aa
 +#include <spirv_cross/spirv_msl.hpp>
 +
 +#include <chrono>
++#include <sys/stat.h>
 +#include <cstdio>
 +#include <cstring>
 +#include <memory>
 +#include <unordered_map>
++#include "glmtl_namemap.h"
 +
 +namespace xr_mtl
 +{
 +namespace
 +{
-+std::unordered_map<GLuint, Shader> g_shaders;
-+std::unordered_map<GLuint, Program> g_programs;
++NameMap<GLuint, Shader> g_shaders;
++NameMap<GLuint, Program> g_programs;
 +GLuint g_current = 0;
 +
 +struct LinkStats
@@ -4856,6 +5116,215 @@ index 00000000..ecdef2aa
 +
 +const EShLanguage kStages[2] = { EShLangVertex, EShLangFragment };
 +
++// ---- Кэш шейдеров на диске ----
++// Ключ — хеш исходников обеих стадий. В файле: готовый MSL и рефлексия (uniform'ы, входы, блоки).
++// При попадании glslang и SPIRV-Cross не запускаются. Сменить kShaderCacheVersion при любой
++// правке пути GLSL → MSL, чтобы старые файлы не подхватились.
++constexpr uint32_t kShaderCacheMagic = 0x534D5258; // "XRMS"
++constexpr uint32_t kShaderCacheVersion = 1;
++
++struct CacheStats
++{
++    unsigned hits = 0, misses = 0;
++} g_cacheStats;
++
++const std::string& CacheDir()
++{
++    static std::string dir;
++    if (dir.empty())
++    {
++        const char* home = getenv("HOME");
++        dir = std::string(home ? home : ".") + "/Library/Caches/iosray_shaders";
++        mkdir((std::string(home ? home : ".") + "/Library").c_str(), 0755);
++        mkdir((std::string(home ? home : ".") + "/Library/Caches").c_str(), 0755);
++        mkdir(dir.c_str(), 0755);
++    }
++    return dir;
++}
++
++uint64_t SourceKey(const std::string src[2])
++{
++    uint64_t h = 1469598103934665603ull;
++    auto mix = [&](const void* d, size_t n) {
++        const auto* b = static_cast<const uint8_t*>(d);
++        for (size_t i = 0; i < n; ++i)
++            h = (h ^ b[i]) * 1099511628211ull;
++    };
++    mix(&kShaderCacheVersion, sizeof(kShaderCacheVersion));
++    for (int i = 0; i < 2; ++i)
++    {
++        const uint64_t n = src[i].size();
++        mix(&n, sizeof(n));
++        mix(src[i].data(), src[i].size());
++    }
++    return h;
++}
++
++std::string CachePath(uint64_t key)
++{
++    char name[40];
++    snprintf(name, sizeof(name), "/%016llx.xms", (unsigned long long)key);
++    return CacheDir() + name;
++}
++
++struct Out
++{
++    std::vector<uint8_t> d;
++    void raw(const void* p, size_t n) { d.insert(d.end(), (const uint8_t*)p, (const uint8_t*)p + n); }
++    void u32(uint32_t v) { raw(&v, 4); }
++    void str(const std::string& s) { u32(uint32_t(s.size())); raw(s.data(), s.size()); }
++};
++struct In
++{
++    const uint8_t* p;
++    const uint8_t* e;
++    bool ok = true;
++    void raw(void* dst, size_t n)
++    {
++        if (size_t(e - p) < n)
++        {
++            ok = false;
++            memset(dst, 0, n);
++            return;
++        }
++        memcpy(dst, p, n);
++        p += n;
++    }
++    uint32_t u32()
++    {
++        uint32_t v = 0;
++        raw(&v, 4);
++        return v;
++    }
++    std::string str()
++    {
++        const uint32_t n = u32();
++        if (!ok || size_t(e - p) < n)
++        {
++            ok = false;
++            return {};
++        }
++        std::string s((const char*)p, n);
++        p += n;
++        return s;
++    }
++};
++
++void SaveCached(uint64_t key, const Program& p)
++{
++    Out o;
++    o.u32(kShaderCacheMagic);
++    o.u32(kShaderCacheVersion);
++    for (int s = 0; s < 2; ++s)
++    {
++        o.str(p.msl[s]);
++        o.u32(uint32_t(p.block[s].size()));
++        o.raw(p.block[s].data(), p.block[s].size());
++        o.u32(p.blockBinding[s]);
++    }
++    o.u32(uint32_t(p.uniforms.size()));
++    for (const Uniform& u : p.uniforms)
++    {
++        o.str(u.name);
++        o.u32(u.glType);
++        o.u32(uint32_t(u.arraySize));
++        o.u32(u.isSampler);
++        for (const UniformSlot& sl : u.slot)
++        {
++            o.u32(sl.present | (sl.isBool << 1));
++            o.u32(sl.offset);
++            o.u32(sl.arrayStride);
++            o.u32(sl.matrixStride);
++            o.u32(sl.textureIndex);
++        }
++    }
++    o.u32(uint32_t(p.vsInputs.size()));
++    for (const VertexInput& v : p.vsInputs)
++    {
++        o.u32(v.location);
++        o.u32(v.components);
++        o.u32(v.isInt);
++    }
++    o.u32(kShaderCacheMagic); // метка конца: недописанный файл не пройдёт проверку
++    const std::string path = CachePath(key);
++    const std::string tmp = path + ".tmp";
++    if (FILE* f = fopen(tmp.c_str(), "wb"))
++    {
++        const bool good = fwrite(o.d.data(), 1, o.d.size(), f) == o.d.size();
++        fclose(f);
++        if (good)
++            rename(tmp.c_str(), path.c_str());
++        else
++            remove(tmp.c_str());
++    }
++}
++
++bool LoadCached(uint64_t key, Program& p)
++{
++    FILE* f = fopen(CachePath(key).c_str(), "rb");
++    if (!f)
++        return false;
++    std::vector<uint8_t> d;
++    fseek(f, 0, SEEK_END);
++    const long n = ftell(f);
++    fseek(f, 0, SEEK_SET);
++    if (n > 16 && n < (16 << 20))
++    {
++        d.resize(size_t(n));
++        if (fread(d.data(), 1, d.size(), f) != d.size())
++            d.clear();
++    }
++    fclose(f);
++    if (d.empty())
++        return false;
++    In in{ d.data(), d.data() + d.size() };
++    if (in.u32() != kShaderCacheMagic || in.u32() != kShaderCacheVersion)
++        return false;
++    for (int s = 0; s < 2; ++s)
++    {
++        p.msl[s] = in.str();
++        const uint32_t bs = in.u32();
++        if (!in.ok || bs > (1u << 20))
++            return false;
++        p.block[s].resize(bs);
++        in.raw(p.block[s].data(), bs);
++        p.blockBinding[s] = in.u32();
++    }
++    const uint32_t nu = in.u32();
++    if (!in.ok || nu > 4096)
++        return false;
++    p.uniforms.resize(nu);
++    for (Uniform& u : p.uniforms)
++    {
++        u.name = in.str();
++        u.glType = GLenum(in.u32());
++        u.arraySize = GLint(in.u32());
++        u.isSampler = in.u32() != 0;
++        u.samplerUnit = 0;
++        for (UniformSlot& sl : u.slot)
++        {
++            const uint32_t fl = in.u32();
++            sl.present = fl & 1;
++            sl.isBool = (fl & 2) != 0;
++            sl.offset = in.u32();
++            sl.arrayStride = in.u32();
++            sl.matrixStride = in.u32();
++            sl.textureIndex = in.u32();
++        }
++    }
++    const uint32_t nv = in.u32();
++    if (!in.ok || nv > 64)
++        return false;
++    p.vsInputs.resize(nv);
++    for (VertexInput& v : p.vsInputs)
++    {
++        v.location = in.u32();
++        v.components = in.u32();
++        v.isInt = in.u32() != 0;
++    }
++    return in.u32() == kShaderCacheMagic && in.ok && !p.msl[0].empty();
++}
++
 +bool Link(GLuint id, Program& p)
 +{
 +    if (!g_glslangReady)
@@ -4879,13 +5348,33 @@ index 00000000..ecdef2aa
 +
 +    for (GLuint sid : p.attached)
 +    {
-+        const auto it = g_shaders.find(sid);
-+        if (it == g_shaders.end())
++        const Shader* shd = g_shaders.get(sid);
++        if (!shd)
 +            continue;
-+        const int stage = it->second.type == GL_VERTEX_SHADER ? 0 : it->second.type == GL_FRAGMENT_SHADER ? 1 : -1;
-+        if (stage < 0)
++        const int stage = shd->type == GL_VERTEX_SHADER ? 0 : shd->type == GL_FRAGMENT_SHADER ? 1 : -1;
++        if (stage >= 0)
++            sources[stage] = PatchVersion(shd->source);
++    }
++    const uint64_t cacheKey = SourceKey(sources);
++    if (!sources[0].empty() && LoadCached(cacheKey, p))
++    {
++        ++g_cacheStats.hits;
++        return true;
++    }
++    // промах: сбрасываем то, что могло частично прочитаться
++    p.uniforms.clear();
++    p.vsInputs.clear();
++    for (int st = 0; st < 2; ++st)
++    {
++        p.msl[st].clear();
++        p.block[st].clear();
++    }
++    ++g_cacheStats.misses;
++
++    for (int stage = 0; stage < 2; ++stage)
++    {
++        if (sources[stage].empty())
 +            continue;
-+        sources[stage] = PatchVersion(it->second.source);
 +        const char* src = sources[stage].c_str();
 +        auto& s = sh[stage];
 +        s = std::make_unique<glslang::TShader>(kStages[stage]);
@@ -4924,14 +5413,14 @@ index 00000000..ecdef2aa
 +        if (!Reflect(p, s, std::move(spirv), p.log))
 +            return false;
 +    }
++    SaveCached(cacheKey, p);
 +    (void)id;
 +    return true;
 +}
 +
 +Program* Get(GLuint program)
 +{
-+    const auto it = g_programs.find(program);
-+    return it == g_programs.end() ? nullptr : &it->second;
++    return g_programs.get(program);
 +}
 +
 +// Запись значений uniform в теневые блоки стадий.
@@ -5050,8 +5539,8 @@ index 00000000..ecdef2aa
 +    }
 +    if (((g_stats.ok + g_stats.failed) % 100) == 0)
 +    {
-+        printf("* [iOSRay] Metal: шейдеров %u (ошибок %u), %.1f с\n", g_stats.ok + g_stats.failed, g_stats.failed,
-+            g_stats.seconds);
++        printf("* [iOSRay] Metal: шейдеров %u (ошибок %u), %.1f с; кэш на диске: из кэша %u, собрано заново %u\n",
++            g_stats.ok + g_stats.failed, g_stats.failed, g_stats.seconds, g_cacheStats.hits, g_cacheStats.misses);
 +        fflush(stdout);
 +    }
 +}
