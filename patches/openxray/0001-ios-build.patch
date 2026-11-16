@@ -7285,6 +7285,24 @@ index 7a1580f8..d344f269 100644
      typedef CUIWindow inherited;
      //-	typedef ALife::EInfluenceType	EIndicatorType;
  
+diff --git a/src/xrNetServer/NET_Client.cpp b/src/xrNetServer/NET_Client.cpp
+index dab8641e..2e62277e 100644
+--- a/src/xrNetServer/NET_Client.cpp
++++ b/src/xrNetServer/NET_Client.cpp
+@@ -133,7 +133,13 @@ void INetQueue::Release()
+     u32 tmp_time = CPU::GetTicks() - 60000;
+     u32 size = unused.size();
+     ready.front()->B.count = 0;
++#if defined(XR_PLATFORM_APPLE)
++    // iOSRay: пакет весит 16 КБ — после всплеска (загрузка уровня, бой) не держим их сотнями
++    constexpr u32 maxSpare = 64;
++    if (size >= maxSpare || ((LastTimeCreate < tmp_time) && (size > 32)))
++#else
+     if ((LastTimeCreate < tmp_time) && (size > 32))
++#endif
+     {
+         xr_delete(ready.front());
+     }
 diff --git a/src/xrServerEntities/script_net_packet_script.cpp b/src/xrServerEntities/script_net_packet_script.cpp
 index 5524bd87..d06ff301 100644
 --- a/src/xrServerEntities/script_net_packet_script.cpp
