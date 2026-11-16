@@ -6055,7 +6055,7 @@ index 6bb1d98e..d15c94de 100644
  int psTextureLOD = 1;
 +#endif
 diff --git a/src/xrEngine/device.cpp b/src/xrEngine/device.cpp
-index 01a427c0..0ce012df 100644
+index 01a427c0..51db89ed 100644
 --- a/src/xrEngine/device.cpp
 +++ b/src/xrEngine/device.cpp
 @@ -1,5 +1,10 @@
@@ -6084,7 +6084,7 @@ index 01a427c0..0ce012df 100644
  
  bool g_bLoaded = false;
  ref_light precache_light = 0;
-@@ -258,6 +269,68 @@ void CRenderDevice::DoRender()
+@@ -258,6 +269,79 @@ void CRenderDevice::DoRender()
      stats.RenderTotal.accum = renderTotalReal.accum;
  }
  
@@ -6141,6 +6141,17 @@ index 01a427c0..0ce012df 100644
 +        XrHeapProfStart();
 +    else if (s_statTicks % 6 == 0)
 +        XrHeapProfReport();
++    // после выхода с уровня (через ~20 с, когда всё выгрузится) — кто остался держать память
++    static bool s_hadLevel = false;
++    static int s_afterLevel = -1;
++    if (g_pGameLevel)
++        s_hadLevel = true, s_afterLevel = -1;
++    else if (s_hadLevel)
++        s_hadLevel = false, s_afterLevel = 2;
++    if (s_afterLevel > 0 && --s_afterLevel == 0)
++        XrHeapProfReportLive("после выхода с уровня");
++    if (g_pGameLevel && s_statTicks % 30 == 0)
++        XrHeapProfReportLive("на уровне");
 +    for (double& v : sum)
 +        v = 0;
 +    worst = 0;
@@ -6153,7 +6164,7 @@ index 01a427c0..0ce012df 100644
  void CRenderDevice::ProcessFrame()
  {
      ZoneScoped;
-@@ -266,10 +339,16 @@ void CRenderDevice::ProcessFrame()
+@@ -266,10 +350,16 @@ void CRenderDevice::ProcessFrame()
          return;
  
      const u64 frameStartTime = TimerGlobal.GetElapsed_ms();
@@ -6170,7 +6181,7 @@ index 01a427c0..0ce012df 100644
  
      const auto& processSeqParallel = TaskScheduler->AddTask([this]
      {
-@@ -281,8 +360,14 @@ void CRenderDevice::ProcessFrame()
+@@ -281,8 +371,14 @@ void CRenderDevice::ProcessFrame()
      });
  
      DoRender();
@@ -6185,7 +6196,7 @@ index 01a427c0..0ce012df 100644
  
      const u64 frameEndTime = TimerGlobal.GetElapsed_ms();
      const u64 frameTime = frameEndTime - frameStartTime;
-@@ -300,6 +385,10 @@ void CRenderDevice::ProcessFrame()
+@@ -300,6 +396,10 @@ void CRenderDevice::ProcessFrame()
  
      if (!b_is_Active)
          Sleep(1);
@@ -6405,10 +6416,10 @@ index 00000000..0c3fe20e
 +#endif
 diff --git a/src/xrEngine/ios_heapprof.cpp b/src/xrEngine/ios_heapprof.cpp
 new file mode 100644
-index 00000000..0550ba5c
+index 00000000..b5abf059
 --- /dev/null
 +++ b/src/xrEngine/ios_heapprof.cpp
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,431 @@
 +// iOSRay: выборочный профилировщик кучи, чтобы найти утечку памяти без Instruments.
 +// Через системный крючок malloc_logger видим каждое выделение/освобождение в процессе.
 +// Запоминаем примерно каждое 64-е (выбор по адресу, чтобы free совпадал с malloc) вместе
@@ -6773,17 +6784,86 @@ index 00000000..0550ba5c
 +    }
 +}
 +#endif
++
++void XrHeapProfReportLive(const char* why)
++{
++    if (!g_on)
++        return;
++    constexpr int kN = 400;
++    static StackRec big[kN];
++    int n = 0;
++    int64_t totalLive = 0;
++    os_unfair_lock_lock(&g_lock);
++    for (size_t i = 0; i < kStackCap; ++i)
++    {
++        const StackRec& s = g_stacks[i];
++        if (!s.hash || s.liveBytes <= 0)
++            continue;
++        totalLive += s.liveBytes;
++        int pos = n;
++        while (pos > 0 && big[pos - 1].liveBytes < s.liveBytes)
++            --pos;
++        if (pos < kN)
++        {
++            for (int k = std::min(n, kN - 1); k > pos; --k)
++                big[k] = big[k - 1];
++            big[pos] = s;
++            n = std::min(n + 1, kN);
++        }
++    }
++    os_unfair_lock_unlock(&g_lock);
++
++    struct Group
++    {
++        char key[256];
++        int64_t bytes, count;
++        char example[600];
++    };
++    static Group groups[kN];
++    int ng = 0;
++    for (int i = 0; i < n; ++i)
++    {
++        char desc[600];
++        Describe(big[i], desc, sizeof(desc));
++        // ключ: две верхние функции
++        char key[256];
++        xr_strcpy(key, desc);
++        if (char* a = strstr(key, " < "))
++            if (char* b = strstr(a + 3, " < "))
++                *b = 0;
++        int g = 0;
++        while (g < ng && strcmp(groups[g].key, key) != 0)
++            ++g;
++        if (g == ng)
++        {
++            xr_strcpy(groups[g].key, key);
++            xr_strcpy(groups[g].example, desc);
++            groups[g].bytes = groups[g].count = 0;
++            ++ng;
++        }
++        groups[g].bytes += big[i].liveBytes;
++        groups[g].count += big[i].liveCount;
++    }
++    std::sort(groups, groups + ng, [](const Group& a, const Group& b) { return a.bytes > b.bytes; });
++    const int64_t k = int64_t(1) << kSampleShift;
++    Msg("* [iOSRay] куча, кто держит память (%s): всего живых ~%lld МБ", why, (long long)(totalLive * k >> 20));
++    for (int g = 0; g < ng && g < 20; ++g)
++        Msg("*   %lld МБ (%lld шт): %s", (long long)(groups[g].bytes * k >> 20), (long long)(groups[g].count * k),
++            groups[g].example[0] ? groups[g].example : "?");
++}
 diff --git a/src/xrEngine/ios_heapprof.h b/src/xrEngine/ios_heapprof.h
 new file mode 100644
-index 00000000..3d82224a
+index 00000000..0d8b24c7
 --- /dev/null
 +++ b/src/xrEngine/ios_heapprof.h
-@@ -0,0 +1,6 @@
+@@ -0,0 +1,8 @@
 +#pragma once
 +#if defined(XR_PLATFORM_APPLE)
 +// iOSRay: выборочный профилировщик кучи (поиск утечек). Отчёт — раз в минуту в лог.
 +void XrHeapProfStart();
 +void XrHeapProfReport();
++// Кто сейчас держит больше всего памяти (сгруппировано по двум верхним функциям)
++void XrHeapProfReportLive(const char* why);
 +#endif
 diff --git a/src/xrEngine/x_ray.cpp b/src/xrEngine/x_ray.cpp
 index 20d2e576..d4d6cdc0 100644
