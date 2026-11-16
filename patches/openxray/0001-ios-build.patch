@@ -6405,10 +6405,10 @@ index 00000000..0c3fe20e
 +#endif
 diff --git a/src/xrEngine/ios_heapprof.cpp b/src/xrEngine/ios_heapprof.cpp
 new file mode 100644
-index 00000000..41d6b545
+index 00000000..0550ba5c
 --- /dev/null
 +++ b/src/xrEngine/ios_heapprof.cpp
-@@ -0,0 +1,314 @@
+@@ -0,0 +1,364 @@
 +// iOSRay: выборочный профилировщик кучи, чтобы найти утечку памяти без Instruments.
 +// Через системный крючок malloc_logger видим каждое выделение/освобождение в процессе.
 +// Запоминаем примерно каждое 64-е (выбор по адресу, чтобы free совпадал с malloc) вместе
@@ -6452,6 +6452,7 @@ index 00000000..41d6b545
 +    int64_t liveBytes;
 +    int64_t liveCount;
 +    int64_t lastReported;
++    int64_t baseline; // живых байт на момент «отсечки» (второй отчёт, уровень уже загружен)
 +};
 +
 +AllocSlot* g_allocs = nullptr;
@@ -6624,7 +6625,7 @@ index 00000000..41d6b545
 +        Dl_info info{};
 +        if (!dladdr(reinterpret_cast<void*>(s.frames[i]), &info))
 +            continue;
-+        if (!info.dli_sname)
++        if (!info.dli_sname || !*info.dli_sname)
 +        {
 +            // без имени (статические функции): смещение в образе — сопоставлю по сборке из CI
 +            const char* img = info.dli_fname ? strrchr(info.dli_fname, '/') : nullptr;
@@ -6641,10 +6642,14 @@ index 00000000..41d6b545
 +        if (!IsAllocatorFrame(name) || shown > 0)
 +        {
 +            // короче: без списка аргументов
-+            char buf[96];
++            char buf[160];
 +            xr_strcpy(buf, name);
++            // «(anonymous namespace)::f(args)» -> «anon::f»: обрезаем список аргументов, а не имя
++            if (char* an = strstr(buf, "(anonymous namespace)::"))
++                memmove(an, "anon::", 6), memmove(an + 6, an + 23, strlen(an + 23) + 1);
 +            if (char* paren = strchr(buf, '('))
-+                *paren = 0;
++                if (paren != buf)
++                    *paren = 0;
 +            len += snprintf(out + len, cap - std::min(len, cap), "%s%s", shown ? " < " : "", buf);
 +            ++shown;
 +        }
@@ -6706,6 +6711,35 @@ index 00000000..41d6b545
 +        }
 +        s.lastReported = s.liveBytes;
 +    }
++    // отсечка и рейтинг «рост с отсечки» — то, что копится постоянно, а не всплеск за минуту
++    static int s_reports = 0;
++    ++s_reports;
++    static Top lasting[8];
++    int nLasting = 0;
++    for (size_t i = 0; i < kStackCap; ++i)
++    {
++        StackRec& s = g_stacks[i];
++        if (!s.hash)
++            continue;
++        if (s_reports == 2)
++        {
++            s.baseline = s.liveBytes;
++            continue;
++        }
++        if (s_reports < 3)
++            continue;
++        const int64_t grow = s.liveBytes - s.baseline;
++        int pos = nLasting;
++        while (pos > 0 && lasting[pos - 1].delta < grow)
++            --pos;
++        if (pos < 8)
++        {
++            for (int k = std::min(nLasting, 7); k > pos; --k)
++                lasting[k] = lasting[k - 1];
++            lasting[pos] = { s, grow };
++            nLasting = std::min(nLasting + 1, 8);
++        }
++    }
 +    const uint64_t dropped = g_dropped;
 +    os_unfair_lock_unlock(&g_lock);
 +
@@ -6720,6 +6754,22 @@ index 00000000..41d6b545
 +        Describe(top[i].rec, desc, sizeof(desc));
 +        Msg("*   +%lld КБ (всего %lld КБ, %lld шт): %s", (long long)(top[i].delta * k >> 10),
 +            (long long)(top[i].rec.liveBytes * k >> 10), (long long)(top[i].rec.liveCount * k), desc[0] ? desc : "?");
++    }
++    if (s_reports == 2)
++        Msg("* [iOSRay] куча: отсечка сделана, дальше — рост с этого момента");
++    if (nLasting > 0)
++    {
++        Msg("* [iOSRay] куча: рост с отсечки (%d мин):", s_reports - 2);
++        for (int i = 0; i < nLasting && i < 6; ++i)
++        {
++            if (lasting[i].delta <= 0)
++                break;
++            char desc[600];
++            Describe(lasting[i].rec, desc, sizeof(desc));
++            Msg("*   =+%lld КБ (всего %lld КБ, %lld шт): %s", (long long)(lasting[i].delta * k >> 10),
++                (long long)(lasting[i].rec.liveBytes * k >> 10), (long long)(lasting[i].rec.liveCount * k),
++                desc[0] ? desc : "?");
++        }
 +    }
 +}
 +#endif
@@ -6761,7 +6811,7 @@ index 20d2e576..d4d6cdc0 100644
  
  constexpr pcstr FRAME_MARK_APPLICATION_STARTUP = "Application startup";
 diff --git a/src/xrEngine/xr_input.cpp b/src/xrEngine/xr_input.cpp
-index b8caddd9..819cf9d8 100644
+index b8caddd9..a9bce47a 100644
 --- a/src/xrEngine/xr_input.cpp
 +++ b/src/xrEngine/xr_input.cpp
 @@ -1,4 +1,7 @@
@@ -6772,7 +6822,22 @@ index b8caddd9..819cf9d8 100644
  #pragma hdrstop
  
  #include "xr_input.h"
-@@ -758,9 +761,16 @@ void CInput::OnAppDeactivate(void)
+@@ -667,8 +670,14 @@ void CInput::EnableTextInput()
+ {
+     ++textInputCounter;
+ 
++#if defined(XR_PLATFORM_APPLE)
++    // iOSRay: клавиатуру могли спрятать кнопкой — показать снова, даже если счётчик не обнулился
++    if (!SDL_IsTextInputActive())
++        SDL_StartTextInput();
++#else
+     if (textInputCounter == 1)
+         SDL_StartTextInput();
++#endif
+ 
+     SDL_PumpEvents();
+     SDL_FlushEvents(SDL_TEXTEDITING, SDL_TEXTINPUT);
+@@ -758,9 +767,16 @@ void CInput::OnAppDeactivate(void)
      controllerState = {};
  }
  
@@ -6789,7 +6854,7 @@ index b8caddd9..819cf9d8 100644
  
      if (AltF4Pressed)
          return;
-@@ -832,3 +842,107 @@ void CInput::Feedback(FeedbackType type, float s1, float s2, float duration)
+@@ -832,3 +848,123 @@ void CInput::Feedback(FeedbackType type, float s1, float s2, float duration)
      default: NODEFAULT;
      }
  }
@@ -6824,6 +6889,22 @@ index b8caddd9..819cf9d8 100644
 +            return dik;
 +    }
 +    return SDL_SCANCODE_UNKNOWN;
++}
++
++// iOSRay: кнопка «спрятать клавиатуру» — подтвердить ввод (Enter) и убрать клавиатуру
++extern "C" void xr_ios_hide_keyboard()
++{
++    for (const Uint32 type : { Uint32(SDL_KEYDOWN), Uint32(SDL_KEYUP) })
++    {
++        SDL_Event e{};
++        e.type = type;
++        e.key.state = type == SDL_KEYDOWN ? SDL_PRESSED : SDL_RELEASED;
++        e.key.keysym.scancode = SDL_SCANCODE_RETURN;
++        e.key.keysym.sym = SDLK_RETURN;
++        SDL_PushEvent(&e);
++    }
++    if (SDL_IsTextInputActive())
++        SDL_StopTextInput();
 +}
 +
 +extern "C" void xr_ios_action(int iosAction, int down)
@@ -7178,6 +7259,28 @@ index d00cfde5..117c835d 100644
              .def("r_s32", &IReader::r_s32)
              .def("r_u16", &IReader::r_u16)
              .def("r_s16", &IReader::r_s16)
+diff --git a/src/xrUICore/EditBox/UICustomEdit.cpp b/src/xrUICore/EditBox/UICustomEdit.cpp
+index bab1dfdf..4b20dc8f 100644
+--- a/src/xrUICore/EditBox/UICustomEdit.cpp
++++ b/src/xrUICore/EditBox/UICustomEdit.cpp
+@@ -29,6 +29,8 @@ CUICustomEdit::CUICustomEdit() : CUIStatic("CUICustomEdit")
+ 
+ CUICustomEdit::~CUICustomEdit()
+ {
++    if (m_bInputFocus) // iOSRay: окно закрыли с фокусом в поле — иначе клавиатура не прячется
++        ec().on_ir_release();
+     xr_delete(m_editor_control);
+     UI().Focus().UnregisterFocusable(this);
+ }
+@@ -245,6 +247,8 @@ void CUICustomEdit::Draw()
+ void CUICustomEdit::Show(bool status)
+ {
+     m_force_update = true;
++    if (!status && m_bInputFocus)
++        CaptureFocus(false);
+     inherited::Show(status);
+ }
+ 
 diff --git a/src/xrUICore/TrackBar/UITrackBar.cpp b/src/xrUICore/TrackBar/UITrackBar.cpp
 index 1cef69ab..d8cfa81c 100644
 --- a/src/xrUICore/TrackBar/UITrackBar.cpp
@@ -7565,10 +7668,10 @@ index 00000000..32c51455
 +}
 diff --git a/src/xr_3da/ios_touch.mm b/src/xr_3da/ios_touch.mm
 new file mode 100644
-index 00000000..0cfa62ae
+index 00000000..68896600
 --- /dev/null
 +++ b/src/xr_3da/ios_touch.mm
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,445 @@
 +// iOSRay: экранное управление поверх окна SDL.
 +//
 +// Хват на 4 пальца: большие — снизу (левый — плавающий стик, правый — обзор и
@@ -7588,6 +7691,7 @@ index 00000000..0cfa62ae
 +extern "C" int xr_ios_input_grabbed();
 +extern "C" void xr_ios_action(int iosAction, int down);
 +extern "C" void xr_ios_look(int dx, int dy);
++extern "C" void xr_ios_hide_keyboard();
 +
 +namespace
 +{
@@ -7598,6 +7702,7 @@ index 00000000..0cfa62ae
 +    actUse, actReload, actInventory, actMenu,
 +    actWeaponNext, actPda, actSprint, actWalk,
 +    actWpn1, actWpn2, actWpn3, actWpn4, actWpn5, actWpn6,
++    actHideKeyboard = 100, // не игровое действие: прячет экранную клавиатуру
 +};
 +
 +constexpr CGFloat kStickZone = 0.40;      // доля ширины экрана слева под стик
@@ -7639,6 +7744,8 @@ index 00000000..0cfa62ae
 +    UIView* _stickBase;
 +    UIView* _stickKnob;
 +    NSMutableArray<XRTouchButton*>* _buttons;
++    XRTouchButton* _hideKb;
++    BOOL _keyboardShown;
 +}
 +
 +- (instancetype)initWithFrame:(CGRect)frame
@@ -7669,6 +7776,12 @@ index 00000000..0cfa62ae
 +        [self addButton:@"PDA" action:actPda size:40];
 +        XRTouchButton* menu = [self addButton:@"Esc" action:actMenu size:40];
 +        menu.alwaysVisible = YES;
++        _hideKb = [self addButton:@"⌨↓" action:actHideKeyboard size:44];
++        _hideKb.hidden = YES;
++        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(keyboardShown:)
++                                                   name:UIKeyboardWillShowNotification object:nil];
++        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(keyboardHidden:)
++                                                   name:UIKeyboardWillHideNotification object:nil];
 +        _gameplay = YES;
 +        self.gameplay = NO;
 +    }
@@ -7705,8 +7818,26 @@ index 00000000..0cfa62ae
 +    return b;
 +}
 +
++- (void)keyboardShown:(NSNotification*)n
++{
++    _keyboardShown = YES;
++    _hideKb.hidden = NO;
++}
++
++- (void)keyboardHidden:(NSNotification*)n
++{
++    _keyboardShown = NO;
++    _hideKb.hidden = YES;
++}
++
 +- (void)press:(XRTouchButton*)b down:(BOOL)down
 +{
++    if (b.action == actHideKeyboard)
++    {
++        if (down)
++            xr_ios_hide_keyboard();
++        return;
++    }
 +    const int before = b.pressCount;
 +    b.pressCount = MAX(0, before + (down ? 1 : -1));
 +    if ((before == 0) == (b.pressCount == 0))
@@ -7735,6 +7866,7 @@ index 00000000..0cfa62ae
 +        case actMenu:      c = CGPointMake(L + 112, T + 26); break;
 +        case actInventory: c = CGPointMake(L + 160, T + 26); break;
 +        case actPda:       c = CGPointMake(L + 208, T + 26); break;
++        case actHideKeyboard: c = CGPointMake(L + 272, T + 26); break; // между PDA и цифрами
 +        // правый большой палец: кнопки по краю, середина свободна для обзора
 +        case actWalk:      c = CGPointMake(W - 44,  H - 200); break;
 +        case actUse:       c = CGPointMake(W - 120, H - 212); break;
@@ -7757,7 +7889,7 @@ index 00000000..0cfa62ae
 +        return;
 +    _gameplay = gameplay;
 +    for (XRTouchButton* b in _buttons)
-+        b.hidden = !(gameplay || b.alwaysVisible);
++        b.hidden = b.action == actHideKeyboard ? !_keyboardShown : !(gameplay || b.alwaysVisible);
 +    [self releaseAll];
 +}
 +
