@@ -6564,6 +6564,43 @@ index f8520bc6..fb30cee2 100644
              if (allow(str))
                  Console->Execute(str);
          }
+diff --git a/src/xrGame/GametaskManager.cpp b/src/xrGame/GametaskManager.cpp
+index 2bce9e42..3adfcbc4 100644
+--- a/src/xrGame/GametaskManager.cpp
++++ b/src/xrGame/GametaskManager.cpp
+@@ -36,7 +36,9 @@ bool task_prio_pred(const SGameTaskKey& k1, const SGameTaskKey& k2)
+ 
+ CGameTaskManager::CGameTaskManager()
+ {
+-    m_gameTaskXml.Load(CONFIG_PATH, "gameplay", "game_tasks.xml", false);
++    if (m_gameTaskXmlUsers++ == 0)
++        m_gameTaskXml.Load(CONFIG_PATH, "gameplay", "game_tasks.xml", false);
++    m_gameTaskXml.SetLocalRoot(m_gameTaskXml.GetRoot());
+ 
+     m_gametasks_wrapper = xr_new<CGameTaskWrapper>();
+     m_gametasks_wrapper->registry().init(0); // actor's id
+@@ -62,7 +64,8 @@ CGameTaskManager::~CGameTaskManager()
+     delete_data(m_gametasks_wrapper);
+     for (auto& taskId : g_active_task_id)
+         taskId = nullptr;
+-    m_gameTaskXml.ClearInternal();
++    if (--m_gameTaskXmlUsers == 0)
++        m_gameTaskXml.ClearInternal();
+ }
+ 
+ vGameTasks& CGameTaskManager::GetGameTasks()
+diff --git a/src/xrGame/GametaskManager.h b/src/xrGame/GametaskManager.h
+index 0e407c8e..6923472a 100644
+--- a/src/xrGame/GametaskManager.h
++++ b/src/xrGame/GametaskManager.h
+@@ -59,4 +59,7 @@ public:
+ 
+ public:
+     inline static CUIXml m_gameTaskXml;
++    // iOSRay: XML общий для всех экземпляров. При «Новой игре» новый менеджер создаётся раньше,
++    // чем удаляется старый, и деструктор старого очищал уже загруженный документ.
++    inline static int m_gameTaskXmlUsers = 0;
+ };
 diff --git a/src/xrGame/MainMenu.cpp b/src/xrGame/MainMenu.cpp
 index 22028756..5dbab994 100644
 --- a/src/xrGame/MainMenu.cpp
@@ -6671,67 +6708,57 @@ index 091259f8..2e590cac 100644
          m_sequencer_items.front()->OnMousePress(btn);
  
 diff --git a/src/xrGame/ui/UIHudStatesWnd.cpp b/src/xrGame/ui/UIHudStatesWnd.cpp
-index b2c8878e..bc9a0f0d 100644
+index b2c8878e..5a0b1289 100644
 --- a/src/xrGame/ui/UIHudStatesWnd.cpp
 +++ b/src/xrGame/ui/UIHudStatesWnd.cpp
-@@ -330,6 +330,57 @@ void CUIHudStatesWnd::UpdateActiveItemInfo(CActor* actor)
-         II_BriefInfo item_info;
-         item->GetBriefInfo(item_info);
+@@ -328,7 +328,31 @@ void CUIHudStatesWnd::UpdateActiveItemInfo(CActor* actor)
+         }
  
-+#if defined(XR_PLATFORM_APPLE)
-+        // iOSRay: диагностика пропавших патронов/значка в HUD — раз на каждый новый предмет
-+        static const void* s_lastItem = nullptr;
-+        static int s_lateDump = -1;
-+        if (s_lastItem != item)
-+            s_lateDump = 90; // через ~1.5 с — подробный снимок уже после обновления
-+        if (s_lateDump > 0 && --s_lateDump == 0)
+         II_BriefInfo item_info;
+-        item->GetBriefInfo(item_info);
++        const bool fresh = item->GetBriefInfo(item_info);
++        // iOSRay: GetBriefInfo пересчитывает патроны и значок только когда инвентарь изменился,
++        // в остальных кадрах возвращает false и оставляет их пустыми. Без кэша счётчик «8/40»
++        // и значок патронов показывались один кадр и тут же скрывались (видно в ТЧ-раскладке HUD).
++        if (fresh)
 +        {
-+            auto deep = [](pcstr what, CUIStatic* st) {
-+                if (!st)
-+                    return;
-+                Fvector2 abs;
-+                st->GetAbsolutePos(abs);
-+                const Frect& tr = st->GetTextureRect();
-+                CGameFont* f = st->GetFont();
-+                Msg("~ [iOSRay] HUD+: %s показ %d текст '%s' цвет текста %08x шрифт %p (выс %.1f) | "
-+                    "текстура цвет %08x rect %.0f,%.0f-%.0f,%.0f | окно %.0f,%.0f %.0fx%.0f",
-+                    what, int(st->IsShown()), st->GetText() ? st->GetText() : "", st->GetTextColor(), (void*)f,
-+                    f ? f->GetHeight() : 0.f, st->GetTextureColor(), tr.x1, tr.y1, tr.x2, tr.y2, abs.x, abs.y, st->GetWidth(), st->GetHeight());
-+            };
-+            deep("static_weapon", m_static_weapon);
-+            deep("static_wpn_icon", m_ui_weapon_icon);
-+            deep("static_ammo", m_ui_weapon_sign_ammo);
++            m_brief_cache = item_info;
++            m_brief_item = item;
 +        }
-+        if (s_lastItem != item)
++        else if (m_brief_item == item)
 +        {
-+            s_lastItem = item;
-+            auto dump = [](pcstr what, CUIWindow* w) {
-+                if (!w)
-+                {
-+                    Msg("~ [iOSRay] HUD: %s — нет в xml", what);
-+                    return;
-+                }
-+                Fvector2 abs;
-+                w->GetAbsolutePos(abs);
-+                bool shown = true;
-+                for (CUIWindow* p = w; p; p = p->GetParent())
-+                    shown = shown && p->IsShown();
-+                Msg("~ [iOSRay] HUD: %s позиция %.0f,%.0f размер %.0fx%.0f видим %d", what, abs.x, abs.y,
-+                    w->GetWidth(), w->GetHeight(), int(shown));
-+            };
-+            Msg("~ [iOSRay] HUD: предмет [%s], значок [%s], патроны [%s/%s], режим [%s]",
-+                item->object().cNameSect().c_str(), item_info.icon.c_str(), item_info.cur_ammo.c_str(),
-+                item_info.total_ammo.c_str(), item_info.fire_mode.c_str());
-+            dump("static_weapon", m_static_weapon);
-+            dump("static_wpn_icon", m_ui_weapon_icon);
-+            dump("static_ammo", m_ui_weapon_sign_ammo);
-+            dump("static_cur_ammo", m_ui_weapon_cur_ammo);
++            const shared_str cur = item_info.cur_ammo, mode = item_info.fire_mode;
++            item_info = m_brief_cache;
++            item_info.cur_ammo = cur;
++            item_info.fire_mode = mode;
 +        }
-+#endif
-+
++        else if (CWeapon* wpn = item->cast_weapon())
++        {
++            wpn->ForceUpdateAmmo(); // новый предмет: посчитать сразу, а не ждать изменения инвентаря
++            if (item->GetBriefInfo(item_info))
++            {
++                m_brief_cache = item_info;
++                m_brief_item = item;
++            }
++        }
+ 
          if (m_fire_mode)
              m_fire_mode->SetText(item_info.fire_mode.c_str());
-         SetAmmoIcon(item_info.icon.c_str());
+diff --git a/src/xrGame/ui/UIHudStatesWnd.h b/src/xrGame/ui/UIHudStatesWnd.h
+index 7a1580f8..d344f269 100644
+--- a/src/xrGame/ui/UIHudStatesWnd.h
++++ b/src/xrGame/ui/UIHudStatesWnd.h
+@@ -18,6 +18,10 @@ class CActor;
+ class CUIHudStatesWnd final : public CUIWindow
+ {
+ private:
++    // iOSRay: последние полные сведения о предмете (см. UpdateActiveItemInfo)
++    II_BriefInfo m_brief_cache;
++    const void* m_brief_item = nullptr;
++
+     typedef CUIWindow inherited;
+     //-	typedef ALife::EInfluenceType	EIndicatorType;
+ 
 diff --git a/src/xrUICore/TrackBar/UITrackBar.cpp b/src/xrUICore/TrackBar/UITrackBar.cpp
 index 1cef69ab..d8cfa81c 100644
 --- a/src/xrUICore/TrackBar/UITrackBar.cpp
