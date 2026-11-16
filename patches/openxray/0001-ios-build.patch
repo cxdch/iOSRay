@@ -6405,10 +6405,10 @@ index 00000000..0c3fe20e
 +#endif
 diff --git a/src/xrEngine/ios_heapprof.cpp b/src/xrEngine/ios_heapprof.cpp
 new file mode 100644
-index 00000000..1185b976
+index 00000000..41d6b545
 --- /dev/null
 +++ b/src/xrEngine/ios_heapprof.cpp
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,314 @@
 +// iOSRay: выборочный профилировщик кучи, чтобы найти утечку памяти без Instruments.
 +// Через системный крючок malloc_logger видим каждое выделение/освобождение в процессе.
 +// Запоминаем примерно каждое 64-е (выбор по адресу, чтобы free совпадал с malloc) вместе
@@ -6619,11 +6619,22 @@ index 00000000..1185b976
 +    out[0] = 0;
 +    size_t len = 0;
 +    int shown = 0;
-+    for (int i = 0; i < kFrames && s.frames[i] && shown < 4; ++i)
++    for (int i = 0; i < kFrames && s.frames[i] && shown < 6; ++i)
 +    {
 +        Dl_info info{};
-+        if (!dladdr(reinterpret_cast<void*>(s.frames[i]), &info) || !info.dli_sname)
++        if (!dladdr(reinterpret_cast<void*>(s.frames[i]), &info))
 +            continue;
++        if (!info.dli_sname)
++        {
++            // без имени (статические функции): смещение в образе — сопоставлю по сборке из CI
++            const char* img = info.dli_fname ? strrchr(info.dli_fname, '/') : nullptr;
++            len += snprintf(out + len, cap - std::min(len, cap), "%s%s+0x%lx", shown ? " < " : "",
++                img ? img + 1 : "?", (unsigned long)(s.frames[i] - uintptr_t(info.dli_fbase)));
++            ++shown;
++            if (len >= cap)
++                break;
++            continue;
++        }
 +        int status = 0;
 +        char* dem = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
 +        const char* name = status == 0 && dem ? dem : info.dli_sname;
@@ -6705,7 +6716,7 @@ index 00000000..1185b976
 +    {
 +        if (top[i].delta <= 0)
 +            break;
-+        char desc[400];
++        char desc[600];
 +        Describe(top[i].rec, desc, sizeof(desc));
 +        Msg("*   +%lld КБ (всего %lld КБ, %lld шт): %s", (long long)(top[i].delta * k >> 10),
 +            (long long)(top[i].rec.liveBytes * k >> 10), (long long)(top[i].rec.liveCount * k), desc[0] ? desc : "?");
@@ -6994,6 +7005,22 @@ index f69d70fc..eb2d8e1c 100644
      b_state_end = true;
  }
  
+diff --git a/src/xrGame/alife_simulator_script.cpp b/src/xrGame/alife_simulator_script.cpp
+index 7f4df747..012bddc3 100644
+--- a/src/xrGame/alife_simulator_script.cpp
++++ b/src/xrGame/alife_simulator_script.cpp
+@@ -52,6 +52,11 @@ CSE_ALifeDynamicObject* alife_object(const CALifeSimulator* self, ALife::_OBJECT
+ CSE_ALifeDynamicObject* alife_object(const CALifeSimulator* self, pcstr name)
+ {
+     VERIFY(self);
++    if (!name) // iOSRay: alife():object(nil) — вместо падения в strcmp вернуть nil
++    {
++        Msg("! [LUA] alife():object(nil) — пустое имя объекта");
++        return nullptr;
++    }
+ 
+     for (CALifeObjectRegistry::OBJECT_REGISTRY::const_iterator it = self->objects().objects().begin();
+          it != self->objects().objects().end(); ++it)
 diff --git a/src/xrGame/login_manager.cpp b/src/xrGame/login_manager.cpp
 index 3eb004d9..5f34ac1e 100644
 --- a/src/xrGame/login_manager.cpp
