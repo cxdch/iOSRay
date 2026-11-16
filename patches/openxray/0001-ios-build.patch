@@ -17,6 +17,19 @@ index 4b438f03..9b3f34a6 100644
      add_subdirectory(LuaJIT-proj)
  else()
      find_package(Lua51 REQUIRED)
+diff --git a/src/Common/PlatformApple.inl b/src/Common/PlatformApple.inl
+index 05463931..b837b951 100644
+--- a/src/Common/PlatformApple.inl
++++ b/src/Common/PlatformApple.inl
+@@ -108,7 +108,7 @@ inline void OutputDebugString(const char *str) // for linux debugger
+ 
+ inline unsigned long GetLastError()
+ {
+-    return 0;
++    return errno; // iOSRay: чтобы в сообщениях об ошибках была причина
+ }
+ 
+ inline int GetExceptionCode()
 diff --git a/src/Layers/xrRender/BufferUtils.h b/src/Layers/xrRender/BufferUtils.h
 index e683c4b1..a96ea1cc 100644
 --- a/src/Layers/xrRender/BufferUtils.h
@@ -5935,6 +5948,83 @@ index 55ae8027..a6713bba 100644
          rt_Forward.create("$user$forward", w, h, D3DFMT_A8R8G8B8, 1);
  #endif
  
+diff --git a/src/xrCore/FS.cpp b/src/xrCore/FS.cpp
+index af98b456..aebbe87d 100644
+--- a/src/xrCore/FS.cpp
++++ b/src/xrCore/FS.cpp
+@@ -533,7 +533,8 @@ CVirtualFileRW::~CVirtualFileRW()
+     CloseHandle(hSrcFile);
+ #elif defined(XR_PLATFORM_POSIX)
+     ::munmap((void*)data, Size);
+-    ::close(hSrcFile);
++    if (hSrcFile != -1)
++        ::close(hSrcFile);
+     hSrcFile = -1;
+ #else
+ #   error Select or add implementation for your platform
+@@ -569,6 +570,12 @@ CVirtualFileReader::CVirtualFileReader(pcstr cFileName)
+     R_ASSERT3(Size, cFileName, xrDebug::ErrorToString(GetLastError()));
+     data = (char*)::mmap(NULL, Size, PROT_READ, MAP_SHARED, hSrcFile, 0);
+     R_ASSERT3(data && data != MAP_FAILED, cFileName, xrDebug::ErrorToString(GetLastError()));
++#if defined(XR_PLATFORM_APPLE)
++    // iOSRay: отображение в память остаётся рабочим и без дескриптора — закрываем сразу,
++    // иначе каждый играющий звук держит открытый файл и упираемся в лимит (256 на iOS)
++    ::close(hSrcFile);
++    hSrcFile = -1;
++#endif
+ #else
+ #   error Select or add implementation for your platform
+ #endif
+diff --git a/src/xrCore/xrCore.cpp b/src/xrCore/xrCore.cpp
+index 7a59c2d8..7e64daa8 100644
+--- a/src/xrCore/xrCore.cpp
++++ b/src/xrCore/xrCore.cpp
+@@ -1,6 +1,9 @@
+ // xrCore.cpp : Defines the entry point for the DLL application.
+ //
+ #include "stdafx.h"
++#if defined(XR_PLATFORM_APPLE)
++#include <sys/resource.h>
++#endif
+ #pragma hdrstop
+ 
+ #if defined(XR_PLATFORM_WINDOWS)
+@@ -194,6 +197,21 @@ void xrCore::Initialize(pcstr _ApplicationName, pcstr commandLine, bool init_fs,
+ 
+     if (0 == init_counter)
+     {
++#if defined(XR_PLATFORM_APPLE)
++        // iOSRay: по умолчанию процессу дают 256 открытых файлов — игре мало
++        {
++            rlimit rl{};
++            if (getrlimit(RLIMIT_NOFILE, &rl) == 0)
++            {
++                const rlim_t want = rl.rlim_max == RLIM_INFINITY ? 8192 : std::min<rlim_t>(rl.rlim_max, 8192);
++                if (rl.rlim_cur < want)
++                {
++                    rl.rlim_cur = want;
++                    setrlimit(RLIMIT_NOFILE, &rl);
++                }
++            }
++        }
++#endif
+ #if defined(XR_ARCHITECTURE_X86) || defined(XR_ARCHITECTURE_X64)
+         R_ASSERT2(CPU::HasSSE2, "Your CPU must support SSE2.");
+ #endif
+diff --git a/src/xrCore/xrDebug.cpp b/src/xrCore/xrDebug.cpp
+index 1edcda8f..a551e3f9 100644
+--- a/src/xrCore/xrDebug.cpp
++++ b/src/xrCore/xrDebug.cpp
+@@ -348,6 +348,9 @@ pcstr xrDebug::ErrorToString(long code)
+         FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, 0, code, 0, descStorage, sizeof(descStorage) - 1, 0);
+         result = descStorage;
+     }
++#elif defined(XR_PLATFORM_APPLE)
++    if (code)
++        result = strerror(int(code));
+ #endif
+     return result;
+ }
 diff --git a/src/xrEngine/CMakeLists.txt b/src/xrEngine/CMakeLists.txt
 index 7a2eb22c..140faf4b 100644
 --- a/src/xrEngine/CMakeLists.txt
