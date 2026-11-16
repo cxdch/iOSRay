@@ -1748,10 +1748,10 @@ index 60fe082f..1d330873 100644
          glReadPixels(0, 0, Device.dwWidth, Device.dwHeight, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl.mm b/src/Layers/xrRenderGL/mtl/glmtl.mm
 new file mode 100644
-index 00000000..f0442477
+index 00000000..eedb0c8e
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl.mm
-@@ -0,0 +1,551 @@
+@@ -0,0 +1,608 @@
 +// iOSRay: Metal-режим рендера.
 +//
 +// Рендер OpenXRay продолжает вызывать функции OpenGL ES (через указатели glad),
@@ -1761,6 +1761,7 @@ index 00000000..f0442477
 +// в glmtl_render.mm. Всё, что не реализовано, — общая заглушка.
 +
 +#include "glmtl_internal.h"
++#include "glmtl_prof.h"
 +#include "glmtl_shaders.h"
 +
 +#include <cstdio>
@@ -2141,9 +2142,10 @@ index 00000000..f0442477
 +{
 +    const char* name;
 +    void* fn;
++    int id;
 +};
 +
-+#define E(n, f) { n, reinterpret_cast<void*>(&f) }
++#define E(n, f) { n, reinterpret_cast<void*>(&xr_mtl::ProfWrap<&f, __LINE__>::fn), __LINE__ }
 +const Entry kTable[] = {
 +    E("glGetError", gl_GetError),
 +    E("glGetString", gl_GetString),
@@ -2297,18 +2299,73 @@ index 00000000..f0442477
 +        return fn;
 +    for (const Entry& e : kTable)
 +        if (!strcmp(e.name, name))
++        {
++            xr_mtl::ProfName(e.id, e.name);
 +            return e.fn;
++        }
 +    return reinterpret_cast<void*>(&gl_noop);
 +}
 +
 +// Конец кадра: вывод на экран (glmtl_render.mm)
 +extern "C" void xr_mtl_present() { xr_mtl::RenderPresent(); }
++
++// --- замер времени по GL-функциям (glmtl_prof.h) ---
++namespace xr_mtl
++{
++ProfSlot g_prof[kProfSlots];
++const char* g_profNames[kProfSlots];
++void ProfName(int id, const char* name)
++{
++    if (id >= 0 && id < kProfSlots && !g_profNames[id])
++        g_profNames[id] = name;
++}
++void ProfReport(unsigned frames)
++{
++    if (!frames)
++        return;
++    static mach_timebase_info_data_t tb;
++    if (!tb.denom)
++        mach_timebase_info(&tb);
++    const double msPerTick = double(tb.numer) / double(tb.denom) / 1e6;
++    int top[12];
++    int n = 0;
++    double total = 0;
++    uint64_t totalCalls = 0;
++    for (int i = 0; i < kProfSlots; ++i)
++    {
++        if (!g_prof[i].calls)
++            continue;
++        if (i < 20000)
++            total += g_prof[i].ticks * msPerTick, totalCalls += g_prof[i].calls;
++        int pos = n;
++        while (pos > 0 && g_prof[top[pos - 1]].ticks < g_prof[i].ticks)
++            --pos;
++        if (pos < 12)
++        {
++            for (int k = std::min(n, 11); k > pos; --k)
++                top[k] = top[k - 1];
++            top[pos] = i;
++            n = std::min(n + 1, 12);
++        }
++    }
++    printf("[iOSRay] Metal, процессор по функциям: всего %.1f мс/кадр, %llu вызовов/кадр\n", total / frames,
++        (unsigned long long)(totalCalls / frames));
++    for (int k = 0; k < n; ++k)
++    {
++        const ProfSlot& sl = g_prof[top[k]];
++        printf("[iOSRay]   %5.2f мс  %6llu выз.  %s\n", sl.ticks * msPerTick / frames,
++            (unsigned long long)(sl.calls / frames), g_profNames[top[k]] ? g_profNames[top[k]] : "?");
++    }
++    for (ProfSlot& sl : g_prof)
++        sl = {};
++}
++} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_internal.h b/src/Layers/xrRenderGL/mtl/glmtl_internal.h
 new file mode 100644
-index 00000000..df101218
+index 00000000..f31c717d
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_internal.h
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,40 @@
 +// iOSRay: Metal-режим — общее между glmtl.mm (база, буферы, шейдеры) и
 +// glmtl_render.mm (текстуры, кадровые буферы, состояние, рисование).
 +#pragma once
@@ -2339,6 +2396,7 @@ index 00000000..df101218
 +{
 +    const char* name;
 +    void* fn;
++    int id;
 +};
 +void* RenderProc(const char* name); // nullptr, если такой функции там нет
 +void RenderInit();
@@ -2457,12 +2515,66 @@ index 00000000..e75e912c
 +    }
 +};
 +} // namespace xr_mtl
+diff --git a/src/Layers/xrRenderGL/mtl/glmtl_prof.h b/src/Layers/xrRenderGL/mtl/glmtl_prof.h
+new file mode 100644
+index 00000000..d2c4578f
+--- /dev/null
++++ b/src/Layers/xrRenderGL/mtl/glmtl_prof.h
+@@ -0,0 +1,48 @@
++#pragma once
++// iOSRay: замер времени CPU по каждой GL-функции слоя Metal (для поиска, на что уходит процессор).
++// Каждая функция из таблиц регистрируется через обёртку ProfWrap: копит время и число вызовов
++// в своей ячейке; раз в 600 кадров ProfReport печатает самые дорогие.
++#include <mach/mach_time.h>
++#include <cstdint>
++
++namespace xr_mtl
++{
++constexpr int kProfSlots = 24000; // id = __LINE__ (+10000 для glmtl_render.mm, +20000 — участки внутри)
++struct ProfSlot
++{
++    uint64_t ticks;
++    uint64_t calls;
++};
++extern ProfSlot g_prof[kProfSlots];
++extern const char* g_profNames[kProfSlots];
++void ProfName(int id, const char* name);
++void ProfReport(unsigned frames);
++
++struct ProfScope
++{
++    ProfSlot& slot;
++    uint64_t t0;
++    explicit ProfScope(int id) : slot(g_prof[id]), t0(mach_absolute_time()) {}
++    ~ProfScope()
++    {
++        slot.ticks += mach_absolute_time() - t0;
++        ++slot.calls;
++    }
++};
++
++template <auto F, int Id>
++struct ProfWrap;
++template <typename R, typename... A, R (*F)(A...), int Id>
++struct ProfWrap<F, Id>
++{
++    static R fn(A... a)
++    {
++        ProfScope p(Id);
++        return F(a...);
++    }
++};
++} // namespace xr_mtl
++
++#define XR_PROF_SECTION(id, name) \
++    [[maybe_unused]] static const bool xr_prof_named_##id = (::xr_mtl::ProfName(20000 + id, name), true); \
++    ::xr_mtl::ProfScope xr_prof_scope_##id(20000 + id)
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_render.mm b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
 new file mode 100644
-index 00000000..aaadd2ef
+index 00000000..23a47df7
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
-@@ -0,0 +1,2485 @@
+@@ -0,0 +1,2505 @@
 +// iOSRay: Metal-режим, этап 4b — рисование.
 +//
 +// Здесь GL-вызовы движка превращаются в работу Metal:
@@ -2479,6 +2591,7 @@ index 00000000..aaadd2ef
 +// а при выводе на экран кадр переворачивается обратно.
 +
 +#include "glmtl_internal.h"
++#include "glmtl_prof.h"
 +#include "glmtl_namemap.h"
 +#include "glmtl_shaders.h"
 +
@@ -3380,6 +3493,8 @@ index 00000000..aaadd2ef
 +std::mutex g_statsMutex;
 +
 +double NowMs() { return CACurrentMediaTime() * 1000.0; }
++
++
 +
 +// Время CPU внутри слоя Metal на вызовах рисования (за период лога)
 +double g_shimMs = 0;
@@ -4359,6 +4474,7 @@ index 00000000..aaadd2ef
 +        return false;
 +    }
 +
++    XR_PROF_SECTION(1, "  draw: программа/цели/раскладка/PSO");
 +    const GLuint program = CurrentProgram();
 +    const Program* p = FindProgram(program);
 +    if (!p || !p->linked)
@@ -4390,6 +4506,10 @@ index 00000000..aaadd2ef
 +            return false;
 +    }
 +
++    xr_prof_scope_1.~ProfScope();
++    new (&xr_prof_scope_1) ProfScope(20000 + 2);
++    static const bool n2 = (ProfName(20000 + 2, "  draw: энкодер и состояние"), true);
++    (void)n2;
 +    EnsureEncoder(t);
 +    id<MTLRenderCommandEncoder> e = s.enc;
 +    if (g_ec.pso != pso)
@@ -4456,6 +4576,10 @@ index 00000000..aaadd2ef
 +        [e setScissorRect:sc];
 +    }
 +
++    xr_prof_scope_1.~ProfScope();
++    new (&xr_prof_scope_1) ProfScope(20000 + 3);
++    static const bool n3 = (ProfName(20000 + 3, "  draw: вершины и uniform"), true);
++    (void)n3;
 +    for (const VertexSetup::Bind& b : vs.binds)
 +        SetBuffer(0, b.buffer, b.offset, b.index);
 +    if (vs.needDummy)
@@ -4500,6 +4624,10 @@ index 00000000..aaadd2ef
 +        uint32_t generation = ~0u;
 +        std::vector<uint16_t> idx;
 +    };
++    xr_prof_scope_1.~ProfScope();
++    new (&xr_prof_scope_1) ProfScope(20000 + 4);
++    static const bool n4 = (ProfName(20000 + 4, "  draw: текстуры и сэмплеры"), true);
++    (void)n4;
 +    static NameMap<GLuint, SamplerList> samplerLists;
 +    SamplerList& sl = samplerLists[program];
 +    if (sl.generation != p->generation)
@@ -4854,6 +4982,7 @@ index 00000000..aaadd2ef
 +            g_storeStats.stored / std::max(1u, framesSinceLog), g_storeStats.skipped / std::max(1u, framesSinceLog),
 +            g_storeStats.mispredicts, os_proc_available_memory() >> 20, s.textures.size(), texBytes >> 20, bufCount, bufBytes >> 20,
 +            poolBytes >> 20, s.pipelines.size(), s.samplerStates.size());
++        ProfReport(framesSinceLog);
 +        fflush(stdout);
 +        g_shimMs = 0;
 +        g_storeStats.stored = g_storeStats.skipped = 0;
@@ -4863,7 +4992,7 @@ index 00000000..aaadd2ef
 +    s.presentSource = nil;
 +}
 +
-+#define E(n, f) { n, reinterpret_cast<void*>(&f) }
++#define E(n, f) { n, reinterpret_cast<void*>(&ProfWrap<&f, 10000 + __LINE__>::fn), 10000 + __LINE__ }
 +const ProcEntry kRenderProcs[] = {
 +    E("glActiveTexture", gl_ActiveTexture),
 +    E("glBindTexture", gl_BindTexture),
@@ -4944,7 +5073,10 @@ index 00000000..aaadd2ef
 +{
 +    for (const ProcEntry& e : kRenderProcs)
 +        if (!strcmp(e.name, name))
++        {
++            ProfName(e.id, e.name);
 +            return e.fn;
++        }
 +    return nullptr;
 +}
 +} // namespace xr_mtl
