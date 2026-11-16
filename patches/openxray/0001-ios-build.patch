@@ -2446,10 +2446,10 @@ index 00000000..e75e912c
 +} // namespace xr_mtl
 diff --git a/src/Layers/xrRenderGL/mtl/glmtl_render.mm b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
 new file mode 100644
-index 00000000..0f929894
+index 00000000..aaadd2ef
 --- /dev/null
 +++ b/src/Layers/xrRenderGL/mtl/glmtl_render.mm
-@@ -0,0 +1,2477 @@
+@@ -0,0 +1,2485 @@
 +// iOSRay: Metal-режим, этап 4b — рисование.
 +//
 +// Здесь GL-вызовы движка превращаются в работу Metal:
@@ -3553,6 +3553,9 @@ index 00000000..0f929894
 +// очистки, в этом же месте кадра дальше его не сохраняем (MTLStoreActionDontCare).
 +// Если прочтение всё же случилось — один кадр может быть неточным, и это место больше не трогаем.
 +constexpr uint8_t kStoreSkipAfter = 8; // кадров подряд без чтения
++// Выключено: в R2 почти все вложения потом читаются, выигрыша нет (0–1 пропуск на кадр),
++// а ошибка предсказания даёт мигающий кадр. Код оставлен для будущих экспериментов.
++constexpr bool kStoreOptEnabled = false;
 +
 +struct StoreDecision
 +{
@@ -3577,7 +3580,7 @@ index 00000000..0f929894
 +// Текстуру прочитали (сэмплинг, копия, частичная запись, загрузка в проход, вывод на экран)
 +void StoreNoteRead(id<MTLTexture> tex, uint8_t aspects)
 +{
-+    if (!tex || g_storePending.empty())
++    if (!kStoreOptEnabled || !tex || g_storePending.empty())
 +        return;
 +    auto it = g_storePending.find((__bridge const void*)tex);
 +    if (it == g_storePending.end())
@@ -3639,6 +3642,11 @@ index 00000000..0f929894
 +MTLStoreAction StoreDecide(id<MTLTexture> tex, uint8_t aspect, NSUInteger level, bool cleared, uint64_t passKey,
 +    uint32_t occurrence, int slot)
 +{
++    if (!kStoreOptEnabled)
++    {
++        ++g_storeStats.stored;
++        return MTLStoreActionStore;
++    }
 +    if (cleared)
 +        StoreNoteOverwrite(tex, aspect, level);
 +    else
@@ -5928,15 +5936,17 @@ index 55ae8027..a6713bba 100644
  #endif
  
 diff --git a/src/xrEngine/CMakeLists.txt b/src/xrEngine/CMakeLists.txt
-index 7a2eb22c..16c91f24 100644
+index 7a2eb22c..140faf4b 100644
 --- a/src/xrEngine/CMakeLists.txt
 +++ b/src/xrEngine/CMakeLists.txt
-@@ -356,6 +356,8 @@ target_sources_grouped(
+@@ -356,6 +356,10 @@ target_sources_grouped(
      FILES
      GameFont.cpp
      GameFont.h
 +    ios_fontgen.cpp
 +    ios_fontgen.h
++    ios_heapprof.cpp
++    ios_heapprof.h
      IGameFont.hpp
  )
  
@@ -6045,7 +6055,7 @@ index 6bb1d98e..d15c94de 100644
  int psTextureLOD = 1;
 +#endif
 diff --git a/src/xrEngine/device.cpp b/src/xrEngine/device.cpp
-index 01a427c0..99b7b1b4 100644
+index 01a427c0..0ce012df 100644
 --- a/src/xrEngine/device.cpp
 +++ b/src/xrEngine/device.cpp
 @@ -1,5 +1,10 @@
@@ -6074,7 +6084,7 @@ index 01a427c0..99b7b1b4 100644
  
  bool g_bLoaded = false;
  ref_light precache_light = 0;
-@@ -258,6 +269,61 @@ void CRenderDevice::DoRender()
+@@ -258,6 +269,68 @@ void CRenderDevice::DoRender()
      stats.RenderTotal.accum = renderTotalReal.accum;
  }
  
@@ -6085,6 +6095,7 @@ index 01a427c0..99b7b1b4 100644
 +#include <malloc/malloc.h>
 +#include <os/proc.h>
 +#include "xrScriptEngine/script_engine.hpp"
++#include "ios_heapprof.h"
 +namespace IosFrameStats
 +{
 +struct Mark
@@ -6124,6 +6135,12 @@ index 01a427c0..99b7b1b4 100644
 +        luaKb = size_t(lua_gc(GEnv.ScriptEngine->lua(), LUA_GCCOUNT, 0));
 +    Msg("* [iOSRay] память: свободно %zu МБ | malloc %zu МБ | Lua %zu МБ", size_t(os_proc_available_memory() >> 20),
 +        ms.size_in_use >> 20, luaKb >> 10);
++    // профилировщик кучи: включается с первой статистикой, отчёт раз в минуту (каждый 6-й раз)
++    static unsigned s_statTicks = 0;
++    if (s_statTicks++ == 0)
++        XrHeapProfStart();
++    else if (s_statTicks % 6 == 0)
++        XrHeapProfReport();
 +    for (double& v : sum)
 +        v = 0;
 +    worst = 0;
@@ -6136,7 +6153,7 @@ index 01a427c0..99b7b1b4 100644
  void CRenderDevice::ProcessFrame()
  {
      ZoneScoped;
-@@ -266,10 +332,16 @@ void CRenderDevice::ProcessFrame()
+@@ -266,10 +339,16 @@ void CRenderDevice::ProcessFrame()
          return;
  
      const u64 frameStartTime = TimerGlobal.GetElapsed_ms();
@@ -6153,7 +6170,7 @@ index 01a427c0..99b7b1b4 100644
  
      const auto& processSeqParallel = TaskScheduler->AddTask([this]
      {
-@@ -281,8 +353,14 @@ void CRenderDevice::ProcessFrame()
+@@ -281,8 +360,14 @@ void CRenderDevice::ProcessFrame()
      });
  
      DoRender();
@@ -6168,7 +6185,7 @@ index 01a427c0..99b7b1b4 100644
  
      const u64 frameEndTime = TimerGlobal.GetElapsed_ms();
      const u64 frameTime = frameEndTime - frameStartTime;
-@@ -300,6 +378,10 @@ void CRenderDevice::ProcessFrame()
+@@ -300,6 +385,10 @@ void CRenderDevice::ProcessFrame()
  
      if (!b_is_Active)
          Sleep(1);
@@ -6385,6 +6402,327 @@ index 00000000..0c3fe20e
 +#if defined(XR_PLATFORM_APPLE)
 +// iOSRay: создаёт в $game_saves$ текстуру (outRel.dds) и метрики (outRel.ini) запасного шрифта.
 +bool XrIosMakeFallbackFont(pcstr texName, u32 texH, pcstr outRel);
++#endif
+diff --git a/src/xrEngine/ios_heapprof.cpp b/src/xrEngine/ios_heapprof.cpp
+new file mode 100644
+index 00000000..1185b976
+--- /dev/null
++++ b/src/xrEngine/ios_heapprof.cpp
+@@ -0,0 +1,303 @@
++// iOSRay: выборочный профилировщик кучи, чтобы найти утечку памяти без Instruments.
++// Через системный крючок malloc_logger видим каждое выделение/освобождение в процессе.
++// Запоминаем примерно каждое 64-е (выбор по адресу, чтобы free совпадал с malloc) вместе
++// со стеком вызова. Раз в минуту печатаем места, где живой памяти больше всего и где она растёт.
++// Внутри крючка нельзя выделять память: все таблицы — заранее выделенные через mmap.
++#include "stdafx.h"
++
++#if defined(XR_PLATFORM_APPLE)
++#include "ios_heapprof.h"
++
++#include <cxxabi.h>
++#include <dlfcn.h>
++#include <os/lock.h>
++#include <pthread.h>
++#include <sys/mman.h>
++#include <algorithm>
++#include <cstring>
++
++typedef void(malloc_logger_t)(uint32_t type, uintptr_t arg1, uintptr_t arg2, uintptr_t arg3, uintptr_t result,
++    uint32_t num_hot_frames_to_skip);
++extern "C" malloc_logger_t* malloc_logger;
++
++namespace
++{
++constexpr uint32_t kLogAlloc = 2, kLogFree = 4;
++constexpr int kSampleShift = 6; // 1 из 64
++constexpr int kFrames = 14;
++constexpr size_t kAllocCap = size_t(1) << 19; // слотов для живых выбранных выделений
++constexpr size_t kStackCap = 16384;
++
++struct AllocSlot
++{
++    uintptr_t ptr; // 0 — пусто
++    uint32_t size;
++    uint32_t stack;
++};
++struct StackRec
++{
++    uint64_t hash; // 0 — пусто
++    uintptr_t frames[kFrames];
++    int64_t liveBytes;
++    int64_t liveCount;
++    int64_t lastReported;
++};
++
++AllocSlot* g_allocs = nullptr;
++StackRec* g_stacks = nullptr;
++size_t g_stackUsed = 0;
++uint64_t g_dropped = 0;
++os_unfair_lock g_lock = OS_UNFAIR_LOCK_INIT;
++bool g_on = false;
++
++inline uint64_t Mix(uint64_t x)
++{
++    x ^= x >> 33;
++    x *= 0xff51afd7ed558ccdull;
++    x ^= x >> 33;
++    return x;
++}
++inline bool Sampled(uintptr_t p) { return p && (Mix(p) >> (64 - kSampleShift)) == 0; }
++
++uint32_t StackOf(const uintptr_t* fr, int n)
++{
++    uint64_t h = 1469598103934665603ull;
++    for (int i = 0; i < n; ++i)
++        h = (h ^ fr[i]) * 1099511628211ull;
++    if (!h)
++        h = 1;
++    size_t i = h & (kStackCap - 1);
++    for (size_t probe = 0; probe < kStackCap; ++probe, i = (i + 1) & (kStackCap - 1))
++    {
++        StackRec& s = g_stacks[i];
++        if (s.hash == h)
++            return uint32_t(i);
++        if (!s.hash)
++        {
++            if (g_stackUsed > kStackCap * 3 / 4)
++                return 0; // переполнено — всё в нулевую запись
++            s.hash = h;
++            memcpy(s.frames, fr, sizeof(uintptr_t) * size_t(n));
++            ++g_stackUsed;
++            return uint32_t(i);
++        }
++    }
++    return 0;
++}
++
++void AllocInsert(uintptr_t p, uint32_t size, uint32_t stack)
++{
++    size_t i = Mix(p) & (kAllocCap - 1);
++    for (size_t probe = 0; probe < kAllocCap / 2; ++probe, i = (i + 1) & (kAllocCap - 1))
++    {
++        if (!g_allocs[i].ptr || g_allocs[i].ptr == p)
++        {
++            g_allocs[i] = { p, size, stack };
++            g_stacks[stack].liveBytes += size;
++            g_stacks[stack].liveCount += 1;
++            return;
++        }
++    }
++    ++g_dropped;
++}
++
++void AllocErase(uintptr_t p)
++{
++    size_t i = Mix(p) & (kAllocCap - 1);
++    for (size_t probe = 0; probe < kAllocCap / 2; ++probe, i = (i + 1) & (kAllocCap - 1))
++    {
++        if (!g_allocs[i].ptr)
++            return;
++        if (g_allocs[i].ptr == p)
++        {
++            StackRec& s = g_stacks[g_allocs[i].stack];
++            s.liveBytes -= g_allocs[i].size;
++            s.liveCount -= 1;
++            // удаление со сдвигом назад, чтобы не оставлять «дыр» в цепочке
++            size_t hole = i;
++            for (size_t j = (i + 1) & (kAllocCap - 1); g_allocs[j].ptr; j = (j + 1) & (kAllocCap - 1))
++            {
++                const size_t home = Mix(g_allocs[j].ptr) & (kAllocCap - 1);
++                const bool between = hole <= j ? (home <= hole || home > j) : (home <= hole && home > j);
++                if (between)
++                {
++                    g_allocs[hole] = g_allocs[j];
++                    hole = j;
++                }
++            }
++            g_allocs[hole].ptr = 0;
++            return;
++        }
++    }
++}
++
++int CaptureStack(uintptr_t* out)
++{
++    pthread_t self = pthread_self();
++    const uintptr_t hi = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(self));
++    const uintptr_t lo = hi - pthread_get_stacksize_np(self);
++    auto* fp = static_cast<uintptr_t*>(__builtin_frame_address(0));
++    int n = 0, skip = 3; // крючок и внутренности malloc
++    while (n < kFrames && fp && (uintptr_t(fp) & 7) == 0 && uintptr_t(fp) >= lo && uintptr_t(fp) < hi)
++    {
++        const uintptr_t ret = fp[1] & 0x0000000FFFFFFFFFull; // без битов подписи указателя
++        auto* next = reinterpret_cast<uintptr_t*>(fp[0]);
++        if (!ret)
++            break;
++        if (skip > 0)
++            --skip;
++        else
++            out[n++] = ret;
++        if (next <= fp)
++            break;
++        fp = next;
++    }
++    return n;
++}
++
++void Logger(uint32_t type, uintptr_t, uintptr_t arg2, uintptr_t arg3, uintptr_t result, uint32_t)
++{
++    const bool isAlloc = (type & kLogAlloc) != 0, isFree = (type & kLogFree) != 0;
++    uintptr_t freed = 0, made = 0;
++    size_t size = 0;
++    if (isAlloc && isFree) // realloc: arg2 — старый адрес, arg3 — новый размер
++    {
++        freed = arg2;
++        made = result;
++        size = arg3;
++        if (freed == made)
++            freed = made = 0; // на месте: размер не отслеживаем, адрес тот же
++    }
++    else if (isAlloc)
++    {
++        made = result;
++        size = arg2;
++    }
++    else if (isFree)
++        freed = arg2;
++
++    const bool f = Sampled(freed), m = Sampled(made);
++    if (!f && !m)
++        return;
++    uintptr_t frames[kFrames];
++    int n = m ? CaptureStack(frames) : 0;
++    os_unfair_lock_lock(&g_lock);
++    if (f)
++        AllocErase(freed);
++    if (m)
++        AllocInsert(made, uint32_t(std::min<size_t>(size, 0xFFFFFFFFu)), StackOf(frames, n));
++    os_unfair_lock_unlock(&g_lock);
++}
++
++// Кадры самого выделения (malloc, operator new, xrMemory, libc++) пропускаем при выводе
++bool IsAllocatorFrame(const char* name)
++{
++    if (!name)
++        return false;
++    static const char* const kSkip[] = { "malloc", "calloc", "realloc", "operator new", "_Znwm", "_Znam",
++        "xrMemory", "mem_alloc", "mem_realloc", "xr_strdup", "allocate", "__libcpp", "posix_memalign",
++        "aligned_alloc", "strdup", "xalloc" };
++    for (const char* k : kSkip)
++        if (strstr(name, k))
++            return true;
++    return false;
++}
++
++void Describe(const StackRec& s, char* out, size_t cap)
++{
++    out[0] = 0;
++    size_t len = 0;
++    int shown = 0;
++    for (int i = 0; i < kFrames && s.frames[i] && shown < 4; ++i)
++    {
++        Dl_info info{};
++        if (!dladdr(reinterpret_cast<void*>(s.frames[i]), &info) || !info.dli_sname)
++            continue;
++        int status = 0;
++        char* dem = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
++        const char* name = status == 0 && dem ? dem : info.dli_sname;
++        if (!IsAllocatorFrame(name) || shown > 0)
++        {
++            // короче: без списка аргументов
++            char buf[96];
++            xr_strcpy(buf, name);
++            if (char* paren = strchr(buf, '('))
++                *paren = 0;
++            len += snprintf(out + len, cap - std::min(len, cap), "%s%s", shown ? " < " : "", buf);
++            ++shown;
++        }
++        free(dem);
++        if (len >= cap)
++            break;
++    }
++}
++} // namespace
++
++void XrHeapProfStart()
++{
++    if (g_on)
++        return;
++    g_allocs = static_cast<AllocSlot*>(
++        mmap(nullptr, sizeof(AllocSlot) * kAllocCap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0));
++    g_stacks = static_cast<StackRec*>(
++        mmap(nullptr, sizeof(StackRec) * kStackCap, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0));
++    if (g_allocs == MAP_FAILED || g_stacks == MAP_FAILED)
++        return;
++    g_stacks[0].hash = 1; // нулевая запись — «прочее»
++    g_on = true;
++    malloc_logger = &Logger;
++    Msg("* [iOSRay] профилировщик памяти включён (выборка 1/%d)", 1 << kSampleShift);
++}
++
++void XrHeapProfReport()
++{
++    if (!g_on)
++        return;
++    struct Top
++    {
++        StackRec rec;
++        int64_t delta;
++    };
++    static Top top[12];
++    int nTop = 0;
++    int64_t totalLive = 0;
++    // Выбираем под замком, описываем (dladdr выделяет память) уже без него
++    os_unfair_lock_lock(&g_lock);
++    for (size_t i = 0; i < kStackCap; ++i)
++    {
++        StackRec& s = g_stacks[i];
++        if (!s.hash)
++            continue;
++        totalLive += s.liveBytes;
++        const int64_t delta = s.liveBytes - s.lastReported;
++        // топ по росту с прошлого отчёта
++        int pos = nTop;
++        while (pos > 0 && top[pos - 1].delta < delta)
++            --pos;
++        if (pos < 12)
++        {
++            const int last = std::min(nTop, 11);
++            for (int k = last; k > pos; --k)
++                top[k] = top[k - 1];
++            top[pos] = { s, delta };
++            nTop = std::min(nTop + 1, 12);
++        }
++        s.lastReported = s.liveBytes;
++    }
++    const uint64_t dropped = g_dropped;
++    os_unfair_lock_unlock(&g_lock);
++
++    const int64_t k = int64_t(1) << kSampleShift;
++    Msg("* [iOSRay] куча (оценка): живых %lld МБ, мест %zu, пропущено %llu. Рост за минуту:", (long long)(totalLive * k >> 20),
++        g_stackUsed, (unsigned long long)dropped);
++    for (int i = 0; i < nTop && i < 8; ++i)
++    {
++        if (top[i].delta <= 0)
++            break;
++        char desc[400];
++        Describe(top[i].rec, desc, sizeof(desc));
++        Msg("*   +%lld КБ (всего %lld КБ, %lld шт): %s", (long long)(top[i].delta * k >> 10),
++            (long long)(top[i].rec.liveBytes * k >> 10), (long long)(top[i].rec.liveCount * k), desc[0] ? desc : "?");
++    }
++}
++#endif
+diff --git a/src/xrEngine/ios_heapprof.h b/src/xrEngine/ios_heapprof.h
+new file mode 100644
+index 00000000..3d82224a
+--- /dev/null
++++ b/src/xrEngine/ios_heapprof.h
+@@ -0,0 +1,6 @@
++#pragma once
++#if defined(XR_PLATFORM_APPLE)
++// iOSRay: выборочный профилировщик кучи (поиск утечек). Отчёт — раз в минуту в лог.
++void XrHeapProfStart();
++void XrHeapProfReport();
 +#endif
 diff --git a/src/xrEngine/x_ray.cpp b/src/xrEngine/x_ray.cpp
 index 20d2e576..d4d6cdc0 100644
