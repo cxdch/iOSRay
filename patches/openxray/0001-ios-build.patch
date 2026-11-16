@@ -7097,6 +7097,60 @@ index 7a1580f8..d344f269 100644
      typedef CUIWindow inherited;
      //-	typedef ALife::EInfluenceType	EIndicatorType;
  
+diff --git a/src/xrServerEntities/script_net_packet_script.cpp b/src/xrServerEntities/script_net_packet_script.cpp
+index 5524bd87..d06ff301 100644
+--- a/src/xrServerEntities/script_net_packet_script.cpp
++++ b/src/xrServerEntities/script_net_packet_script.cpp
+@@ -10,6 +10,10 @@
+ 
+ #include "base_client_classes_wrappers.h"
+ 
++// iOSRay: в оригинальной (32-битной) игре u32 попадал в Lua как 32-битное целое со знаком,
++// и скрипты ТЧ на это рассчитывают: task_manager пишет w_u32(-1) и сравнивает r_u32() ~= -1.
++// На 64 битах приходило 4294967295, сравнение ломалось, и загрузка сохранения с заданием
++// «защитить лагерь» падала (alife():object(65535) = nil). Возвращаем прежнее поведение.
+ void CScriptNetPacket::script_register(lua_State* luaState)
+ {
+     using namespace luabind;
+@@ -69,7 +73,11 @@ void CScriptNetPacket::script_register(lua_State* luaState)
+             .def("r_float", (float (NET_Packet::*)())(&NET_Packet::r_float))
+             .def("r_u64", (u64(NET_Packet::*)())(&NET_Packet::r_u64))
+             .def("r_s64", (s64(NET_Packet::*)())(&NET_Packet::r_s64))
++#if defined(XR_PLATFORM_APPLE)
++            .def("r_u32", +[](NET_Packet* self) { return static_cast<s32>(self->r_u32()); })
++#else
+             .def("r_u32", (u32(NET_Packet::*)())(&NET_Packet::r_u32))
++#endif
+             .def("r_s32", (s32(NET_Packet::*)())(&NET_Packet::r_s32))
+             .def("r_u16", (u16(NET_Packet::*)())(&NET_Packet::r_u16))
+             .def("r_s16", (s16(NET_Packet::*)())(&NET_Packet::r_s16))
+diff --git a/src/xrServerEntities/script_reader_script.cpp b/src/xrServerEntities/script_reader_script.cpp
+index d00cfde5..117c835d 100644
+--- a/src/xrServerEntities/script_reader_script.cpp
++++ b/src/xrServerEntities/script_reader_script.cpp
+@@ -10,6 +10,10 @@
+ 
+ #include "base_client_classes_wrappers.h"
+ 
++// iOSRay: в оригинальной (32-битной) игре u32 попадал в Lua как 32-битное целое со знаком,
++// и скрипты ТЧ на это рассчитывают: task_manager пишет w_u32(-1) и сравнивает r_u32() ~= -1.
++// На 64 битах приходило 4294967295, сравнение ломалось, и загрузка сохранения с заданием
++// «защитить лагерь» падала (alife():object(65535) = nil). Возвращаем прежнее поведение.
+ void CScriptReader::script_register(lua_State* luaState)
+ {
+     using namespace luabind;
+@@ -24,7 +28,11 @@ void CScriptReader::script_register(lua_State* luaState)
+             .def("r_float", &IReader::r_float)
+             .def("r_u64", &IReader::r_u64)
+             .def("r_s64", &IReader::r_s64)
++#if defined(XR_PLATFORM_APPLE)
++            .def("r_u32", +[](IReader* self) { return static_cast<s32>(self->r_u32()); })
++#else
+             .def("r_u32", &IReader::r_u32)
++#endif
+             .def("r_s32", &IReader::r_s32)
+             .def("r_u16", &IReader::r_u16)
+             .def("r_s16", &IReader::r_s16)
 diff --git a/src/xrUICore/TrackBar/UITrackBar.cpp b/src/xrUICore/TrackBar/UITrackBar.cpp
 index 1cef69ab..d8cfa81c 100644
 --- a/src/xrUICore/TrackBar/UITrackBar.cpp
